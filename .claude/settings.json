@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"ERROR|Exception|500|enterprise\" /tmp/nexus.log 2>/dev/null | tail -30)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"spring-boot:run\")",
+      "Bash(mvn compile *)",
+      "Bash(python3 -c \"import sys,json; print\\(json.load\\(sys.stdin\\)['status']\\)\")",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"test3@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Test\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"analyst@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Analyst\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/enterprise-map/objects -H 'X-Nexus-Token: d8cf6a1824567dc4b8667c6b0297b9d0a6ed06909162d87aeb869ad39d3cd4b6' -H 'Content-Type: application/json' -d '{\"tableName\":\"lgs_supplier\",\"entityName\":\"Supplier\",\"businessName\":\"Suppliers\",\"purpose\":\"Supplier master data\",\"connectionKey\":\"local-postgres\",\"schemaName\":\"public\",\"domainKey\":\"PLATFORM\"}')",
+      "Bash(echo \"Compile: $?\")",
+      "PowerShell(Get-Process java -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)",
+      "Bash(python3 -c \"import sys,json; print\\('Health:', json.load\\(sys.stdin\\)['status']\\)\")",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"ops3@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Ops3\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/enterprise-map/objects -H 'X-Nexus-Token: f144b736266c13eda856e90f5890d50877cc5757802883dce79cf65a382c9c63' -H 'Content-Type: application/json' -d '{\"tableName\":\"lgs_product\",\"entityName\":\"Product\",\"businessName\":\"Products\",\"purpose\":\"Product catalogue. reorder_point threshold. product_id PK sku unique.\",\"identifierColumns\":\"product_id,sku\",\"statusColumns\":\"status\",\"connectionKey\":\"local-postgres\",\"schemaName\":\"public\",\"domainKey\":\"PLATFORM\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/chat/ask -H 'X-Nexus-Token: f144b736266c13eda856e90f5890d50877cc5757802883dce79cf65a382c9c63' -H 'Content-Type: application/json' -d '{\"agentKey\":\"logistics-analyst\",\"conversationId\":\"test-conv-2\",\"question\":\"which supplier has the most overdue orders?\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2\\)\\)\")",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/chat/ask -H 'X-Nexus-Token: f144b736266c13eda856e90f5890d50877cc5757802883dce79cf65a382c9c63' -H 'Content-Type: application/json' -d '{\"agent_key\":\"logistics-analyst\",\"conversation_id\":\"test-conv-3\",\"question\":\"which supplier has the most overdue orders?\"}')",
+      "Bash(PGPASSWORD=postgres 'C:/Program Files/PostgreSQL/17/bin/psql.exe' -U postgres -d nexus -c 'INSERT INTO nexus_evidence \\(evidence_key, run_key, evidence_type, payload_json, created_at\\) VALUES \\('\\\\''test-ev-1'\\\\'', '\\\\''run-252a252690344b30'\\\\'', '\\\\''ROUTING'\\\\'', '\\\\''{\"test\":1}'\\\\'', NOW\\(\\)\\) RETURNING evidence_key;')",
+      "Bash(curl -s --max-time 90 -X POST http://localhost:8090/api/v1/chat/ask -H 'X-Nexus-Token: 71941dbc7290f9f0e17da0bce3aadca1e028acdea0ffb8e3b7ea50ab484e3ab7' -H 'Content-Type: application/json' -d '{\"agent_key\":\"logistics-analyst\",\"conversation_id\":\"conv-test-2\",\"question\":\"which supplier has the most overdue orders?\"}')",
+      "Bash(curl -s --max-time 90 -X POST http://localhost:8090/api/v1/chat/ask -H 'X-Nexus-Token: 1ca9c3199f1e338ce564dab4388f52683874f9d921cd5a862c8cde897d49d3f5' -H 'Content-Type: application/json' -d '{\"agent_key\":\"logistics-analyst\",\"conversation_id\":\"conv-final\",\"question\":\"which supplier has the most overdue orders?\"}')",
+      "Bash(curl -s --max-time 90 -X POST http://localhost:8090/api/v1/chat/ask -H 'X-Nexus-Token: 1ca9c3199f1e338ce564dab4388f52683874f9d921cd5a862c8cde897d49d3f5' -H 'Content-Type: application/json' -d '{\"agent_key\":\"logistics-analyst\",\"conversation_id\":\"conv-debug\",\"question\":\"which supplier has the most overdue orders?\"}')",
+      "Bash(python3 -c \"import sys,json; print\\('UP:', json.load\\(sys.stdin\\)['status']=='UP'\\)\")",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"livetest@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Live Test\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"diagtest@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Diag\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"ctxtest@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Ctx\"}')",
+      "Bash(echo \"UP: $\\(curl -s http://localhost:8090/api/v1/actuator/health)",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"final2@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"Final2\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"exectest@nexus.local\",\"password\":\"Test1234!\",\"display_name\":\"ExecTest\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('deps:', list\\(d.get\\('dependencies',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(npx vite *)",
+      "Bash(mvn clean *)",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"livetest@nexus.local\",\"password\":\"Test1234!\",\"tenant_slug\":\"default\"}')",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"admin@nexus.local\",\"password\":\"AdminPass1!\",\"tenant_slug\":\"default\"}')",
+      "Bash(curl -s -X POST http://localhost:8090/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"admin@acme.com\",\"password\":\"AcmePass1!\",\"tenant_slug\":\"acme-corp\"}')",
+      "Bash(python3 -c \"import sys,json; conns=json.load\\(sys.stdin\\); print\\(f'{len\\(conns\\)} connections:', conns\\)\")"
+    ]
+  }
+}

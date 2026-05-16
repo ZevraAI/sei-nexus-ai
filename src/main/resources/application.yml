@@ -1,0 +1,66 @@
+server:
+  port: ${PORT:8090}
+  servlet:
+    context-path: /api/v1
+
+spring:
+  datasource:
+    url: ${NEXUS_DB_URL:jdbc:postgresql://aws-1-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require}
+    username: ${NEXUS_DB_USERNAME:postgres.qlmumipyikwifbcvzsfx}
+    password: ${NEXUS_DB_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 30000
+      idle-timeout: 600000
+      keepalive-time: 120000
+  sql:
+    init:
+      mode: never
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    validate-on-migrate: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+nexus:
+  cors:
+    allowed-origins: ${NEXUS_CORS_ALLOWED_ORIGINS:*}
+  storage:
+    local-path: ${NEXUS_STORAGE_PATH:./data/documents}
+  memory:
+    embedding-dimensions: 1536
+    chunk-target-words: 850
+    chunk-overlap-words: 100
+    retrieval-top-k: 6
+  openai:
+    api-key: ${OPENAI_API_KEY}
+    chat-model: ${OPENAI_CHAT_MODEL:gpt-4o}
+    embedding-model: ${OPENAI_EMBEDDING_MODEL:text-embedding-ada-002}
+  security:
+    jwt-secret: ${NEXUS_JWT_SECRET:change-me-in-production}
+    session-expiry-hours: 24
+  query-governance:
+    sync-timeout-seconds: 30
+    async-timeout-seconds: 90
+    point-lookup-timeout-seconds: 10
+    max-sync-rows: 500
+    max-sync-cost: 500
+    max-async-rows: 10000
+    max-async-cost: 10000
+    max-joins: 4
+    max-selected-columns: 30
+    default-row-limit: 100
+    max-row-limit: 500
+  retention:
+    conversation-days: 3

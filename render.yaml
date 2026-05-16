@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: zevra-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/actuator/health
+
+    envVars:
+      # ── Database (Supabase session pooler) ──────────────────────────────────
+      - key: NEXUS_DB_URL
+        value: jdbc:postgresql://aws-1-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require
+
+      - key: NEXUS_DB_USERNAME
+        value: postgres.qlmumipyikwifbcvzsfx
+
+      - key: NEXUS_DB_PASSWORD
+        sync: false          # Set manually in Render dashboard — never commit
+
+      # ── OpenAI ──────────────────────────────────────────────────────────────
+      - key: OPENAI_API_KEY
+        sync: false          # Set manually in Render dashboard — never commit
+
+      - key: OPENAI_CHAT_MODEL
+        value: gpt-4o
+
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-ada-002
+
+      # ── Security ─────────────────────────────────────────────────────────────
+      - key: NEXUS_JWT_SECRET
+        generateValue: true  # Render generates a strong random value
+
+      - key: NEXUS_CORS_ALLOWED_ORIGINS
+        value: "*"           # Update to your Vercel URL once deployed
+                             # e.g. https://zevra.vercel.app
+
+      # ── Storage ──────────────────────────────────────────────────────────────
+      - key: NEXUS_STORAGE_PATH
+        value: /tmp/zevra/documents
