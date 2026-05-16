@@ -69,11 +69,14 @@ public class RunRepository {
     public void save(NexusRun run) {
         Timestamp completedAt = run.completedAt() != null
                 ? Timestamp.from(run.completedAt().toInstant()) : null;
+        // Blank domain_key violates the FK — treat it as null (nullable column)
+        String domainKey = (run.domainKey() == null || run.domainKey().isBlank())
+                ? null : run.domainKey();
         jdbc.update(INSERT_RUN,
                 run.runKey(),
                 run.conversationId(),
                 run.agentKey(),
-                run.domainKey(),
+                domainKey,
                 run.userEmail(),
                 run.question(),
                 run.answer(),
