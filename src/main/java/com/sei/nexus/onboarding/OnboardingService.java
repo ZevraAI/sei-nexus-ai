@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -116,28 +117,154 @@ public class OnboardingService {
     // ── Scan ──────────────────────────────────────────────────────────────────
 
     /**
-     * Lists all tables in the given schema of the given connection.
-     * Each entry contains table_name and column_count.
+     * Lists all tables in the given schema with their column counts.
+     *
+     * <p><strong>Scalability:</strong> Uses a single SQL query against
+     * {@code information_schema} to fetch table names and column counts for
+     * ALL tables in one round-trip — O(1) database calls regardless of table
+     * count. The previous implementation made one {@code describeTable()} call
+     * per table (N+1 pattern), which would take 500+ seconds for a large schema.
      */
     public List<Map<String, Object>> scanTables(String connectionKey, String schemaName) {
-        List<Map<String, Object>> rawTables =
-                dynamicSqlService.listTables(connectionKey, schemaName, "");
+        return dynamicSqlService.listTablesWithColumnCounts(connectionKey, schemaName);
+    }
 
-        return rawTables.stream().map(row -> {
-            String tableName = (String) row.getOrDefault("table_name",
-                               row.values().stream().findFirst().orElse("unknown"));
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("table_name", tableName);
-            // Column count — do a lightweight describe
+    // ── Recommend ─────────────────────────────────────────────────────────────
+
+    /**
+     * AI-powered table recommendation for large databases.
+     *
+     * <p><strong>Scalability design:</strong>
+     * <ul>
+     *   <li>One SQL query fetches ALL table metadata (names + column counts +
+     *       column name list) regardless of schema size — O(1) DB round-trips.</li>
+     *   <li>One AI call analyses the entire schema at once and returns the top 15
+     *       recommended tables — O(1) API calls regardless of table count.</li>
+     *   <li>Result is cached in {@code nexus_tenant_settings} keyed by
+     *       connection+schema so repeat calls (browser refresh, re-render) are free.</li>
+     * </ul>
+     *
+     * @return map containing {@code recommended} list, {@code total_tables} count,
+     *         and {@code cached} flag indicating whether the result came from cache.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> recommendTables(String connectionKey, String schemaName) {
+        String cacheKey = "onboarding_recommend_" + connectionKey + "_" + schemaName;
+
+        // Return cached result if available — avoids re-running the AI call on
+        // every wizard render. Cache is invalidated when a new connection is added.
+        Optional<String> cached = settings.get(cacheKey);
+        if (cached.isPresent()) {
             try {
-                int cols = dynamicSqlService.describeTable(
-                        connectionKey, schemaName, tableName).size();
-                entry.put("column_count", cols);
-            } catch (Exception e) {
-                entry.put("column_count", 0);
+                Map<String, Object> result = objectMapper.readValue(
+                        cached.get(), new TypeReference<>() {});
+                result.put("cached", true);
+                return result;
+            } catch (Exception ignored) {
+                // Corrupt cache entry — fall through to regenerate
             }
-            return entry;
-        }).collect(Collectors.toList());
+        }
+
+        // 1. Single query: all tables with column counts and column names
+        List<Map<String, Object>> allTables =
+                dynamicSqlService.listTablesWithColumnCounts(connectionKey, schemaName);
+
+        if (allTables.isEmpty()) {
+            return Map.of("recommended", List.of(), "total_tables", 0, "cached", false);
+        }
+
+        // 2. Build a compact representation for the AI prompt.
+        //    Format: "table_name (N cols): col1, col2, col3..."
+        //    Truncate column list to first 10 names to keep the prompt concise.
+        StringBuilder tableList = new StringBuilder();
+        for (Map<String, Object> t : allTables) {
+            String name    = String.valueOf(t.getOrDefault("table_name", ""));
+            Object colCnt  = t.getOrDefault("column_count", 0);
+            String colNames= String.valueOf(t.getOrDefault("column_names", ""));
+            // Truncate long column lists to keep prompt size manageable
+            String truncated = truncateColumnList(colNames, 10);
+            tableList.append(name).append(" (").append(colCnt).append(" cols): ")
+                     .append(truncated).append("\n");
+        }
+
+        // 3. Single AI call — analyse the entire schema in one prompt
+        String systemPrompt = """
+                You are an enterprise data analyst helping onboard a large database into an
+                operational intelligence platform. The database has many tables.
+                Identify the 10-15 most important BUSINESS tables for initial setup.
+
+                Prioritise tables that:
+                - Represent core business entities (customers, orders, products, invoices, bookings, shipments, employees, contracts, transactions)
+                - Are frequently referenced by other tables (indicated by "id" columns matching other table names)
+                - Have meaningful business column names (not just technical fields)
+
+                Exclude system/audit tables: audit_*, *_log, *_logs, *_history, tmp_*, staging_*,
+                flyway_*, pg_*, _*, *_archive, *_backup.
+
+                Respond with valid JSON only:
+                {
+                  "recommended": [
+                    {
+                      "table_name": "exact_table_name",
+                      "reason": "one sentence explaining why this is important",
+                      "category": "Customers|Orders|Finance|Inventory|Logistics|HR|Other",
+                      "priority": 1
+                    }
+                  ]
+                }
+                Order by priority (1 = most important). Return 10-15 items maximum.
+                """;
+
+        String userMessage = "Schema: " + schemaName + "\nTotal tables: " + allTables.size()
+                + "\n\nTables (name, column count, column names):\n" + tableList;
+
+        List<Map<String, Object>> recommended;
+        try {
+            String aiResponse = aiClient.chatWithJson(
+                    List.of(ChatMessage.user(userMessage)), systemPrompt);
+            Map<String, Object> parsed = parseJson(aiResponse);
+            recommended = (List<Map<String, Object>>) parsed.getOrDefault(
+                    "recommended", List.of());
+        } catch (Exception e) {
+            log.warn("AI recommendation failed for {}/{}: {}", connectionKey, schemaName, e.getMessage());
+            // Graceful degradation: return first 15 tables alphabetically
+            recommended = allTables.stream()
+                    .limit(15)
+                    .map(t -> {
+                        Map<String, Object> entry = new LinkedHashMap<>();
+                        entry.put("table_name", t.get("table_name"));
+                        entry.put("reason",     "Suggested based on schema position");
+                        entry.put("category",   "Other");
+                        entry.put("priority",   allTables.indexOf(t) + 1);
+                        return entry;
+                    })
+                    .collect(Collectors.toList());
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("recommended",   recommended);
+        result.put("total_tables",  allTables.size());
+        result.put("cached",        false);
+
+        // 4. Cache result — expires with next tenant settings reset
+        try {
+            settings.set(cacheKey, objectMapper.writeValueAsString(result));
+        } catch (Exception ignored) {}
+
+        return result;
+    }
+
+    private String truncateColumnList(String columnNames, int maxColumns) {
+        if (columnNames == null || columnNames.isBlank()) return "";
+        String[] parts = columnNames.split(",\\s*");
+        if (parts.length <= maxColumns) return columnNames;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < maxColumns; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(parts[i].trim());
+        }
+        sb.append(" … +").append(parts.length - maxColumns).append(" more");
+        return sb.toString();
     }
 
     // ── Analyse ───────────────────────────────────────────────────────────────

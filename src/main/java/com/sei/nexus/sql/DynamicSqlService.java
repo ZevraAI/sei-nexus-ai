@@ -173,6 +173,75 @@ public class DynamicSqlService {
     }
 
     /**
+     * Returns ALL tables in the schema with column counts and a compact comma-separated
+     * list of their column names — in a SINGLE database round-trip.
+     *
+     * <p><strong>Scalability:</strong> One SQL query regardless of how many tables exist.
+     * Used by the onboarding recommendation engine so it can pass complete schema
+     * metadata to the AI without making N individual {@code describeTable} calls.
+     * Also filters out obvious system/framework tables (flyway, pg_*, audit logs)
+     * at the SQL level to reduce noise in the AI prompt.
+     */
+    public List<Map<String, Object>> listTablesWithColumnCounts(String connectionKey,
+                                                                  String schemaName) {
+        NexusConnection conn = requireConnection(connectionKey);
+        String secret = conn.encryptedSecret();
+
+        String sql;
+        if ("ORACLE".equalsIgnoreCase(conn.connectionType())) {
+            sql = """
+                    SELECT t.table_name,
+                           COUNT(c.column_name)                                    AS column_count,
+                           LISTAGG(c.column_name, ', ')
+                               WITHIN GROUP (ORDER BY c.column_id)                 AS column_names
+                      FROM all_tables     t
+                      JOIN all_tab_columns c ON c.table_name = t.table_name
+                                            AND c.owner      = t.owner
+                     WHERE t.owner = ?
+                     GROUP BY t.table_name
+                     ORDER BY t.table_name
+                    """;
+        } else {
+            sql = """
+                    SELECT t.table_name,
+                           COUNT(c.column_name)                                      AS column_count,
+                           STRING_AGG(c.column_name, ', '
+                               ORDER BY c.ordinal_position)                          AS column_names
+                      FROM information_schema.tables  t
+                      JOIN information_schema.columns c ON c.table_name  = t.table_name
+                                                       AND c.table_schema = t.table_schema
+                     WHERE t.table_schema = ?
+                       AND t.table_type   = 'BASE TABLE'
+                       AND t.table_name NOT LIKE 'flyway%'
+                       AND t.table_name NOT LIKE 'pg\\_%'
+                       AND t.table_name NOT LIKE '\\_%'
+                       AND t.table_name NOT LIKE '%\\_log'
+                       AND t.table_name NOT LIKE '%\\_logs'
+                       AND t.table_name NOT LIKE '%\\_audit'
+                       AND t.table_name NOT LIKE 'tmp\\_%'
+                     GROUP BY t.table_name
+                     ORDER BY t.table_name
+                    """;
+        }
+
+        try (Connection jdbc = DriverManager.getConnection(conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+
+            ps.setString(1, "ORACLE".equalsIgnoreCase(conn.connectionType())
+                    ? (schemaName != null ? schemaName.toUpperCase() : null) : schemaName);
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                return mapResultSet(rs);
+            }
+        } catch (SQLException ex) {
+            log.error("listTablesWithColumnCounts failed on {}: {}", connectionKey, ex.getMessage());
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Could not scan schema: " + ex.getMessage());
+        }
+    }
+
+    /**
      * Returns table names within the given schema that match the search pattern.
      *
      * @param query substring to match against table names (case-insensitive)

@@ -53,6 +53,32 @@ public class OnboardingController {
     }
 
     /**
+     * POST /onboarding/recommend
+     * AI-powered table recommendation for large databases.
+     *
+     * <p>Fetches all table metadata in one SQL query, sends the full schema
+     * to the AI in one prompt, and returns the top 10-15 recommended tables
+     * with reasoning. Result is cached in tenant settings so re-renders are free.
+     *
+     * <pre>
+     * Request:  { "connectionKey": "...", "schemaName": "public" }
+     * Response: {
+     *   "recommended": [
+     *     { "table_name": "orders", "reason": "...", "category": "Orders", "priority": 1 }
+     *   ],
+     *   "total_tables": 487,
+     *   "cached": false
+     * }
+     * </pre>
+     */
+    @PostMapping("/recommend")
+    public ResponseEntity<Map<String, Object>> recommend(@RequestBody Map<String, Object> body) {
+        String connectionKey = require(body, "connectionKey");
+        String schemaName    = (String) body.getOrDefault("schemaName", "public");
+        return ResponseEntity.ok(onboardingService.recommendTables(connectionKey, schemaName));
+    }
+
+    /**
      * POST /onboarding/scan
      * Lists all tables in a schema of the given connection.
      *
