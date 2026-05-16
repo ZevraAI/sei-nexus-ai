@@ -5,6 +5,7 @@ import com.sei.nexus.auth.NexusAuthFilter;
 import com.sei.nexus.tenant.TenantRepository;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -38,6 +39,8 @@ public class SecurityConfig {
             .formLogin(form -> form.disable())
             .httpBasic(basic -> basic.disable())
             .authorizeHttpRequests(auth -> auth
+                    // CORS preflight — must pass before auth check
+                    .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                     // Public auth endpoints — no token required
                     .requestMatchers("/auth/signup", "/auth/login").permitAll()
                     // Health and metrics — no token required
