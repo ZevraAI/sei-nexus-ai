@@ -7,6 +7,7 @@ import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.enterprise.EnterpriseMapService;
 import com.sei.nexus.semantic.SemanticService;
+import org.springframework.jdbc.core.JdbcTemplate;
 import com.sei.nexus.sql.DynamicSqlService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +38,7 @@ public class OnboardingService {
     private final SemanticService          semanticService;
     private final AzureOpenAiClient        aiClient;
     private final ObjectMapper             objectMapper;
+    private final JdbcTemplate             jdbc;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -44,7 +46,8 @@ public class OnboardingService {
                               EnterpriseMapService enterpriseMapService,
                               SemanticService semanticService,
                               AzureOpenAiClient aiClient,
-                              ObjectMapper objectMapper) {
+                              ObjectMapper objectMapper,
+                              JdbcTemplate jdbc) {
         this.settings             = settings;
         this.connectionRepository = connectionRepository;
         this.dynamicSqlService    = dynamicSqlService;
@@ -52,6 +55,7 @@ public class OnboardingService {
         this.semanticService      = semanticService;
         this.aiClient             = aiClient;
         this.objectMapper         = objectMapper;
+        this.jdbc                 = jdbc;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -64,10 +68,28 @@ public class OnboardingService {
     public Map<String, Object> getStatus() {
         Map<String, Object> result = new LinkedHashMap<>();
 
+        // 1. Explicit completion flag set by the wizard
         boolean complete = settings.isTrue(KEY_COMPLETED);
-        result.put("complete", complete);
 
-        long connCount   = connectionRepository.findAll().size();
+        // 2. Auto-complete: if the tenant already has business entities configured
+        //    (e.g. the default tenant seeded by V007, or any tenant that was set up
+        //    outside the wizard), skip onboarding entirely.
+        if (!complete) {
+            try {
+                Integer entityCount = jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM nexus_business_entity WHERE status != 'ARCHIVED'",
+                        Integer.class);
+                if (entityCount != null && entityCount > 0) {
+                    settings.set(KEY_COMPLETED, "true");
+                    complete = true;
+                }
+            } catch (Exception ignored) {
+                // Table may not exist yet on very first startup — fail open
+            }
+        }
+
+        result.put("complete", complete);
+        long connCount = connectionRepository.findAll().size();
         result.put("connection_count", connCount);
 
         if (complete) {
@@ -80,15 +102,13 @@ public class OnboardingService {
                     result.put("suggested_questions", List.of());
                 }
             });
+            if (!result.containsKey("suggested_questions")) {
+                result.put("suggested_questions", List.of());
+            }
             return result;
         }
 
-        if (connCount == 0) {
-            result.put("step", "CONNECT_DATABASE");
-        } else {
-            result.put("step", "SELECT_TABLES");
-        }
-
+        result.put("step", connCount == 0 ? "CONNECT_DATABASE" : "SELECT_TABLES");
         result.put("suggested_questions", List.of());
         return result;
     }
