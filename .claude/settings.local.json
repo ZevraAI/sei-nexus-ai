@@ -29,7 +29,10 @@
       "Bash(git branch *)",
       "Bash(git push *)",
       "Bash(git init *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "WebFetch(domain:arahi.ai)",
+      "WebFetch(domain:moveworks.com)"
     ],
     "additionalDirectories": [
       "c:\\Users\\mural\\OneDrive\\Documents\\Claude\\Projects\\Nexus AI"
