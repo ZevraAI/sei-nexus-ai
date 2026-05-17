@@ -90,7 +90,9 @@ public class KnowledgeGraphService {
 
             StringBuilder sb = new StringBuilder();
             sb.append("=== KNOWLEDGE GRAPH ===\n");
-            sb.append("The following business entities and relationships are approved for investigation.\n\n");
+            sb.append("Business entities available for investigation.\n");
+            sb.append("IMPORTANT: these are entity categories, NOT connection keys.\n");
+            sb.append("Always use the connection_key value from the TABLE SCHEMA section below.\n\n");
 
             // Group nodes by their group_label
             Map<String, List<GraphNode>> byGroup = allNodes.stream()
@@ -98,7 +100,7 @@ public class KnowledgeGraphService {
                             n -> n.groupLabel() != null ? n.groupLabel() : "General"));
 
             for (Map.Entry<String, List<GraphNode>> entry : byGroup.entrySet()) {
-                sb.append("--- ").append(entry.getKey()).append(" ---\n");
+                sb.append("[Group: ").append(entry.getKey()).append("]\n");
                 for (GraphNode n : entry.getValue()) {
                     sb.append("• ").append(n.label())
                       .append(" [table: ").append(tableName(n.primaryObjectKey())).append("]");
