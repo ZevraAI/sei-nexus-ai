@@ -16,5 +16,8 @@ public record ChatResponse(
         boolean needsKnowledge,
         String suggestedAction,
         List<Map<String, Object>> quickRefinements,
-        List<Map<String, Object>> asyncOperations
+        List<Map<String, Object>> asyncOperations,
+        // Raw rows from the first successful sync query — used by the frontend
+        // for data visualisation. Capped at 100 rows; null when no live query ran.
+        List<Map<String, Object>> queryData
 ) {}

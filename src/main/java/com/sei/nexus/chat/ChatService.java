@@ -152,7 +152,7 @@ public class ChatService {
                         "Use /request-source to request workflow integrations.";
                 runRepository.update(runKey, ans, "READ_ONLY_BOUNDARY", "COMPLETE", null);
                 return buildResponse(conversationId, runKey, ans, "READ_ONLY_BOUNDARY",
-                        agent, routingConfidence, false, List.of(), List.of());
+                        agent, routingConfidence, false, List.of(), List.of(), List.of());
             }
 
             // STEP 9: Prior result check
@@ -165,6 +165,7 @@ public class ChatService {
 
             String answer;
             List<Map<String, Object>> asyncOps = new ArrayList<>();
+            List<Map<String, Object>> queryData = new ArrayList<>();
             String resultSnapshot = null;
 
             switch (decisionType) {
@@ -290,6 +291,19 @@ public class ChatService {
                     answer = composeAnswer(question, execResults, memChunks, semCtx, findings, anomalyCtx,
                             agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
                     reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED", answer, 0.8, Instant.now());
+
+                    // Collect rows from the first successful sync step for frontend visualisation.
+                    // Capped at 100 rows — the chart never needs more than that.
+                    for (Map<String, Object> r : execResults) {
+                        if (r.containsKey("rows")) {
+                            @SuppressWarnings("unchecked")
+                            List<Map<String, Object>> stepRows = (List<Map<String, Object>>) r.get("rows");
+                            if (!stepRows.isEmpty()) {
+                                queryData = stepRows.size() > 100 ? stepRows.subList(0, 100) : stepRows;
+                            }
+                            break;
+                        }
+                    }
                 }
                 default -> {
                     answer = "I was unable to determine how to answer this question with available approved sources.";
@@ -304,7 +318,7 @@ public class ChatService {
 
             List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, question);
             return buildResponse(conversationId, runKey, answer, decisionType,
-                    agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType), quickRefs, asyncOps);
+                    agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType), quickRefs, asyncOps, queryData);
 
         } catch (Exception e) {
             log.error("Chat orchestration failed for run {}: {}", runKey, e.getMessage(), e);
@@ -661,7 +675,7 @@ public class ChatService {
                 "KNOWLEDGE_PROPOSAL", "COMPLETE", null);
         return buildResponse(convId, runKey,
                 "Your knowledge proposal has been submitted for review by the domain owner. Ref: " + gapKey,
-                "KNOWLEDGE_PROPOSAL", null, 1.0, false, List.of(), List.of());
+                "KNOWLEDGE_PROPOSAL", null, 1.0, false, List.of(), List.of(), List.of());
     }
 
     private ChatResponse handleSourceRequest(String text, String userEmail) {
@@ -677,7 +691,7 @@ public class ChatService {
         runRepository.update(runKey, "Source request submitted.", "SOURCE_REQUEST", "COMPLETE", null);
         return buildResponse(convId, runKey,
                 "Your source request has been submitted for review. Ref: " + gapKey,
-                "SOURCE_REQUEST", null, 1.0, false, List.of(), List.of());
+                "SOURCE_REQUEST", null, 1.0, false, List.of(), List.of(), List.of());
     }
 
     // =========================================================================
@@ -686,7 +700,8 @@ public class ChatService {
 
     private ChatResponse buildResponse(String conversationId, String runKey, String answer,
             String decisionType, NexusAgent agent, double confidence, boolean needsKnowledge,
-            List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps) {
+            List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps,
+            List<Map<String, Object>> queryData) {
         String evidenceMode = (decisionType.contains("QUERY") || decisionType.contains("HYBRID"))
                 ? "LIVE_DATA" : "MEMORY";
         OrchestratorDecision decision = new OrchestratorDecision(
@@ -702,7 +717,8 @@ public class ChatService {
                 agent != null ? agent.name() : null,
                 agent != null ? agent.domainKeys() : null,
                 confidence, needsKnowledge, "",
-                quickRefs, asyncOps);
+                quickRefs, asyncOps,
+                queryData != null ? queryData : List.of());
     }
 
     // =========================================================================
