@@ -167,6 +167,14 @@ public class TenantController {
             throw new NexusException(HttpStatus.FORBIDDEN,
                     "Admin role required for tenant management");
         }
+        // Tenant management is only available from the platform workspace (public schema).
+        // A tenant admin (e.g. acme-corp) has ADMIN role in their own schema but must
+        // not be able to create, list, or deprovision other tenants.
+        String currentSchema = com.sei.nexus.tenant.TenantContext.getSchema();
+        if (!"public".equals(currentSchema)) {
+            throw new NexusException(HttpStatus.FORBIDDEN,
+                    "Tenant management is only available from the platform workspace");
+        }
     }
 
     private String requireString(Map<String, Object> body, String field) {
