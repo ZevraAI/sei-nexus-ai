@@ -77,8 +77,17 @@ public class OnboardingService {
     public Map<String, Object> getStatus() {
         Map<String, Object> result = new LinkedHashMap<>();
 
-        // 1. Explicit completion flag set by the wizard
-        boolean complete = settings.isTrue(KEY_COMPLETED);
+        // 1. Explicit completion flag set by the wizard.
+        //    Wrapped in try-catch: if nexus_tenant_settings doesn't exist yet
+        //    (tenant schema not fully migrated), treat as "not complete" rather
+        //    than throwing a 500 that silently skips the wizard in the frontend.
+        boolean complete;
+        try {
+            complete = settings.isTrue(KEY_COMPLETED);
+        } catch (Exception e) {
+            log.warn("Could not read onboarding_completed setting (schema may be incomplete): {}", e.getMessage());
+            complete = false;
+        }
 
         // 2. Auto-complete for tenants configured outside the wizard.
         //
@@ -102,7 +111,14 @@ public class OnboardingService {
         }
 
         result.put("complete", complete);
-        long connCount = connectionRepository.findAll().size();
+
+        long connCount;
+        try {
+            connCount = connectionRepository.findAll().size();
+        } catch (Exception e) {
+            log.warn("Could not count connections: {}", e.getMessage());
+            connCount = 0;
+        }
         result.put("connection_count", connCount);
 
         if (complete) {
