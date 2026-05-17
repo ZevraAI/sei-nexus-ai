@@ -572,25 +572,22 @@ public class ChatService {
         }
 
         // ── Enterprise map entity context (columns, scan data) ────────────────
-        if (entCtx.containsKey("entityContext")) {
-            String ec = (String) entCtx.get("entityContext");
-            if (ec != null && !ec.isBlank()) {
-                sb.append("=== TABLE SCHEMA ===\n").append(ec).append("\n");
-            } else {
-                sb.append("=== TABLE SCHEMA ===\n");
-                sb.append("NO APPROVED DATA SOURCES CONFIGURED.\n");
-                sb.append("Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
-                sb.append("Use KNOWLEDGE_GAP — the user needs to complete onboarding first.\n\n");
-            }
+        boolean hasMemory = memChunks != null && !memChunks.isEmpty();
+        String ec = entCtx.containsKey("entityContext") ? (String) entCtx.get("entityContext") : null;
+        if (ec != null && !ec.isBlank()) {
+            sb.append("=== TABLE SCHEMA ===\n").append(ec).append("\n");
         } else {
             sb.append("=== TABLE SCHEMA ===\n");
-            sb.append("NO APPROVED DATA SOURCES CONFIGURED.\n");
-            sb.append("Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
-            sb.append("Use KNOWLEDGE_GAP — the user needs to complete onboarding first.\n\n");
+            sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
+            if (hasMemory) {
+                sb.append("Memory documents ARE available — use ANSWER_FROM_MEMORY.\n\n");
+            } else {
+                sb.append("No memory documents either — use KNOWLEDGE_GAP.\n\n");
+            }
         }
 
         // ── Supporting context ────────────────────────────────────────────────
-        if (memChunks != null && !memChunks.isEmpty()) {
+        if (hasMemory) {
             sb.append("Knowledge memory chunks: ").append(memChunks.size()).append(" available\n");
         }
         if (!semCtx.isBlank()) sb.append("Semantic layer: available\n");
