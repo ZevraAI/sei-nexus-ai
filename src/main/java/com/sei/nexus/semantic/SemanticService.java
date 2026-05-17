@@ -19,13 +19,13 @@ public class SemanticService {
     private static final Logger log = LoggerFactory.getLogger(SemanticService.class);
 
     private static final String FIND_ENTITIES =
-            "SELECT entity_key, entity_name, entity_type, description, domain_key, " +
-            "canonical_identifiers, synonyms, status " +
+            "SELECT entity_key, entity_name, node_type, description, " +
+            "operational_meaning, investigation_hints, status " +
             "FROM nexus_business_entity WHERE domain_key = ANY(?::text[]) AND status = 'ACTIVE' LIMIT 50";
 
     private static final String FIND_VOCABULARY =
-            "SELECT term, definition, synonyms, domain_key " +
-            "FROM nexus_operational_vocabulary WHERE domain_key = ANY(?::text[]) LIMIT 30";
+            "SELECT term, definition, sql_equivalent " +
+            "FROM nexus_operational_vocabulary WHERE domain_key = ANY(?::text[]) AND status = 'ACTIVE' LIMIT 30";
 
     private final JdbcTemplate jdbc;
     private final AzureOpenAiClient aiClient;
@@ -54,15 +54,16 @@ public class SemanticService {
             List<String> entityRows = jdbc.query(FIND_ENTITIES,
                     ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", domainArray)),
                     (rs, rowNum) -> {
-                        String name = rs.getString("entity_name");
-                        String type = rs.getString("entity_type");
-                        String desc = rs.getString("description");
-                        String synonyms = rs.getString("synonyms");
-                        String id = rs.getString("canonical_identifiers");
-                        StringBuilder row = new StringBuilder(name).append(" (").append(type).append(")");
+                        String name    = rs.getString("entity_name");
+                        String type    = rs.getString("node_type");
+                        String desc    = rs.getString("description");
+                        String meaning = rs.getString("operational_meaning");
+                        String hints   = rs.getString("investigation_hints");
+                        StringBuilder row = new StringBuilder(name);
+                        if (type != null && !type.isBlank()) row.append(" (").append(type).append(")");
                         if (desc != null && !desc.isBlank()) row.append(": ").append(desc);
-                        if (synonyms != null && !synonyms.isBlank()) row.append(" [also: ").append(synonyms).append("]");
-                        if (id != null && !id.isBlank()) row.append(" [id: ").append(id).append("]");
+                        if (meaning != null && !meaning.isBlank()) row.append(" | ").append(meaning);
+                        if (hints != null && !hints.isBlank()) row.append(" | Hint: ").append(hints);
                         return row.toString();
                     });
 
@@ -77,10 +78,10 @@ public class SemanticService {
                     ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", domainArray)),
                     (rs, rowNum) -> {
                         String term = rs.getString("term");
-                        String def = rs.getString("definition");
-                        String synonyms = rs.getString("synonyms");
-                        String row = term + ": " + def;
-                        return (synonyms != null && !synonyms.isBlank()) ? row + " [synonyms: " + synonyms + "]" : row;
+                        String def  = rs.getString("definition");
+                        String sql  = rs.getString("sql_equivalent");
+                        String row  = term + ": " + def;
+                        return (sql != null && !sql.isBlank()) ? row + " [SQL: " + sql + "]" : row;
                     });
 
             if (!vocabRows.isEmpty()) {
