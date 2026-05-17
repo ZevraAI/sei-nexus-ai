@@ -72,11 +72,7 @@ public class ConnectionRepository {
     }
 
     public void archive(String connectionKey) {
-        jdbc.update("""
-                UPDATE nexus_connection
-                   SET status = 'ARCHIVED', updated_at = NOW()
-                 WHERE connection_key = ?
-                """, connectionKey);
+        jdbc.update("DELETE FROM nexus_connection WHERE connection_key = ?", connectionKey);
     }
 
     public void updateTestResult(String connectionKey, String status, String message) {
