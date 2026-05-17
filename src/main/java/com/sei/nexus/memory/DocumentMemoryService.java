@@ -4,7 +4,6 @@ import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
 import org.apache.tika.Tika;
-import org.apache.tika.metadata.Metadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -145,11 +144,14 @@ public class DocumentMemoryService {
         memoryRepository.updateDocumentStatus(documentKey, "INDEXING", 0, null);
 
         try {
-            // --- Extract text with Apache Tika ---
+            // --- Extract text ---
             File file = new File(doc.filePath());
-            Tika tika = new Tika();
-            Metadata metadata = new Metadata();
-            String rawText = tika.parseToString(new FileInputStream(file), metadata, TIKA_MAX_CHARS);
+            if (!file.exists()) {
+                throw new IllegalStateException("File not found on disk: " + doc.filePath());
+            }
+
+            String rawText = extractText(file, doc.contentType());
+            log.info("Extracted {} chars from document {}", rawText.length(), documentKey);
 
             // --- Chunk ---
             List<String> chunks = chunkText(rawText, documentKey, doc.domainKey(), doc.title());
@@ -261,6 +263,34 @@ public class DocumentMemoryService {
     // ---------------------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------------------
+
+    /**
+     * Extracts plain text from a document file.
+     * Text-based files (txt, md, html) are read directly — Tika can silently
+     * return blank text for these on some platforms. Binary formats (pdf, docx)
+     * use Tika for structured extraction.
+     */
+    private String extractText(File file, String contentType) throws Exception {
+        String name = file.getName().toLowerCase();
+        boolean isPlainText = name.endsWith(".txt") || name.endsWith(".md")
+                || name.endsWith(".html") || name.endsWith(".htm")
+                || (contentType != null && (contentType.startsWith("text/")
+                        || contentType.equals("application/xhtml+xml")));
+
+        if (isPlainText) {
+            return java.nio.file.Files.readString(file.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+
+        // PDF, DOCX, etc. — use Tika
+        Tika tika = new Tika();
+        org.apache.tika.metadata.Metadata metadata = new org.apache.tika.metadata.Metadata();
+        String text = tika.parseToString(new FileInputStream(file), metadata, TIKA_MAX_CHARS);
+        if (text == null || text.isBlank()) {
+            log.warn("Tika returned blank text for {}; attempting raw read", file.getName());
+            text = java.nio.file.Files.readString(file.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        return text;
+    }
 
     private String extractExtension(String fileName) {
         int dot = fileName.lastIndexOf('.');
