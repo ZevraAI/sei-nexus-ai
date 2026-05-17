@@ -165,7 +165,11 @@ public class ChatService {
 
             switch (decisionType) {
                 case "ANSWER_FROM_PRIOR_RESULTS" -> {
-                    answer = answerFromPriorResults(question, priorSnapshot.get(), memChunks, history, agent);
+                    if (priorSnapshot.isPresent()) {
+                        answer = answerFromPriorResults(question, priorSnapshot.get(), memChunks, history, agent);
+                    } else {
+                        answer = answerFromMemory(question, memChunks, semCtx, entCtx, agent);
+                    }
                 }
                 case "ANSWER_FROM_MEMORY" -> {
                     answer = answerFromMemory(question, memChunks, semCtx, entCtx, agent);

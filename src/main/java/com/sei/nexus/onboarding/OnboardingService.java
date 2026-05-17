@@ -2,6 +2,8 @@ package com.sei.nexus.onboarding;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sei.nexus.agent.AgentRepository;
+import com.sei.nexus.agent.AgentService;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.connection.ConnectionRepository;
@@ -40,6 +42,8 @@ public class OnboardingService {
     private final AzureOpenAiClient        aiClient;
     private final ObjectMapper             objectMapper;
     private final JdbcTemplate             jdbc;
+    private final AgentService             agentService;
+    private final AgentRepository          agentRepository;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -48,7 +52,9 @@ public class OnboardingService {
                               SemanticService semanticService,
                               AzureOpenAiClient aiClient,
                               ObjectMapper objectMapper,
-                              JdbcTemplate jdbc) {
+                              JdbcTemplate jdbc,
+                              AgentService agentService,
+                              AgentRepository agentRepository) {
         this.settings             = settings;
         this.connectionRepository = connectionRepository;
         this.dynamicSqlService    = dynamicSqlService;
@@ -57,6 +63,8 @@ public class OnboardingService {
         this.aiClient             = aiClient;
         this.objectMapper         = objectMapper;
         this.jdbc                 = jdbc;
+        this.agentService         = agentService;
+        this.agentRepository      = agentRepository;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -451,6 +459,25 @@ public class OnboardingService {
             settings.set(KEY_QUESTIONS, objectMapper.writeValueAsString(topQuestions));
         } catch (Exception e) {
             log.warn("Failed to store suggested questions: {}", e.getMessage());
+        }
+
+        // 5. Auto-create a default Data Analyst agent if no active agents exist yet.
+        //    Only runs once per tenant — skipped if the user has already configured agents.
+        try {
+            if (agentRepository.findActive().isEmpty()) {
+                Map<String, Object> agentBody = new LinkedHashMap<>();
+                agentBody.put("agentKey",       "data-analyst");
+                agentBody.put("name",           "Data Analyst");
+                agentBody.put("purpose",        "Answers operational intelligence questions using your enterprise data");
+                agentBody.put("domainKeys",     domainKey != null ? domainKey : "");
+                agentBody.put("connectionKeys", connectionKey != null ? connectionKey : "");
+                agentBody.put("actionScope",    "READ_ONLY");
+                agentBody.put("restApiEnabled", false);
+                agentService.createOrUpdate(agentBody, userEmail);
+                log.info("Auto-created default Data Analyst agent for domain {}", domainKey);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to auto-create default agent: {}", e.getMessage());
         }
 
         return Map.of(
