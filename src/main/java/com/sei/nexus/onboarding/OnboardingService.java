@@ -72,20 +72,30 @@ public class OnboardingService {
         // 1. Explicit completion flag set by the wizard
         boolean complete = settings.isTrue(KEY_COMPLETED);
 
-        // 2. Auto-complete: if the tenant already has business entities configured
-        //    (e.g. the default tenant seeded by V007, or any tenant that was set up
-        //    outside the wizard), skip onboarding entirely.
+        // 2. Auto-complete for tenants that were set up OUTSIDE the wizard
+        //    (e.g. the default/platform workspace which has V007 seed data and
+        //    pre-existing connections).
+        //
+        //    Condition: entities > 0 AND connections > 0
+        //    Why BOTH are required: every new tenant schema gets V007 logistics
+        //    entities from the Flyway migration, so entities alone is not a
+        //    reliable signal. Connections are only added by a human action, so
+        //    "has entities + has connections" reliably means the tenant has been
+        //    genuinely configured and does not need onboarding.
         if (!complete) {
             try {
-                Integer entityCount = jdbc.queryForObject(
-                        "SELECT COUNT(*) FROM nexus_business_entity WHERE status != 'ARCHIVED'",
-                        Integer.class);
-                if (entityCount != null && entityCount > 0) {
-                    settings.set(KEY_COMPLETED, "true");
-                    complete = true;
+                long connCount2 = connectionRepository.findAll().size();
+                if (connCount2 > 0) {
+                    Integer entityCount = jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM nexus_business_entity WHERE status != 'ARCHIVED'",
+                            Integer.class);
+                    if (entityCount != null && entityCount > 0) {
+                        settings.set(KEY_COMPLETED, "true");
+                        complete = true;
+                    }
                 }
             } catch (Exception ignored) {
-                // Table may not exist yet on very first startup — fail open
+                // Fail open — table may not exist on first startup
             }
         }
 
