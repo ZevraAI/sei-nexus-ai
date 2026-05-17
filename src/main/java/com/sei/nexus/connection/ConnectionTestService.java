@@ -156,10 +156,28 @@ public class ConnectionTestService {
     // Helpers
     // ---------------------------------------------------------------------------
 
-    /** Strip potentially sensitive JDBC details from error messages. */
+    /** Return a user-friendly, actionable error message from a raw JDBC/HTTP exception. */
     private String sanitise(String message) {
         if (message == null) return "Unknown error";
-        // Truncate very long messages
+        String m = message.toLowerCase();
+        if (m.contains("connection attempt failed") || m.contains("timed out") || m.contains("timeout")) {
+            return "Host unreachable or connection timed out — verify the hostname and port in the JDBC URL are correct and the database is accepting remote connections.";
+        }
+        if (m.contains("connection refused")) {
+            return "Connection refused — the database is not listening on the specified host/port. Check that the host, port, and firewall rules are correct.";
+        }
+        if (m.contains("password") || m.contains("authentication") || m.contains("pg_hba")) {
+            return "Authentication failed — check the username and password.";
+        }
+        if (m.contains("database") && (m.contains("does not exist") || m.contains("not found"))) {
+            return "Database not found — verify the database name at the end of the JDBC URL.";
+        }
+        if (m.contains("unknown host") || m.contains("nodename nor servname")) {
+            return "Unknown hostname — the hostname in the JDBC URL cannot be resolved. Check for typos.";
+        }
+        if (m.contains("ssl") || m.contains("certificate")) {
+            return "SSL/TLS error — try adding ?sslmode=require or ?sslmode=disable to the JDBC URL.";
+        }
         return message.length() > 256 ? message.substring(0, 256) + "…" : message;
     }
 }
