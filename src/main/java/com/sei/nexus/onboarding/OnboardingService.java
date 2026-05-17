@@ -429,14 +429,13 @@ public class OnboardingService {
             // 2. Create semantic business entity
             try {
                 Map<String, Object> entityBody = new LinkedHashMap<>();
-                entityBody.put("entity_key",          entityKey);
-                entityBody.put("entity_name",         entityName);
-                entityBody.put("description",         purpose);
-                entityBody.put("operational_meaning", opMeaning);
-                entityBody.put("investigation_hints", hints);
-                entityBody.put("domain_key",          domainKey);
-                entityBody.put("node_type",           "ENTITY");
-                entityBody.put("status",              "ACTIVE");
+                entityBody.put("entityKey",          entityKey);
+                entityBody.put("entityName",         entityName);
+                entityBody.put("description",        purpose);
+                entityBody.put("operationalMeaning", opMeaning);
+                entityBody.put("investigationHints", hints);
+                entityBody.put("domainKey",          domainKey);
+                entityBody.put("status",             "ACTIVE");
                 semanticService.createOrUpdateEntity(entityBody, userEmail);
                 entitiesCreated++;
             } catch (Exception e) {
@@ -450,12 +449,13 @@ public class OnboardingService {
                 if (!Boolean.TRUE.equals(term.get("approved"))) continue;
                 try {
                     Map<String, Object> termBody = new LinkedHashMap<>();
-                    termBody.put("term_key",       slugify((String) term.get("term")) + "-" + entityKey);
-                    termBody.put("term",           term.get("term"));
-                    termBody.put("definition",     term.get("definition"));
-                    termBody.put("sql_equivalent", term.getOrDefault("sqlEquivalent", ""));
-                    termBody.put("domain_key",     domainKey);
-                    termBody.put("status",         "ACTIVE");
+                    termBody.put("termKey",      slugify((String) term.get("term")) + "-" + entityKey);
+                    termBody.put("term",         term.get("term"));
+                    termBody.put("definition",   term.get("definition"));
+                    termBody.put("sqlEquivalent", term.getOrDefault("sqlEquivalent", ""));
+                    termBody.put("domainKey",    domainKey);
+                    termBody.put("entityKey",    entityKey);
+                    termBody.put("status",       "ACTIVE");
                     semanticService.createTerm(termBody);
                     vocabCreated++;
                 } catch (Exception e) {
