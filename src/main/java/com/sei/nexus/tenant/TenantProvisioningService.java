@@ -162,6 +162,9 @@ public class TenantProvisioningService {
                     "The default tenant cannot be deprovisioned");
         }
         tenantRepository.updateStatus(slug, "DEPROVISIONED");
+        // Invalidate all active sessions for this tenant so existing token holders
+        // get a clean 401 rather than an obscure schema-not-found error.
+        tenantRepository.deleteSessionsBySchema(tenant.schemaName());
         dropSchema(tenant.schemaName());
         log.warn("Tenant '{}' deprovisioned — schema '{}' dropped", slug, tenant.schemaName());
     }

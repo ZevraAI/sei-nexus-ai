@@ -132,6 +132,10 @@ public class TenantRepository {
         jdbc.update("DELETE FROM nexus_session_index WHERE token_hash = ?", tokenHash);
     }
 
+    public void deleteSessionsBySchema(String tenantSchema) {
+        jdbc.update("DELETE FROM nexus_session_index WHERE tenant_schema = ?", tenantSchema);
+    }
+
     public int deleteExpiredSessionIndexes() {
         return jdbc.update("DELETE FROM nexus_session_index WHERE expires_at <= NOW()");
     }
