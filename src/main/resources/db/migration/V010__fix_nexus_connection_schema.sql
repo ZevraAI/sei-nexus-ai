@@ -26,7 +26,7 @@ CREATE TABLE nexus_connection (
     last_test_message   TEXT,
     last_tested_at      TIMESTAMPTZ,
     status              VARCHAR(32)     NOT NULL DEFAULT 'ACTIVE'
-                            CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR')),
+                            CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR', 'ARCHIVED')),
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
