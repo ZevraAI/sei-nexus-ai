@@ -2,6 +2,7 @@ package com.sei.nexus.onboarding;
 
 import com.sei.nexus.auth.UserAccount;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.connection.ConnectionRepository;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -27,10 +28,13 @@ import java.util.Map;
 @RequestMapping("/onboarding")
 public class OnboardingController {
 
-    private final OnboardingService onboardingService;
+    private final OnboardingService      onboardingService;
+    private final ConnectionRepository   connectionRepository;
 
-    public OnboardingController(OnboardingService onboardingService) {
-        this.onboardingService = onboardingService;
+    public OnboardingController(OnboardingService onboardingService,
+                                 ConnectionRepository connectionRepository) {
+        this.onboardingService    = onboardingService;
+        this.connectionRepository = connectionRepository;
     }
 
     /**
@@ -83,7 +87,7 @@ public class OnboardingController {
     @PostMapping("/recommend")
     public ResponseEntity<Map<String, Object>> recommend(@RequestBody Map<String, Object> body) {
         String connectionKey = require(body, "connectionKey");
-        String schemaName    = (String) body.getOrDefault("schemaName", "public");
+        String schemaName    = resolveSchema(body, connectionKey);
         return ResponseEntity.ok(onboardingService.recommendTables(connectionKey, schemaName));
     }
 
@@ -99,7 +103,7 @@ public class OnboardingController {
     @PostMapping("/scan")
     public ResponseEntity<Map<String, Object>> scan(@RequestBody Map<String, Object> body) {
         String connectionKey = require(body, "connectionKey");
-        String schemaName    = (String) body.getOrDefault("schemaName", "public");
+        String schemaName    = resolveSchema(body, connectionKey);
 
         List<Map<String, Object>> tables =
                 onboardingService.scanTables(connectionKey, schemaName);
@@ -214,6 +218,23 @@ public class OnboardingController {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the schema to use for a scan/recommend operation.
+     * Priority: explicit schemaName in request body → connection's allowedSchemas → "public".
+     */
+    private String resolveSchema(Map<String, Object> body, String connectionKey) {
+        String explicit = (String) body.get("schemaName");
+        if (explicit != null && !explicit.isBlank()) return explicit.trim();
+        return connectionRepository.findByKey(connectionKey)
+                .map(c -> {
+                    String s = c.allowedSchemas();
+                    if (s == null || s.isBlank()) return "public";
+                    // allowedSchemas may be comma-separated; use the first entry
+                    return s.split(",")[0].trim();
+                })
+                .orElse("public");
+    }
 
     private String require(Map<String, Object> body, String field) {
         Object val = body.get(field);
