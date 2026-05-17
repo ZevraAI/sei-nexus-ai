@@ -9,6 +9,7 @@ import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.enterprise.EnterpriseMapService;
 import com.sei.nexus.knowledge.KnowledgeGap;
 import com.sei.nexus.knowledge.KnowledgeGapRepository;
@@ -48,6 +49,7 @@ public class ChatService {
     private final EnterpriseMapService enterpriseMapService;
     private final SemanticService semanticService;
     private final AgentRepository agentRepository;
+    private final ConnectionRepository connectionRepository;
     private final QueryGovernanceService queryGovernanceService;
     private final QueryExecutionRepository queryExecutionRepository;
     private final DynamicSqlService dynamicSqlService;
@@ -63,6 +65,7 @@ public class ChatService {
                        EnterpriseMapService enterpriseMapService,
                        SemanticService semanticService,
                        AgentRepository agentRepository,
+                       ConnectionRepository connectionRepository,
                        QueryGovernanceService queryGovernanceService,
                        QueryExecutionRepository queryExecutionRepository,
                        DynamicSqlService dynamicSqlService,
@@ -77,6 +80,7 @@ public class ChatService {
         this.enterpriseMapService = enterpriseMapService;
         this.semanticService = semanticService;
         this.agentRepository = agentRepository;
+        this.connectionRepository = connectionRepository;
         this.queryGovernanceService = queryGovernanceService;
         this.queryExecutionRepository = queryExecutionRepository;
         this.dynamicSqlService = dynamicSqlService;
@@ -229,6 +233,20 @@ public class ChatService {
                         String desc = step.containsKey("description") ? (String) step.get("description") : "Step " + stepNo;
 
                         if (sql == null || connKey == null || connKey.isBlank()) {
+                            stepNo++;
+                            continue;
+                        }
+
+                        // Validate the connection key exists before handing to governance.
+                        // The AI sometimes invents a key from context (table name, group label).
+                        // Skip the step gracefully rather than throwing a 500.
+                        if (connectionRepository.findByKeyOrName(connKey).isEmpty()) {
+                            log.warn("Step {} skipped — AI generated unknown connection_key '{}'. " +
+                                     "Check that onboarding has been completed and data objects are configured.",
+                                     stepNo, connKey);
+                            execResults.add(Map.of("step", stepNo, "error",
+                                    "No approved data source found for this query. " +
+                                    "Complete onboarding to configure a database connection."));
                             stepNo++;
                             continue;
                         }
@@ -558,7 +576,17 @@ public class ChatService {
             String ec = (String) entCtx.get("entityContext");
             if (ec != null && !ec.isBlank()) {
                 sb.append("=== TABLE SCHEMA ===\n").append(ec).append("\n");
+            } else {
+                sb.append("=== TABLE SCHEMA ===\n");
+                sb.append("NO APPROVED DATA SOURCES CONFIGURED.\n");
+                sb.append("Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
+                sb.append("Use KNOWLEDGE_GAP — the user needs to complete onboarding first.\n\n");
             }
+        } else {
+            sb.append("=== TABLE SCHEMA ===\n");
+            sb.append("NO APPROVED DATA SOURCES CONFIGURED.\n");
+            sb.append("Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
+            sb.append("Use KNOWLEDGE_GAP — the user needs to complete onboarding first.\n\n");
         }
 
         // ── Supporting context ────────────────────────────────────────────────
