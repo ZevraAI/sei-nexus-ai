@@ -49,6 +49,15 @@ public class OnboardingController {
      */
     @GetMapping("/status")
     public ResponseEntity<Map<String, Object>> status() {
+        // Platform admins (public schema) never need onboarding — return complete immediately.
+        String schema = com.sei.nexus.tenant.TenantContext.getSchema();
+        if ("public".equals(schema)) {
+            return ResponseEntity.ok(java.util.Map.of(
+                    "complete", true,
+                    "step", "COMPLETE",
+                    "connection_count", 0,
+                    "suggested_questions", java.util.List.of()));
+        }
         return ResponseEntity.ok(onboardingService.getStatus());
     }
 
