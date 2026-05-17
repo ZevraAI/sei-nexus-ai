@@ -488,6 +488,87 @@ public class OnboardingService {
         );
     }
 
+    // ── Reset ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Wipes all onboarding-generated data so the wizard can be re-run.
+     * Deletes: settings flags, user-created entities + vocab + data objects,
+     * entity relationships, and the auto-created default agent.
+     * System-seeded rows (created_by = 'system') are preserved.
+     */
+    public Map<String, Object> reset() {
+        int deletedSettings  = 0;
+        int deletedEntities  = 0;
+        int deletedVocab     = 0;
+        int deletedObjects   = 0;
+        int deletedAgents    = 0;
+
+        try {
+            // Agent children first (FK order)
+            jdbc.update("DELETE FROM nexus_agent_kpi      WHERE agent_key = 'data-analyst'");
+            jdbc.update("DELETE FROM nexus_agent_playbook WHERE agent_key = 'data-analyst'");
+            jdbc.update("DELETE FROM nexus_agent_version  WHERE agent_key = 'data-analyst'");
+            deletedAgents = jdbc.update("DELETE FROM nexus_agent WHERE agent_key = 'data-analyst'");
+        } catch (Exception e) {
+            log.warn("Reset: agent cleanup failed: {}", e.getMessage());
+        }
+
+        try {
+            // Semantic entity children
+            jdbc.update("""
+                DELETE FROM nexus_entity_lifecycle_state
+                WHERE entity_key IN (SELECT entity_key FROM nexus_business_entity WHERE created_by != 'system')
+                """);
+            jdbc.update("""
+                DELETE FROM nexus_entity_data_mapping
+                WHERE entity_key IN (SELECT entity_key FROM nexus_business_entity WHERE created_by != 'system')
+                """);
+            jdbc.update("""
+                DELETE FROM nexus_entity_relationship
+                WHERE source_entity_key IN (SELECT entity_key FROM nexus_business_entity WHERE created_by != 'system')
+                   OR target_entity_key IN (SELECT entity_key FROM nexus_business_entity WHERE created_by != 'system')
+                """);
+            deletedVocab    = jdbc.update("DELETE FROM nexus_operational_vocabulary WHERE created_by != 'system'");
+            deletedEntities = jdbc.update("DELETE FROM nexus_business_entity        WHERE created_by != 'system'");
+        } catch (Exception e) {
+            log.warn("Reset: entity cleanup failed: {}", e.getMessage());
+        }
+
+        try {
+            // Enterprise map objects
+            jdbc.update("""
+                DELETE FROM nexus_data_column
+                WHERE object_key IN (SELECT object_key FROM nexus_data_object WHERE created_by != 'system')
+                """);
+            jdbc.update("""
+                DELETE FROM nexus_data_object_version
+                WHERE object_key IN (SELECT object_key FROM nexus_data_object WHERE created_by != 'system')
+                """);
+            deletedObjects = jdbc.update("DELETE FROM nexus_data_object WHERE created_by != 'system'");
+        } catch (Exception e) {
+            log.warn("Reset: data object cleanup failed: {}", e.getMessage());
+        }
+
+        try {
+            deletedSettings = jdbc.update(
+                    "DELETE FROM nexus_tenant_settings WHERE setting_key LIKE 'onboarding%'");
+        } catch (Exception e) {
+            log.warn("Reset: settings cleanup failed: {}", e.getMessage());
+        }
+
+        log.info("Onboarding reset: {} settings, {} entities, {} vocab, {} objects, {} agents deleted",
+                deletedSettings, deletedEntities, deletedVocab, deletedObjects, deletedAgents);
+
+        return Map.of(
+                "settings_deleted",       deletedSettings,
+                "entities_deleted",       deletedEntities,
+                "vocab_deleted",          deletedVocab,
+                "data_objects_deleted",   deletedObjects,
+                "agents_deleted",         deletedAgents,
+                "status",                 "RESET"
+        );
+    }
+
     // ── Complete ──────────────────────────────────────────────────────────────
 
     /**

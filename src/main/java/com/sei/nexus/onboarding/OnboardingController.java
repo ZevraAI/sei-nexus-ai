@@ -189,6 +189,21 @@ public class OnboardingController {
         return ResponseEntity.ok(onboardingService.complete());
     }
 
+    /**
+     * POST /onboarding/reset
+     * Wipes all onboarding-generated data for this tenant so the wizard
+     * can be re-run from scratch. Useful for testing and re-onboarding.
+     * System-seeded rows (created_by = 'system') are preserved.
+     *
+     * <pre>
+     * Response: { "status": "RESET", "entities_deleted": 3, ... }
+     * </pre>
+     */
+    @PostMapping("/reset")
+    public ResponseEntity<Map<String, Object>> reset() {
+        return ResponseEntity.ok(onboardingService.reset());
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private String require(Map<String, Object> body, String field) {
