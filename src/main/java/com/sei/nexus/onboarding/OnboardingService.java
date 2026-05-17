@@ -72,30 +72,24 @@ public class OnboardingService {
         // 1. Explicit completion flag set by the wizard
         boolean complete = settings.isTrue(KEY_COMPLETED);
 
-        // 2. Auto-complete for tenants that were set up OUTSIDE the wizard
-        //    (e.g. the default/platform workspace which has V007 seed data and
-        //    pre-existing connections).
+        // 2. Auto-complete for tenants configured outside the wizard.
         //
-        //    Condition: entities > 0 AND connections > 0
-        //    Why BOTH are required: every new tenant schema gets V007 logistics
-        //    entities from the Flyway migration, so entities alone is not a
-        //    reliable signal. Connections are only added by a human action, so
-        //    "has entities + has connections" reliably means the tenant has been
-        //    genuinely configured and does not need onboarding.
+        //    V007 migration seeds logistics demo entities with created_by = 'system'.
+        //    User-created entities (via wizard or Semantic Layer) carry the user's
+        //    email in created_by. Filtering on created_by != 'system' means system
+        //    seed data never suppresses the wizard for genuine new customers.
         if (!complete) {
             try {
-                long connCount2 = connectionRepository.findAll().size();
-                if (connCount2 > 0) {
-                    Integer entityCount = jdbc.queryForObject(
-                            "SELECT COUNT(*) FROM nexus_business_entity WHERE status != 'ARCHIVED'",
-                            Integer.class);
-                    if (entityCount != null && entityCount > 0) {
-                        settings.set(KEY_COMPLETED, "true");
-                        complete = true;
-                    }
+                Integer userEntityCount = jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM nexus_business_entity " +
+                        "WHERE status != 'ARCHIVED' AND created_by != 'system'",
+                        Integer.class);
+                if (userEntityCount != null && userEntityCount > 0) {
+                    settings.set(KEY_COMPLETED, "true");
+                    complete = true;
                 }
             } catch (Exception ignored) {
-                // Fail open — table may not exist on first startup
+                // Fail open — table may not exist on very first startup
             }
         }
 
