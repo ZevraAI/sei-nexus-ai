@@ -34,6 +34,16 @@ public class ConnectionRepository {
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }
 
+    /** Looks up by key first; falls back to case-insensitive name match. */
+    public Optional<NexusConnection> findByKeyOrName(String value) {
+        Optional<NexusConnection> byKey = findByKey(value);
+        if (byKey.isPresent()) return byKey;
+        List<NexusConnection> rows = jdbc.query(
+                "SELECT * FROM nexus_connection WHERE LOWER(name) = LOWER(?) AND status = 'ACTIVE' LIMIT 1",
+                rowMapper(), value);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
     /**
      * Upserts a connection record keyed on connection_key.
      */

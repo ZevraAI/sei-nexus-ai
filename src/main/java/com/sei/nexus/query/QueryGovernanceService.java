@@ -85,8 +85,9 @@ public class QueryGovernanceService {
                 "BLOCKED", "BLOCK", "CRITICAL", sql, safety.reason(), -1, defaultRowLimit, syncTimeout);
         }
 
-        // 2. Load connection
-        NexusConnection conn = connectionRepository.findByKey(connectionKey)
+        // 2. Load connection — try exact key first, then name match so the AI
+        //    can use a display name and still resolve to the right connection.
+        NexusConnection conn = connectionRepository.findByKeyOrName(connectionKey)
             .orElseThrow(() -> new NexusException(HttpStatus.BAD_REQUEST, "Connection not found: " + connectionKey));
 
         // 3. Validate tables in SQL are on allow-list

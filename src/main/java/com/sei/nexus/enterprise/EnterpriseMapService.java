@@ -187,7 +187,8 @@ public class EnterpriseMapService {
             entityContext.append("Table: ").append(obj.schemaName()).append(".").append(obj.tableName())
                     .append(" (").append(obj.businessName()).append(")\n");
             entityContext.append("Purpose: ").append(orEmpty(obj.purpose())).append("\n");
-            entityContext.append("Connection: ").append(obj.connectionKey()).append("\n");
+            entityContext.append("connection_key=").append(obj.connectionKey())
+                         .append(" (use this exact value in your SQL plan)\n");
             if (obj.identifierColumns() != null && !obj.identifierColumns().isBlank()) {
                 entityContext.append("Identifier columns: ").append(obj.identifierColumns()).append("\n");
             }
