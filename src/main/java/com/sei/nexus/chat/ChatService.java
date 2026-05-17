@@ -242,12 +242,14 @@ public class ChatService {
                         // The AI sometimes invents a key from context (table name, group label).
                         // Skip the step gracefully rather than throwing a 500.
                         if (connectionRepository.findByKeyOrName(connKey).isEmpty()) {
-                            log.warn("Step {} skipped — AI generated unknown connection_key '{}'. " +
-                                     "Check that onboarding has been completed and data objects are configured.",
+                            log.warn("Step {} skipped — connection '{}' is referenced by data objects " +
+                                     "but no longer exists in nexus_connection. " +
+                                     "The connection may have been deleted after onboarding.",
                                      stepNo, connKey);
                             execResults.add(Map.of("step", stepNo, "error",
-                                    "No approved data source found for this query. " +
-                                    "Complete onboarding to configure a database connection."));
+                                    "The database connection configured during onboarding (" + connKey + ") " +
+                                    "no longer exists. Please re-add the connection in the Connections page " +
+                                    "and then use POST /onboarding/reset to re-run onboarding."));
                             stepNo++;
                             continue;
                         }
