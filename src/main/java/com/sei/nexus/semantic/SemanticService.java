@@ -1,7 +1,6 @@
 package com.sei.nexus.semantic;
 
 import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.common.Keys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,7 +10,6 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 @Service
 public class SemanticService {
@@ -101,19 +99,18 @@ public class SemanticService {
     // -------------------------------------------------------------------------
 
     public BusinessEntity createOrUpdateEntity(Map<String, Object> body, String userEmail) {
-        String entityKey = body.containsKey("entityKey")
-                ? (String) body.get("entityKey")
-                : Keys.uniqueKey("entity");
+        String entityKey = str(body, "entityKey", "entity_key");
+        if (entityKey == null || entityKey.isBlank()) entityKey = Keys.uniqueKey("entity");
         Instant now = Instant.now();
         BusinessEntity entity = new BusinessEntity(
                 entityKey,
-                (String) body.get("domainKey"),
-                (String) body.get("entityName"),
-                (String) body.get("description"),
-                (String) body.get("primaryObjectKey"),
-                (String) body.get("operationalMeaning"),
-                (String) body.get("investigationHints"),
-                (String) body.getOrDefault("status", "ACTIVE"),
+                str(body, "domainKey",          "domain_key"),
+                str(body, "entityName",          "entity_name"),
+                str(body, "description"),
+                str(body, "primaryObjectKey",    "primary_object_key"),
+                str(body, "operationalMeaning",  "operational_meaning"),
+                str(body, "investigationHints",  "investigation_hints"),
+                str(body, "status") != null ? str(body, "status") : "ACTIVE",
                 userEmail,
                 now, now);
         repository.saveEntity(entity);
@@ -161,22 +158,33 @@ public class SemanticService {
     }
 
     public OperationalVocabulary createTerm(Map<String, Object> body) {
-        String termKey = body.containsKey("termKey")
-                ? (String) body.get("termKey")
-                : Keys.uniqueKey("term");
+        String termKey = str(body, "termKey", "term_key");
+        if (termKey == null || termKey.isBlank()) termKey = Keys.uniqueKey("term");
         Instant now = Instant.now();
         OperationalVocabulary term = new OperationalVocabulary(
                 termKey,
-                (String) body.get("domainKey"),
-                (String) body.get("entityKey"),
-                (String) body.get("term"),
-                (String) body.get("definition"),
-                (String) body.get("sqlEquivalent"),
-                (String) body.get("examples"),
-                (String) body.getOrDefault("status", "ACTIVE"),
+                str(body, "domainKey",     "domain_key"),
+                str(body, "entityKey",     "entity_key"),
+                str(body, "term"),
+                str(body, "definition"),
+                str(body, "sqlEquivalent", "sql_equivalent"),
+                str(body, "examples"),
+                str(body, "status") != null ? str(body, "status") : "ACTIVE",
                 now, now);
         repository.saveTerm(term);
         return term;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /** Reads the first non-null value for a list of key aliases.
+     *  Accepts both camelCase and snake_case callers without duplicating logic. */
+    private String str(Map<String, Object> body, String... keys) {
+        for (String key : keys) {
+            Object v = body.get(key);
+            if (v != null && !v.toString().isBlank()) return v.toString();
+        }
+        return null;
     }
 
     public EntityDataMapping addMapping(String entityKey, Map<String, Object> body) {
