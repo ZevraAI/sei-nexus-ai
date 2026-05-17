@@ -6,13 +6,20 @@
 -- entities mislead users: Knowledge Graph and Semantic Layer show rich data
 -- while Chat correctly says "no approved data sources".
 --
--- The current_schema() = 'public' guard makes this a safe no-op when Flyway
--- runs this migration against a tenant schema during provisioning.
+-- Guard: nexus_tenant only exists in the public (platform) schema.
+-- Tenant schemas (tenant_xyz etc.) do not have it, so this is a safe no-op
+-- when Flyway runs this migration against a tenant schema during provisioning.
 
 DO $$
 BEGIN
-  IF current_schema() != 'public' THEN
-    RAISE NOTICE 'V012: not public schema — skipping demo seed removal';
+  -- nexus_tenant is the platform-level tenant registry — only present in public.
+  -- If it is not in the current schema we are in a tenant schema: skip.
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.tables
+       WHERE table_name   = 'nexus_tenant'
+         AND table_schema = current_schema()
+  ) THEN
+    RAISE NOTICE 'V012: nexus_tenant not found in current schema — skipping (tenant schema)';
     RETURN;
   END IF;
 
