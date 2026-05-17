@@ -526,42 +526,86 @@ public class ChatService {
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
         try {
             StringBuilder ctx = new StringBuilder();
-            ctx.append("Query results:\n");
+
             for (Map<String, Object> r : execResults) {
                 if (r.containsKey("rows")) {
                     @SuppressWarnings("unchecked")
                     List<Map<String, Object>> rows = (List<Map<String, Object>>) r.get("rows");
-                    ctx.append("Step ").append(r.get("step")).append(": ").append(rows.size()).append(" rows\n");
-                    rows.stream().limit(10).forEach(row -> ctx.append("  ").append(row).append("\n"));
+                    // Build a statistical summary — do NOT dump raw rows. The frontend
+                    // renders the full table, so the AI only needs aggregate insight.
+                    ctx.append(buildRowSummary(rows));
                 } else if (r.containsKey("error")) {
-                    ctx.append("Step ").append(r.get("step")).append(" error: ").append(r.get("error")).append("\n");
+                    ctx.append("Query error: ").append(r.get("error")).append("\n");
                 } else if (r.containsKey("blocked")) {
-                    ctx.append("Step ").append(r.get("step")).append(" blocked: ").append(r.get("reason")).append("\n");
-                } else if (r.containsKey("needs_filter")) {
-                    ctx.append("Step ").append(r.get("step")).append(" needs filter: ").append(r.get("reason")).append("\n");
+                    ctx.append("Query blocked: ").append(r.get("reason")).append("\n");
                 }
             }
+
             if (!findings.isEmpty()) {
-                ctx.append("\nPrior Findings:\n");
-                findings.forEach(f -> ctx.append("- ").append(f.title()).append(": ").append(f.description()).append("\n"));
+                ctx.append("\nRelevant prior findings:\n");
+                findings.stream().limit(2).forEach(f ->
+                        ctx.append("- ").append(f.title()).append(": ").append(f.description()).append("\n"));
             }
             if (!anomalyCtx.isBlank()) ctx.append("\n").append(anomalyCtx);
             if (includeMemory) {
-                memChunks.stream().limit(3).forEach(c -> {
-                    int len = Math.min(500, c.chunkText().length());
-                    ctx.append("\nKnowledge: ").append(c.chunkText(), 0, len);
-                });
+                memChunks.stream().limit(2).forEach(c ->
+                        ctx.append("\nContext: ").append(c.chunkText(), 0, Math.min(300, c.chunkText().length())));
             }
-            String prompt = "Question: " + question + "\n\nInvestigation results:\n" + ctx;
-            return aiClient.chat(List.of(ChatMessage.user(prompt)),
-                    "You are SEI Nexus, an enterprise operational reasoning platform. " +
-                    "Compose a clear, business-focused answer based on the investigation results. " +
-                    "Highlight key findings, identify patterns, and suggest next steps if appropriate. " +
-                    "Format the answer with markdown headings and bullet points for clarity.");
+
+            String prompt = "Question: " + question + "\n\nData summary:\n" + ctx;
+            return aiClient.chat(List.of(ChatMessage.user(prompt)), """
+                    You are Zevra, an enterprise operational intelligence AI.
+                    The full data is already shown to the user in a table and chart — do NOT list individual records or reproduce row-level data.
+                    Write a concise analyst summary of 2-4 sentences covering:
+                    1. Total count and headline distribution (e.g. "10 orders: 5 received, 2 open, 3 overdue")
+                    2. The single most important insight or anomaly (e.g. "All overdue orders are from Supplier 3")
+                    3. One actionable recommendation only if clearly warranted
+                    Use plain prose. Bold key numbers. No markdown headings or bullet lists unless there are multiple distinct anomalies.
+                    """);
         } catch (Exception e) {
-            return "Investigation completed. " + execResults.size() + " step(s) executed. " +
-                    (execResults.stream().anyMatch(r -> r.containsKey("rows")) ? "Results available." : "No data returned.");
+            return "Investigation completed. " +
+                    (execResults.stream().anyMatch(r -> r.containsKey("rows")) ? "Results are shown in the table below." : "No data returned.");
         }
+    }
+
+    /**
+     * Builds a compact statistical summary of query rows for the AI context.
+     * Sends distributions and totals, never individual row values — the frontend
+     * table handles row-level display.
+     */
+    private String buildRowSummary(List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) return "Query returned 0 rows.\n";
+        StringBuilder sb = new StringBuilder();
+        sb.append("Total rows: ").append(rows.size()).append("\n");
+
+        java.util.Set<String> cols = rows.get(0).keySet();
+        sb.append("Columns: ").append(String.join(", ", cols)).append("\n");
+
+        for (String col : cols) {
+            // Distribution for low-cardinality string columns (likely categorical)
+            java.util.List<String> strVals = rows.stream()
+                    .map(r -> String.valueOf(r.getOrDefault(col, "")))
+                    .filter(v -> !v.isBlank() && !v.equals("null"))
+                    .collect(java.util.stream.Collectors.toList());
+            java.util.Map<String, Long> dist = strVals.stream()
+                    .collect(java.util.stream.Collectors.groupingBy(v -> v, java.util.stream.Collectors.counting()));
+            boolean isLowCardinality = dist.size() >= 2 && dist.size() <= 8 && dist.size() < rows.size();
+            boolean looksNumeric = strVals.stream().allMatch(v -> { try { Double.parseDouble(v); return true; } catch (Exception e) { return false; } });
+            boolean isId = col.toLowerCase().endsWith("_id") || col.equalsIgnoreCase("id");
+
+            if (isLowCardinality && !looksNumeric) {
+                sb.append("  ").append(col).append(" distribution: ").append(dist).append("\n");
+            } else if (looksNumeric && !isId) {
+                // Sum and average for numeric non-ID columns
+                try {
+                    double sum = strVals.stream().mapToDouble(Double::parseDouble).sum();
+                    double avg = sum / strVals.size();
+                    sb.append("  ").append(col).append(": sum=").append(String.format("%.2f", sum))
+                      .append(", avg=").append(String.format("%.2f", avg)).append("\n");
+                } catch (Exception ignored) {}
+            }
+        }
+        return sb.toString();
     }
 
     // =========================================================================
