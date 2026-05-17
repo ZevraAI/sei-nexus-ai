@@ -161,18 +161,25 @@ public class EnterpriseMapService {
                                                    String question) {
         Map<String, Object> ctx = new LinkedHashMap<>();
 
-        // Load data objects for agent's domains
+        // Load all data objects for the agent's domains
         List<DataObject> dataObjects = new ArrayList<>();
         for (String dk : agentDomainKeys) {
             dataObjects.addAll(repository.findDataObjectsByDomain(dk));
         }
-        // Also include objects reachable via connection keys
-        if (agentConnectionKeys != null) {
-            for (DataObject o : new ArrayList<>(dataObjects)) {
-                if (!agentConnectionKeys.contains(o.connectionKey())) {
-                    dataObjects.remove(o);
-                }
+
+        // Narrow to the agent's approved connection keys when present.
+        // If the filter produces zero results (e.g. the connection was deleted and
+        // a new one added with a different key), fall back to all domain objects so
+        // the agent can still answer questions — a stale connection key on the agent
+        // record should not silently block all queries.
+        if (agentConnectionKeys != null && !agentConnectionKeys.isEmpty()) {
+            List<DataObject> filtered = dataObjects.stream()
+                    .filter(o -> agentConnectionKeys.contains(o.connectionKey()))
+                    .collect(java.util.stream.Collectors.toList());
+            if (!filtered.isEmpty()) {
+                dataObjects = filtered;
             }
+            // else: filtered is empty — keep all domain objects as fallback
         }
 
         // Load operational notes for those domains
@@ -181,13 +188,32 @@ public class EnterpriseMapService {
             notes.addAll(repository.findNotesByDomain(dk));
         }
 
+        // Resolve a fallback connection key once — used when a data object's stored
+        // connection has been deleted. Avoids re-querying on every iteration.
+        String fallbackConnKey = null;
+
         // Build entity context string
         StringBuilder entityContext = new StringBuilder();
         for (DataObject obj : dataObjects) {
+            // If the data object's stored connection no longer exists, substitute the
+            // first active connection so the AI always receives a usable key.
+            String effectiveConnKey = obj.connectionKey();
+            if (connectionRepository.findByKey(effectiveConnKey).isEmpty()) {
+                if (fallbackConnKey == null) {
+                    fallbackConnKey = connectionRepository.findAll().stream()
+                            .findFirst()
+                            .map(c -> c.connectionKey())
+                            .orElse(effectiveConnKey);
+                }
+                effectiveConnKey = fallbackConnKey;
+                log.warn("Data object '{}' references deleted connection '{}'; substituting '{}' in context",
+                        obj.tableName(), obj.connectionKey(), effectiveConnKey);
+            }
+
             entityContext.append("Table: ").append(obj.schemaName()).append(".").append(obj.tableName())
                     .append(" (").append(obj.businessName()).append(")\n");
             entityContext.append("Purpose: ").append(orEmpty(obj.purpose())).append("\n");
-            entityContext.append("connection_key=").append(obj.connectionKey())
+            entityContext.append("connection_key=").append(effectiveConnKey)
                          .append(" (use this exact value in your SQL plan)\n");
             if (obj.identifierColumns() != null && !obj.identifierColumns().isBlank()) {
                 entityContext.append("Identifier columns: ").append(obj.identifierColumns()).append("\n");
