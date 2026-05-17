@@ -107,6 +107,36 @@ public class MemoryRepository {
                 chunk.chunkText(), vectorStr, chunk.tokenCount());
     }
 
+    /** Retrieves top-K chunks across ALL indexed documents (no domain filter). */
+    public List<DocumentChunk> retrieveAllChunks(float[] embedding, int topK) {
+        String vectorStr = toVectorString(embedding);
+        return jdbc.query(con -> {
+            var ps = con.prepareStatement("""
+                    SELECT c.chunk_key,
+                           c.document_key,
+                           c.chunk_index AS chunk_no,
+                           c.chunk_text,
+                           c.token_count,
+                           1 - (c.embedding <=> ?::vector) AS similarity
+                      FROM nexus_document_chunk c
+                      JOIN nexus_document d USING (document_key)
+                     WHERE d.status = 'INDEXED'
+                     ORDER BY c.embedding <=> ?::vector
+                     LIMIT ?
+                    """);
+            ps.setString(1, vectorStr);
+            ps.setString(2, vectorStr);
+            ps.setInt(3, topK);
+            return ps;
+        }, (rs, rowNum) -> new DocumentChunk(
+                rs.getString("chunk_key"),
+                rs.getString("document_key"),
+                rs.getInt("chunk_no"),
+                rs.getString("chunk_text"),
+                new float[0],
+                rs.getInt("token_count")));
+    }
+
     public void deleteChunks(String documentKey) {
         jdbc.update("DELETE FROM nexus_document_chunk WHERE document_key = ?", documentKey);
     }

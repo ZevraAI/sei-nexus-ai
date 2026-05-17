@@ -226,10 +226,13 @@ public class DocumentMemoryService {
         if (question == null || question.isBlank()) {
             return List.of();
         }
-        if (domainKeys == null || domainKeys.isEmpty()) {
-            return List.of();
-        }
         float[] embedding = azureOpenAiClient.embed(question).embedding();
+        if (domainKeys == null || domainKeys.isEmpty()) {
+            // No agent/domain scoping — search across all indexed documents in
+            // the current tenant schema. Safe because TenantContext already
+            // isolates the connection to the correct schema.
+            return memoryRepository.retrieveAllChunks(embedding, retrievalTopK);
+        }
         return memoryRepository.retrieveChunks(embedding, domainKeys, retrievalTopK);
     }
 
