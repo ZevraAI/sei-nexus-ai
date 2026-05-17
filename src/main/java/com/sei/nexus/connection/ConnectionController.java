@@ -140,12 +140,20 @@ public class ConnectionController {
 
     /**
      * DELETE /connections/{connectionKey}
-     * Archives the connection (soft delete).
+     * Deletes the connection — blocked if any data objects or agents reference it.
      */
     @DeleteMapping("/{connectionKey}")
     public ResponseEntity<Void> archiveConnection(@PathVariable String connectionKey) {
         connectionRepository.findByKey(connectionKey)
                 .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND, "Connection not found: " + connectionKey));
+
+        List<String> dependents = connectionRepository.findDependents(connectionKey);
+        if (!dependents.isEmpty()) {
+            throw new NexusException(HttpStatus.CONFLICT,
+                    "Cannot delete connection '" + connectionKey + "' — it is still used by: " +
+                    String.join(", ", dependents) + ". Remove those dependencies first or re-assign them to another connection.");
+        }
+
         connectionRepository.archive(connectionKey);
         return ResponseEntity.noContent().build();
     }
