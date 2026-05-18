@@ -35,18 +35,20 @@ public class AnomalyDetector {
 
     /**
      * Checks a baseline by executing its measurement SQL, computing statistics,
-     * updating trend data, and detecting anomalies. Best-effort — exceptions are caught.
+     * updating trend data, and detecting anomalies.
+     *
+     * @return the created AnomalyEvent if an anomaly was detected, otherwise null
      */
-    public void checkBaseline(OperationalBaseline baseline) {
+    public AnomalyEvent checkBaseline(OperationalBaseline baseline) {
         try {
             List<Map<String, Object>> rows = dynamicSqlService.executeQuery(
                     baseline.connectionKey(), baseline.measurementSql(), 1);
-            if (rows.isEmpty()) return;
+            if (rows.isEmpty()) return null;
 
-            double newValue = parseValue(rows.get(0));
+            double newValue  = parseValue(rows.get(0));
             String trendData = updateTrendData(baseline.trendData(), newValue);
             List<Double> history = extractHistory(trendData);
-            double avg = history.stream().mapToDouble(d -> d).average().orElse(newValue);
+            double avg    = history.stream().mapToDouble(d -> d).average().orElse(newValue);
             double stddev = computeStddev(history, avg);
             Instant nextDue = computeNextDue(baseline.measurementWindow());
 
@@ -55,23 +57,26 @@ public class AnomalyDetector {
                     Instant.now(), nextDue);
 
             if (stddev > 0) {
-                double zScore = Math.abs((newValue - avg) / stddev);
+                double zScore       = Math.abs((newValue - avg) / stddev);
                 double deviationPct = avg != 0 ? Math.abs((newValue - avg) / avg * 100) : 0;
-                String severity = zScore > 3 ? "CRITICAL" : zScore > 2 ? "HIGH" : zScore > 1.5 ? "MEDIUM" : "LOW";
+                String severity     = zScore > 3 ? "CRITICAL" : zScore > 2 ? "HIGH" : zScore > 1.5 ? "MEDIUM" : "LOW";
 
                 if (zScore > 1.5 || deviationPct > 20) {
-                    String anomalyKey = Keys.uniqueKey("anomaly");
-                    AnomalyEvent event = new AnomalyEvent(
+                    String       anomalyKey = Keys.uniqueKey("anomaly");
+                    AnomalyEvent event      = new AnomalyEvent(
                             anomalyKey, baseline.baselineKey(), baseline.domainKey(),
                             null, Instant.now(), baseline.metricName(),
                             avg, newValue, deviationPct, zScore, severity, "OPEN", null);
                     temporalRepository.saveAnomaly(event);
-                    log.info("Anomaly detected for baseline {}: {} severity, z={}", baseline.baselineKey(), severity, zScore);
+                    log.info("Anomaly detected for baseline {}: {} severity, z={}",
+                            baseline.baselineKey(), severity, zScore);
+                    return event;
                 }
             }
         } catch (Exception e) {
             log.warn("Baseline check failed for {}: {}", baseline.baselineKey(), e.getMessage());
         }
+        return null;
     }
 
     /**

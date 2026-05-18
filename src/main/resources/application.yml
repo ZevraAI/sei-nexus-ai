@@ -64,3 +64,22 @@ nexus:
     max-row-limit: 500
   retention:
     conversation-days: 3
+  alerts:
+    app-url: ${NEXUS_APP_URL:http://localhost:5176}
+
+# ── Email (optional — set SMTP_* env vars to enable email alerts) ────────────
+spring:
+  mail:
+    host:     ${SMTP_HOST:smtp.gmail.com}
+    port:     ${SMTP_PORT:587}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+        connectiontimeout: 5000
+        timeout: 5000
