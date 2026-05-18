@@ -39,21 +39,30 @@ public class KnowledgeGraphRepository {
                 """, nodeMapper());
     }
 
-    /** Recursive CTE — finds all nodes within {@code depth} hops of the given entity. */
+    /**
+     * Recursive CTE — finds all nodes within {@code depth} hops of the given entity.
+     *
+     * PostgreSQL recursive CTEs require exactly ONE union separator between the
+     * non-recursive base case and the recursive term.  The two directions (forward
+     * edges and bidirectional reverse edges) are combined in a single recursive step
+     * using a CASE expression; UNION (not UNION ALL) prevents cycles by deduplicating.
+     */
     public List<GraphNode> findNeighbors(String entityKey, int depth) {
         return jdbc.query("""
                 WITH RECURSIVE neighbors(entity_key, depth) AS (
-                    SELECT ?, 0
-                    UNION ALL
-                    SELECT r.target_entity_key, n.depth + 1
+                    SELECT ?::varchar, 0
+                    UNION
+                    SELECT CASE
+                             WHEN r.source_entity_key = n.entity_key THEN r.target_entity_key
+                             ELSE r.source_entity_key
+                           END,
+                           n.depth + 1
                       FROM nexus_entity_relationship r
-                      JOIN neighbors n ON n.entity_key = r.source_entity_key
+                      JOIN neighbors n ON (
+                          r.source_entity_key = n.entity_key
+                          OR (r.bidirectional = TRUE AND r.target_entity_key = n.entity_key)
+                      )
                      WHERE n.depth < ?
-                    UNION ALL
-                    SELECT r.source_entity_key, n.depth + 1
-                      FROM nexus_entity_relationship r
-                      JOIN neighbors n ON n.entity_key = r.target_entity_key
-                     WHERE n.depth < ? AND r.bidirectional = TRUE
                 )
                 SELECT DISTINCT e.entity_key, e.entity_name, e.node_type, e.color,
                        e.group_label, e.domain_key, e.description, e.primary_object_key,
@@ -61,7 +70,7 @@ public class KnowledgeGraphRepository {
                   FROM nexus_business_entity e
                   JOIN neighbors nb ON nb.entity_key = e.entity_key
                  WHERE e.status != 'ARCHIVED'
-                """, nodeMapper(), entityKey, depth, depth);
+                """, nodeMapper(), entityKey, depth);
     }
 
     // ── Edge queries ──────────────────────────────────────────────────────────
