@@ -390,14 +390,22 @@ public class ChatService {
                       "clarification_question": ""
                     }
                     Routing rules (in priority order):
-                    1. Use ANSWER_FROM_PRIOR_RESULTS if conversation history exists AND the question is a follow-up —
-                       this includes questions like "how?", "why?", "explain", "source?", "how did you get that?",
-                       "are you sure?", "what data?", "break it down", or any question referencing a prior answer.
-                    2. Use QUERY_LIVE_DATA if approved data sources exist and fresh live data is needed.
+                    1. Use ANSWER_FROM_PRIOR_RESULTS ONLY when the question is specifically asking about
+                       the previous answer itself — not new data. Examples: "explain that", "show me the SQL
+                       you used", "how did you get that number", "why that result", "are you sure",
+                       "what query ran", "break down that specific number".
+                       DO NOT use this for any question that asks for new data, a different metric,
+                       a different filter, or a different entity — even if it is in the same conversation.
+                    2. Use QUERY_LIVE_DATA if the question needs fresh data from the database — including
+                       follow-up questions that ask for different metrics, different filters, or different
+                       entities than what was previously returned.
                     3. Use ANSWER_FROM_MEMORY if document memory can answer without live data.
                     4. Use HYBRID_DOC_AND_DATA for complex questions needing both memory and live data.
                     5. Use KNOWLEDGE_GAP if no knowledge or data sources are available at all.
                     6. Use ASK_CLARIFICATION ONLY if the question is completely ambiguous AND there is no prior conversation context.
+                    Key rule: when in doubt between ANSWER_FROM_PRIOR_RESULTS and QUERY_LIVE_DATA,
+                    always choose QUERY_LIVE_DATA. It is always better to query fresh data than to
+                    give a wrong answer from stale results.
                     """;
             String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), sys);
             return objectMapper.readValue(extractJson(resp),
