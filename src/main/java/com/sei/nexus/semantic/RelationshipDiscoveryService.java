@@ -235,9 +235,27 @@ public class RelationshipDiscoveryService {
      * Builds the table → entity_key index by joining nexus_data_object with
      * nexus_business_entity on primary_object_key, scoped to the given domain.
      */
+    /**
+     * Builds the table_name → entity_key index used to map FK relationships to
+     * semantic entity relationships.
+     *
+     * <p>Strategy (in order):
+     * <ol>
+     *   <li>Exact link via {@code primary_object_key} — entities created after this
+     *       fix will always have it set.</li>
+     *   <li>Name-pattern fallback — for entities created before the fix whose
+     *       {@code primary_object_key} is NULL, derive the match by comparing the
+     *       slugified table name (strip common prefixes, replace {@code _} with {@code -})
+     *       against the entity key. Covers both {@code lgs_purchase_order → purchase-order}
+     *       and plain {@code orders → orders}.</li>
+     * </ol>
+     */
     private Map<String, String> buildTableToEntityIndex(String domainKey) {
+        Map<String, String> index = new LinkedHashMap<>();
+
+        // 1. Primary: join via primary_object_key
         try {
-            return jdbc.query("""
+            jdbc.query("""
                     SELECT obj.table_name, be.entity_key
                       FROM nexus_data_object obj
                       JOIN nexus_business_entity be
@@ -249,14 +267,55 @@ public class RelationshipDiscoveryService {
                     """,
                     (rs, i) -> Map.entry(rs.getString("table_name"), rs.getString("entity_key")),
                     domainKey, domainKey)
-                    .stream()
-                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
-                            (a, b) -> a, LinkedHashMap::new));
+                    .forEach(e -> index.put(e.getKey(), e.getValue()));
         } catch (Exception e) {
-            // Fall back to matching via entity_key → table name pattern
-            log.warn("Could not build table→entity index via data objects: {}", e.getMessage());
-            return Map.of();
+            log.warn("Primary table→entity index failed: {}", e.getMessage());
         }
+
+        // 2. Fallback: match by slugified table name for entities without primary_object_key
+        if (index.size() < 2) {
+            try {
+                // Get all data objects (tables) for this domain
+                List<String> tables = jdbc.queryForList(
+                        "SELECT DISTINCT table_name FROM nexus_data_object WHERE domain_key = ?",
+                        String.class, domainKey);
+
+                // Get all entities whose primary_object_key is not yet set
+                List<Map.Entry<String, String>> entities = jdbc.query("""
+                        SELECT entity_key, entity_name
+                          FROM nexus_business_entity
+                         WHERE domain_key = ?
+                           AND status != 'ARCHIVED'
+                           AND (primary_object_key IS NULL OR primary_object_key = '')
+                        """,
+                        (rs, i) -> Map.entry(rs.getString("entity_key"), rs.getString("entity_name")),
+                        domainKey);
+
+                for (String table : tables) {
+                    if (index.containsKey(table)) continue; // already resolved
+                    // Normalise: strip common prefixes, convert _ to -
+                    String norm = table
+                            .replaceAll("^(lgs_|stg_|dim_|fact_|tbl_|vw_)", "")
+                            .replace("_", "-");
+                    for (Map.Entry<String, String> ent : entities) {
+                        String eKey = ent.getKey(); // e.g. "purchase-order"
+                        if (eKey.equalsIgnoreCase(norm)
+                                || norm.startsWith(eKey.replace("-", ""))
+                                || eKey.replace("-", "").equalsIgnoreCase(
+                                        norm.replace("-", ""))) {
+                            index.put(table, eKey);
+                            break;
+                        }
+                    }
+                }
+                log.info("After fallback matching: {} table→entity mappings in domain '{}'",
+                        index.size(), domainKey);
+            } catch (Exception e) {
+                log.warn("Fallback table→entity matching failed: {}", e.getMessage());
+            }
+        }
+
+        return index;
     }
 
     /**

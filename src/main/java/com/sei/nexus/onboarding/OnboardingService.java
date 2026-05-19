@@ -414,7 +414,8 @@ public class OnboardingService {
             String opMeaning  = (String) entity.getOrDefault("operationalMeaning", "");
             String hints      = (String) entity.getOrDefault("investigationHints", "");
 
-            // 1. Create enterprise map data object (scans columns automatically)
+            // 1. Create enterprise map data object — capture its key for the entity link
+            String objectKey = null;
             try {
                 Map<String, Object> objBody = new LinkedHashMap<>();
                 objBody.put("domainKey",     domainKey);
@@ -424,13 +425,14 @@ public class OnboardingService {
                 objBody.put("entityName",    entityName);
                 objBody.put("businessName",  entityName + "s");
                 objBody.put("purpose",       purpose);
-                enterpriseMapService.createOrUpdateObject(objBody, userEmail);
+                var dataObj = enterpriseMapService.createOrUpdateObject(objBody, userEmail);
+                objectKey = dataObj.objectKey();
                 objectsCreated++;
             } catch (Exception e) {
                 log.warn("Failed to create data object for {}: {}", tableName, e.getMessage());
             }
 
-            // 2. Create semantic business entity
+            // 2. Create semantic business entity — link to the data object via primaryObjectKey
             try {
                 Map<String, Object> entityBody = new LinkedHashMap<>();
                 entityBody.put("entityKey",          entityKey);
@@ -440,6 +442,9 @@ public class OnboardingService {
                 entityBody.put("investigationHints", hints);
                 entityBody.put("domainKey",          domainKey);
                 entityBody.put("status",             "ACTIVE");
+                if (objectKey != null) {
+                    entityBody.put("primaryObjectKey", objectKey);
+                }
                 semanticService.createOrUpdateEntity(entityBody, userEmail);
                 entitiesCreated++;
             } catch (Exception e) {
