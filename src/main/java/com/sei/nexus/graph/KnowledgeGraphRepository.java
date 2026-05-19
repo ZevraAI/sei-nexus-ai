@@ -116,26 +116,42 @@ public class KnowledgeGraphRepository {
     }
 
     /**
-     * Shortest path between two entities using a bidirectional BFS implemented
-     * as a recursive CTE. Returns the sequence of entity keys on the path.
+     * Shortest path between two entities traversing relationships in BOTH directions.
+     *
+     * <p>Uses a recursive CTE with a LATERAL subquery so the "next entity" is computed
+     * once and reused in SELECT, trail concatenation, cycle detection, and found flag.
+     * UNION (deduplicating) prevents cycles beyond the explicit trail check.
+     *
+     * <p>Traversal is bidirectional regardless of the {@code bidirectional} flag —
+     * for path-finding purposes all semantic edges are traversable in either direction.
      */
     public List<String> findShortestPath(String fromKey, String toKey) {
         return jdbc.query("""
                 WITH RECURSIVE path(entity_key, trail, depth, found) AS (
-                    SELECT ?, ARRAY[?]::text[], 0, (? = ?)
-                    UNION ALL
-                    SELECT r.target_entity_key,
-                           p.trail || r.target_entity_key,
+                    SELECT ?::varchar, ARRAY[?::varchar], 0, ?::varchar = ?::varchar
+                    UNION
+                    SELECT nxt.next_key,
+                           p.trail || nxt.next_key,
                            p.depth + 1,
-                           r.target_entity_key = ?
-                      FROM nexus_entity_relationship r
-                      JOIN path p ON p.entity_key = r.source_entity_key
+                           nxt.next_key = ?::varchar
+                      FROM path p
+                      CROSS JOIN LATERAL (
+                          SELECT CASE
+                                   WHEN r.source_entity_key = p.entity_key
+                                   THEN r.target_entity_key
+                                   ELSE r.source_entity_key
+                                 END AS next_key
+                            FROM nexus_entity_relationship r
+                           WHERE r.source_entity_key = p.entity_key
+                              OR r.target_entity_key = p.entity_key
+                      ) nxt
                      WHERE p.depth < 8
-                       AND NOT (r.target_entity_key = ANY(p.trail))
+                       AND NOT p.found
+                       AND NOT (nxt.next_key = ANY(p.trail))
                 )
                 SELECT trail
                   FROM path
-                 WHERE found = TRUE
+                 WHERE found
                  ORDER BY depth
                  LIMIT 1
                 """,
