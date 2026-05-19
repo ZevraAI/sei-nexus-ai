@@ -238,14 +238,14 @@ public class RelationshipDiscoveryService {
     private Map<String, String> buildTableToEntityIndex(String domainKey) {
         try {
             return jdbc.query("""
-                    SELECT do.table_name, be.entity_key
-                      FROM nexus_data_object do
+                    SELECT obj.table_name, be.entity_key
+                      FROM nexus_data_object obj
                       JOIN nexus_business_entity be
-                        ON be.primary_object_key = do.object_key
-                     WHERE do.domain_key  = ?
+                        ON be.primary_object_key = obj.object_key
+                     WHERE obj.domain_key = ?
                        AND be.domain_key  = ?
                        AND be.status != 'ARCHIVED'
-                     GROUP BY do.table_name, be.entity_key
+                     GROUP BY obj.table_name, be.entity_key
                     """,
                     (rs, i) -> Map.entry(rs.getString("table_name"), rs.getString("entity_key")),
                     domainKey, domainKey)
