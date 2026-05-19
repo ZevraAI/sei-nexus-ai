@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.agent.AgentRepository;
 import com.sei.nexus.agent.AgentService;
+import com.sei.nexus.semantic.RelationshipDiscoveryService;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.connection.ConnectionRepository;
@@ -42,8 +43,9 @@ public class OnboardingService {
     private final AzureOpenAiClient        aiClient;
     private final ObjectMapper             objectMapper;
     private final JdbcTemplate             jdbc;
-    private final AgentService             agentService;
-    private final AgentRepository          agentRepository;
+    private final AgentService                agentService;
+    private final AgentRepository             agentRepository;
+    private final RelationshipDiscoveryService relationshipDiscovery;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -54,17 +56,19 @@ public class OnboardingService {
                               ObjectMapper objectMapper,
                               JdbcTemplate jdbc,
                               AgentService agentService,
-                              AgentRepository agentRepository) {
-        this.settings             = settings;
-        this.connectionRepository = connectionRepository;
-        this.dynamicSqlService    = dynamicSqlService;
-        this.enterpriseMapService = enterpriseMapService;
-        this.semanticService      = semanticService;
-        this.aiClient             = aiClient;
-        this.objectMapper         = objectMapper;
-        this.jdbc                 = jdbc;
-        this.agentService         = agentService;
-        this.agentRepository      = agentRepository;
+                              AgentRepository agentRepository,
+                              RelationshipDiscoveryService relationshipDiscovery) {
+        this.settings              = settings;
+        this.connectionRepository  = connectionRepository;
+        this.dynamicSqlService     = dynamicSqlService;
+        this.enterpriseMapService  = enterpriseMapService;
+        this.semanticService       = semanticService;
+        this.aiClient              = aiClient;
+        this.objectMapper          = objectMapper;
+        this.jdbc                  = jdbc;
+        this.agentService          = agentService;
+        this.agentRepository       = agentRepository;
+        this.relationshipDiscovery = relationshipDiscovery;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -477,7 +481,20 @@ public class OnboardingService {
             log.warn("Failed to store suggested questions: {}", e.getMessage());
         }
 
-        // 5. Auto-create a default Data Analyst agent if no active agents exist yet.
+        // 5. Auto-discover entity relationships from FK constraints and column-name heuristics.
+        //    Runs after all entities are created so the table→entity index is populated.
+        if (connectionKey != null && !connectionKey.isBlank()) {
+            try {
+                String schema = request.containsKey("schemaName")
+                        ? (String) request.get("schemaName") : "public";
+                int rels = relationshipDiscovery.discoverAndPersist(connectionKey, schema, domainKey);
+                log.info("Auto-discovered {} relationships for domain '{}'", rels, domainKey);
+            } catch (Exception e) {
+                log.warn("Relationship auto-discovery failed (non-fatal): {}", e.getMessage());
+            }
+        }
+
+        // 6. Auto-create a default Data Analyst agent if no active agents exist yet.
         //    Only runs once per tenant — skipped if the user has already configured agents.
         try {
             if (agentRepository.findActive().isEmpty()) {

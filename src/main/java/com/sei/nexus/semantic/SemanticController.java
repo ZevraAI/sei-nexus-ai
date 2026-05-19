@@ -15,15 +15,18 @@ import java.util.Map;
 @RequestMapping("/semantic")
 public class SemanticController {
 
-    private final SemanticService service;
-    private final SemanticRepository repository;
-    private final EnterpriseMapService enterpriseMapService;
+    private final SemanticService             service;
+    private final SemanticRepository          repository;
+    private final EnterpriseMapService        enterpriseMapService;
+    private final RelationshipDiscoveryService discoveryService;
 
     public SemanticController(SemanticService service, SemanticRepository repository,
-                               EnterpriseMapService enterpriseMapService) {
-        this.service = service;
-        this.repository = repository;
+                               EnterpriseMapService enterpriseMapService,
+                               RelationshipDiscoveryService discoveryService) {
+        this.service          = service;
+        this.repository       = repository;
         this.enterpriseMapService = enterpriseMapService;
+        this.discoveryService = discoveryService;
     }
 
     // -------------------------------------------------------------------------
@@ -173,6 +176,36 @@ public class SemanticController {
     public ResponseEntity<Map<String, Object>> discover(@RequestBody Map<String, Object> body) {
         Map<String, Object> result = enterpriseMapService.analyzeForOnboarding(body);
         return ResponseEntity.ok(result);
+    }
+
+    /**
+     * POST /semantic/discover-relationships
+     * Automatically discovers entity relationships from the connected database
+     * using foreign key constraints and column-name heuristics.
+     * Safe to call multiple times — idempotent.
+     *
+     * Request: { "connectionKey": "...", "schemaName": "public", "domainKey": "PLATFORM" }
+     * Response: { "relationships_created": 12, "connection_key": "...", "domain_key": "..." }
+     */
+    @PostMapping("/discover-relationships")
+    public ResponseEntity<Map<String, Object>> discoverRelationships(@RequestBody Map<String, Object> body) {
+        String connectionKey = requireStr(body, "connectionKey");
+        String schemaName    = (String) body.getOrDefault("schemaName", "public");
+        String domainKey     = requireStr(body, "domainKey");
+
+        int created = discoveryService.discoverAndPersist(connectionKey, schemaName, domainKey);
+        return ResponseEntity.ok(Map.of(
+                "relationships_created", created,
+                "connection_key",        connectionKey,
+                "schema_name",           schemaName,
+                "domain_key",            domainKey));
+    }
+
+    private String requireStr(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null || v.toString().isBlank())
+            throw new NexusException(HttpStatus.BAD_REQUEST, key + " is required");
+        return v.toString();
     }
 
     // -------------------------------------------------------------------------
