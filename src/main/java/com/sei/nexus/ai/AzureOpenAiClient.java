@@ -79,6 +79,56 @@ public class AzureOpenAiClient {
     }
 
     /**
+     * Analyses an image using GPT-4o vision and returns a structured description.
+     * The model receives both the question and the base64-encoded image.
+     *
+     * <p>Works for any image type: receipts, invoices, charts, screenshots,
+     * photos, scanned documents — the model describes what it sees in detail.
+     *
+     * @param question    what the user wants to know about the image
+     * @param base64Image base64-encoded image bytes (no data URI prefix)
+     * @param mimeType    e.g. "image/jpeg", "image/png", "image/webp"
+     * @param systemPrompt additional instructions for the model
+     * @return the model's analysis as plain text
+     */
+    public String analyzeImage(String question, String base64Image,
+                                String mimeType, String systemPrompt) {
+        String url = BASE_URL + "/chat/completions";
+
+        // Build multimodal content: text + image
+        List<Map<String, Object>> userContent = new ArrayList<>();
+        userContent.add(Map.of("type", "text", "text",
+                question != null && !question.isBlank() ? question
+                        : "Describe everything you see in this image in detail."));
+        userContent.add(Map.of(
+                "type", "image_url",
+                "image_url", Map.of(
+                        "url",    "data:" + mimeType + ";base64," + base64Image,
+                        "detail", "high")));
+
+        List<Map<String, Object>> messageList = new ArrayList<>();
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messageList.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        messageList.add(Map.of("role", "user", "content", userContent));
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", chatModel);   // gpt-4o already supports vision
+        requestBody.put("messages", messageList);
+        requestBody.put("max_tokens", 4096);
+        requestBody.put("temperature", 0.1);   // low temp for accurate extraction
+
+        String responseBody = executeWithRetry(url, requestBody);
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            return root.path("choices").get(0).path("message").path("content").asText();
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse vision response: " + e.getMessage());
+        }
+    }
+
+    /**
      * Sends a chat completion request with JSON response format enabled.
      * Returns the assistant's content as a raw JSON string.
      */

@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -15,18 +16,21 @@ import java.util.Map;
 @RequestMapping("/semantic")
 public class SemanticController {
 
-    private final SemanticService             service;
-    private final SemanticRepository          repository;
-    private final EnterpriseMapService        enterpriseMapService;
+    private final SemanticService              service;
+    private final SemanticRepository           repository;
+    private final EnterpriseMapService         enterpriseMapService;
     private final RelationshipDiscoveryService discoveryService;
+    private final LearnedMappingRepository     learnedMappingRepository;
 
     public SemanticController(SemanticService service, SemanticRepository repository,
                                EnterpriseMapService enterpriseMapService,
-                               RelationshipDiscoveryService discoveryService) {
-        this.service          = service;
-        this.repository       = repository;
-        this.enterpriseMapService = enterpriseMapService;
-        this.discoveryService = discoveryService;
+                               RelationshipDiscoveryService discoveryService,
+                               LearnedMappingRepository learnedMappingRepository) {
+        this.service                 = service;
+        this.repository              = repository;
+        this.enterpriseMapService    = enterpriseMapService;
+        this.discoveryService        = discoveryService;
+        this.learnedMappingRepository = learnedMappingRepository;
     }
 
     // -------------------------------------------------------------------------
@@ -206,6 +210,89 @@ public class SemanticController {
         if (v == null || v.toString().isBlank())
             throw new NexusException(HttpStatus.BAD_REQUEST, key + " is required");
         return v.toString();
+    }
+
+    // -------------------------------------------------------------------------
+    // Learned Mappings  (Phase 3 — Semantic Learning)
+    // -------------------------------------------------------------------------
+
+    /**
+     * GET /semantic/learnings?domainKey=
+     * Lists learned term → SQL pattern mappings for the Learnings panel.
+     */
+    @GetMapping("/learnings")
+    public ResponseEntity<List<Map<String, Object>>> listLearnings(
+            @RequestParam(required = false) String domainKey) {
+        List<LearnedMapping> mappings = learnedMappingRepository.findForDomain(domainKey);
+        List<Map<String, Object>> result = mappings.stream().map(this::toLearningMap).toList();
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * PATCH /semantic/learnings/{mappingKey}
+     * Admin can update the sql_pattern or confidence of a learned mapping.
+     * Send {"sqlPattern":"..."} and/or {"confidence": 0.9} in the request body.
+     */
+    @PatchMapping("/learnings/{mappingKey}")
+    public ResponseEntity<Map<String, Object>> updateLearning(
+            @PathVariable String mappingKey,
+            @RequestBody Map<String, Object> body) {
+        String sqlPattern = (String) body.get("sqlPattern");
+        Double confidence = body.containsKey("confidence")
+                ? ((Number) body.get("confidence")).doubleValue() : null;
+        learnedMappingRepository.update(mappingKey, sqlPattern, confidence);
+        return learnedMappingRepository.findByKey(mappingKey)
+                .map(m -> ResponseEntity.ok(toLearningMap(m)))
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Learned mapping not found: " + mappingKey));
+    }
+
+    /**
+     * POST /semantic/learnings/{mappingKey}/promote
+     * Manually promote a learned mapping to formal vocabulary immediately,
+     * without waiting for the nightly scheduler threshold.
+     */
+    @PostMapping("/learnings/{mappingKey}/promote")
+    public ResponseEntity<Map<String, Object>> promoteLearning(@PathVariable String mappingKey) {
+        LearnedMapping m = learnedMappingRepository.findByKey(mappingKey)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Learned mapping not found: " + mappingKey));
+        service.createTerm(Map.of(
+                "domainKey",     m.domainKey() != null ? m.domainKey() : "",
+                "term",          m.businessTerm(),
+                "definition",    "Promoted from team learning: maps to — " + m.sqlPattern(),
+                "sql_equivalent", m.sqlPattern(),
+                "status",        "ACTIVE"));
+        learnedMappingRepository.markPromoted(mappingKey);
+        return ResponseEntity.ok(Map.of(
+                "mapping_key", mappingKey,
+                "promoted",    true,
+                "term",        m.businessTerm()));
+    }
+
+    /**
+     * DELETE /semantic/learnings/{mappingKey}
+     * Reject and delete a learned mapping.
+     */
+    @DeleteMapping("/learnings/{mappingKey}")
+    public ResponseEntity<Void> deleteLearning(@PathVariable String mappingKey) {
+        learnedMappingRepository.delete(mappingKey);
+        return ResponseEntity.noContent().build();
+    }
+
+    private Map<String, Object> toLearningMap(LearnedMapping m) {
+        var r = new LinkedHashMap<String, Object>();
+        r.put("mapping_key",   m.mappingKey());
+        r.put("domain_key",    m.domainKey());
+        r.put("business_term", m.businessTerm());
+        r.put("sql_pattern",   m.sqlPattern());
+        r.put("source",        m.source());
+        r.put("confidence",    m.confidence());
+        r.put("use_count",     m.useCount());
+        r.put("last_used_at",  m.lastUsedAt() != null ? m.lastUsedAt().toString() : null);
+        r.put("promoted",      m.promoted());
+        r.put("created_at",    m.createdAt() != null ? m.createdAt().toString() : null);
+        return r;
     }
 
     // -------------------------------------------------------------------------

@@ -1,0 +1,181 @@
+{
+  "pack_id": "healthcare-v1",
+  "industry": "HEALTHCARE",
+  "display_name": "Healthcare & Clinical Operations",
+  "version": "1.0.0",
+  "description": "Semantic layer for hospitals, clinics, health systems, and care facilities. Covers patient flow, clinical operations, staffing, and financial performance.",
+  "entities": [
+    {
+      "name": "Patient",
+      "aliases": ["patient", "client", "member", "beneficiary", "service_user"],
+      "table_patterns": ["patient", "patients", "patient_record", "patient_records", "client", "clients", "member", "members", "beneficiary", "beneficiaries", "service_user", "person"],
+      "key_column_patterns": ["patient_id", "patient_number", "mrn", "medical_record_number", "member_id", "client_id", "person_id", "nhs_number"],
+      "description": "Individual receiving healthcare services",
+      "operational_meaning": "Core entity for patient flow, census, safety, and outcomes tracking"
+    },
+    {
+      "name": "Encounter",
+      "aliases": ["encounter", "visit", "episode", "admission", "attendance"],
+      "table_patterns": ["encounter", "encounters", "visit", "visits", "admission", "admissions", "episode", "episodes", "attendance", "attendances", "episode_of_care"],
+      "key_column_patterns": ["encounter_id", "visit_id", "admission_id", "episode_id", "attendance_id"],
+      "description": "A single interaction between a patient and healthcare provider",
+      "operational_meaning": "Drives LOS, readmission, throughput, and cost metrics"
+    },
+    {
+      "name": "Provider",
+      "aliases": ["provider", "clinician", "doctor", "physician", "nurse", "staff"],
+      "table_patterns": ["provider", "providers", "clinician", "clinicians", "physician", "physicians", "doctor", "doctors", "staff", "employee", "employees", "practitioner"],
+      "key_column_patterns": ["provider_id", "clinician_id", "physician_id", "doctor_id", "staff_id", "employee_id", "npi"],
+      "description": "Healthcare professional delivering care",
+      "operational_meaning": "Tracks workload, productivity, compliance, and patient outcomes by clinician"
+    },
+    {
+      "name": "Bed",
+      "aliases": ["bed", "room", "bay", "unit"],
+      "table_patterns": ["bed", "beds", "room", "rooms", "bay", "bays", "unit", "units", "bed_assignment"],
+      "key_column_patterns": ["bed_id", "bed_number", "room_id", "room_number", "bay_id"],
+      "description": "Physical inpatient bed or care location",
+      "operational_meaning": "Central to occupancy management and capacity planning"
+    },
+    {
+      "name": "Ward",
+      "aliases": ["ward", "department", "floor", "wing", "unit"],
+      "table_patterns": ["ward", "wards", "department", "departments", "floor", "floors", "wing", "wings", "clinical_area", "nursing_unit"],
+      "key_column_patterns": ["ward_id", "ward_code", "department_id", "dept_id", "floor_id"],
+      "description": "Clinical area or nursing unit where patients are cared for",
+      "operational_meaning": "Used for capacity planning, staffing ratios, and performance benchmarking"
+    },
+    {
+      "name": "Appointment",
+      "aliases": ["appointment", "booking", "referral", "slot"],
+      "table_patterns": ["appointment", "appointments", "booking", "bookings", "referral", "referrals", "slot", "slots", "schedule", "schedules"],
+      "key_column_patterns": ["appointment_id", "booking_id", "referral_id", "slot_id"],
+      "description": "Scheduled patient-provider interaction",
+      "operational_meaning": "Used for access metrics, no-show rates, and waiting time analysis"
+    },
+    {
+      "name": "Medication",
+      "aliases": ["medication", "drug", "prescription", "medicine"],
+      "table_patterns": ["medication", "medications", "drug", "drugs", "prescription", "prescriptions", "medicine", "medicines", "order", "orders", "med_order"],
+      "key_column_patterns": ["medication_id", "drug_id", "prescription_id", "order_id", "ndc", "formulary_id"],
+      "description": "Pharmaceutical product prescribed or administered to a patient",
+      "operational_meaning": "Drives adherence, formulary compliance, and drug spend analysis"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "LOS",
+      "aliases": ["length of stay", "days admitted", "inpatient days", "hospital stay"],
+      "definition": "Number of days between admission and discharge for an inpatient encounter",
+      "sql_hint": "DATE_PART('day', discharge_date - admission_date) or DATEDIFF(discharge_date, admission_date)"
+    },
+    {
+      "term": "ALOS",
+      "aliases": ["average length of stay", "average LOS", "mean LOS"],
+      "definition": "Mean number of inpatient days across a group of encounters",
+      "sql_hint": "AVG(DATE_PART('day', discharge_date - admission_date))"
+    },
+    {
+      "term": "readmission",
+      "aliases": ["readmit", "30-day readmission", "unplanned readmission"],
+      "definition": "Patient admitted again within 30 days of a prior discharge",
+      "sql_hint": "encounter where admission_date <= prior_discharge_date + INTERVAL '30 days' AND encounter_type = 'INPATIENT'"
+    },
+    {
+      "term": "discharge pending",
+      "aliases": ["awaiting discharge", "delayed discharge", "discharge backlog"],
+      "definition": "Patient clinically ready to leave but still occupying a bed",
+      "sql_hint": "status IN ('DISCHARGE_PENDING','AWAITING_DISCHARGE','READY_FOR_DISCHARGE') OR discharge_date IS NULL AND ready_for_discharge = TRUE"
+    },
+    {
+      "term": "bed occupancy",
+      "aliases": ["occupancy rate", "bed occupancy rate", "census"],
+      "definition": "Percentage of available beds that are occupied at a point in time",
+      "sql_hint": "COUNT(occupied_beds) / total_beds * 100"
+    },
+    {
+      "term": "ED revisit",
+      "aliases": ["emergency revisit", "ED return", "bounce back"],
+      "definition": "Patient returning to the emergency department within 72 hours",
+      "sql_hint": "visit_type = 'EMERGENCY' AND visit_date <= prior_ed_visit_date + INTERVAL '72 hours'"
+    },
+    {
+      "term": "did not wait",
+      "aliases": ["DNW", "left without being seen", "LWBS"],
+      "definition": "Patient who left the ED before receiving treatment",
+      "sql_hint": "status IN ('DID_NOT_WAIT','LEFT_WITHOUT_SEEN','LWBS','DNW')"
+    },
+    {
+      "term": "elective",
+      "aliases": ["planned", "scheduled admission", "elective procedure"],
+      "definition": "Non-urgent, pre-planned healthcare encounter",
+      "sql_hint": "admission_type IN ('ELECTIVE','PLANNED','SCHEDULED')"
+    }
+  ],
+  "suggested_questions": [
+    "What is the average length of stay by ward this month?",
+    "Which wards have the highest number of discharge-pending patients right now?",
+    "Show me 30-day readmission rates by specialty for the last quarter",
+    "What is today's bed occupancy by ward?",
+    "Which providers have the highest patient volume this week?",
+    "Show me ED wait times by hour for the last 7 days",
+    "How many appointments were missed or cancelled last month?",
+    "What is the trend in emergency admissions over the past 6 months?"
+  ],
+  "kpi_definitions": [
+    {
+      "name": "Bed Occupancy Rate",
+      "formula_description": "occupied_beds / total_beds * 100",
+      "target_range": "75–90%",
+      "alert_threshold": 95,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "30-Day Readmission Rate",
+      "formula_description": "readmissions_within_30_days / total_discharges * 100",
+      "target_range": "< 10%",
+      "alert_threshold": 15,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "Average Length of Stay",
+      "formula_description": "AVG(discharge_date - admission_date)",
+      "target_range": "Industry benchmark varies by specialty",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "ED Wait Time",
+      "formula_description": "AVG(time_to_first_clinician - arrival_time) in minutes",
+      "target_range": "< 60 minutes",
+      "alert_threshold": 120,
+      "alert_severity": "HIGH"
+    }
+  ],
+  "alert_templates": [
+    {
+      "name": "High Bed Occupancy",
+      "description": "Ward bed occupancy exceeds the high-risk threshold",
+      "metric_hint": "COUNT(*) FROM beds WHERE status = 'OCCUPIED' grouped by ward",
+      "threshold_type": "ABOVE",
+      "threshold_value": 95,
+      "severity": "HIGH"
+    },
+    {
+      "name": "Discharge Backlog Alert",
+      "description": "Patients waiting for discharge have exceeded the target",
+      "metric_hint": "COUNT(*) FROM encounters WHERE status IN ('DISCHARGE_PENDING','AWAITING_DISCHARGE')",
+      "threshold_type": "ABOVE",
+      "threshold_value": 10,
+      "severity": "MEDIUM"
+    },
+    {
+      "name": "High ED Wait Time",
+      "description": "Average ED wait time has exceeded 2 hours",
+      "metric_hint": "AVG(EXTRACT(EPOCH FROM (triage_time - arrival_time))/60) FROM ed_visits WHERE arrival_date = CURRENT_DATE",
+      "threshold_type": "ABOVE",
+      "threshold_value": 120,
+      "severity": "HIGH"
+    }
+  ]
+}

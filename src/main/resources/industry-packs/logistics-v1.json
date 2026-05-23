@@ -1,0 +1,181 @@
+{
+  "pack_id": "logistics-v1",
+  "industry": "LOGISTICS",
+  "display_name": "Logistics & Supply Chain",
+  "version": "1.0.0",
+  "description": "Semantic layer for freight, transportation, warehousing, and supply chain operations. Covers shipment tracking, supplier performance, inventory, and cost management.",
+  "entities": [
+    {
+      "name": "Shipment",
+      "aliases": ["shipment", "consignment", "freight", "delivery", "dispatch"],
+      "table_patterns": ["shipment", "shipments", "consignment", "consignments", "freight", "delivery", "deliveries", "dispatch", "dispatches", "parcel", "parcels", "load"],
+      "key_column_patterns": ["shipment_id", "tracking_number", "consignment_id", "freight_id", "delivery_id", "waybill_number", "awb", "pro_number"],
+      "description": "A movement of goods from origin to destination",
+      "operational_meaning": "Primary entity for on-time delivery, cost, and transit time analytics"
+    },
+    {
+      "name": "Order",
+      "aliases": ["order", "purchase_order", "sales_order", "customer_order"],
+      "table_patterns": ["order", "orders", "purchase_order", "purchase_orders", "sales_order", "sales_orders", "customer_order", "fulfillment_order", "po"],
+      "key_column_patterns": ["order_id", "order_number", "po_number", "so_number", "purchase_order_id"],
+      "description": "A request for goods or services to be supplied or delivered",
+      "operational_meaning": "Links demand to supply, drives fill rate and OTIF measurement"
+    },
+    {
+      "name": "Carrier",
+      "aliases": ["carrier", "transporter", "shipper", "haulier", "freight_company"],
+      "table_patterns": ["carrier", "carriers", "transporter", "transporters", "haulier", "hauliers", "freight_company", "logistics_provider", "courier"],
+      "key_column_patterns": ["carrier_id", "carrier_code", "transporter_id", "scac_code"],
+      "description": "Company or entity that physically moves goods",
+      "operational_meaning": "Used for carrier scorecard, lane costing, and service level monitoring"
+    },
+    {
+      "name": "Warehouse",
+      "aliases": ["warehouse", "facility", "distribution_center", "dc", "depot"],
+      "table_patterns": ["warehouse", "warehouses", "facility", "facilities", "distribution_center", "distribution_centres", "depot", "depots", "dc", "storage_location"],
+      "key_column_patterns": ["warehouse_id", "facility_id", "dc_id", "depot_id", "location_code"],
+      "description": "Physical location where goods are stored and distributed",
+      "operational_meaning": "Used for utilisation, throughput, dwell time, and labour cost analysis"
+    },
+    {
+      "name": "Route",
+      "aliases": ["route", "lane", "leg", "service", "trade_lane"],
+      "table_patterns": ["route", "routes", "lane", "lanes", "leg", "legs", "service", "services", "trade_lane", "corridor"],
+      "key_column_patterns": ["route_id", "lane_id", "leg_id", "origin", "destination"],
+      "description": "A defined path between origin and destination points",
+      "operational_meaning": "Used for lane profitability, transit time benchmarking, and capacity planning"
+    },
+    {
+      "name": "Supplier",
+      "aliases": ["supplier", "vendor", "manufacturer", "shipper"],
+      "table_patterns": ["supplier", "suppliers", "vendor", "vendors", "manufacturer", "manufacturers", "partner", "partners"],
+      "key_column_patterns": ["supplier_id", "vendor_id", "manufacturer_id", "partner_id", "supplier_code"],
+      "description": "Entity that provides goods or services in the supply chain",
+      "operational_meaning": "Used for supplier scorecards, lead time analysis, and risk management"
+    },
+    {
+      "name": "Item",
+      "aliases": ["item", "sku", "product", "cargo", "commodity"],
+      "table_patterns": ["item", "items", "sku", "skus", "product", "products", "cargo", "commodity", "commodities", "line_item"],
+      "key_column_patterns": ["item_id", "sku_id", "sku_code", "product_id", "item_code", "commodity_code"],
+      "description": "A specific product or SKU being shipped or stored",
+      "operational_meaning": "Links physical goods to shipments, inventory positions, and demand"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "OTD",
+      "aliases": ["on-time delivery", "on time delivery", "delivery performance", "on-time"],
+      "definition": "Shipments delivered on or before the promised delivery date",
+      "sql_hint": "actual_delivery_date <= promised_delivery_date OR status = 'DELIVERED_ON_TIME'"
+    },
+    {
+      "term": "OTIF",
+      "aliases": ["on-time in-full", "on time in full", "perfect order"],
+      "definition": "Orders delivered on time AND with the correct quantity and condition",
+      "sql_hint": "delivered_on_time = TRUE AND quantity_received = quantity_ordered AND no_damage = TRUE"
+    },
+    {
+      "term": "dwell time",
+      "aliases": ["dwell", "wait time", "port time", "facility dwell"],
+      "definition": "Time a shipment or vehicle spends stationary at a facility",
+      "sql_hint": "departure_time - arrival_time at a given facility or stop"
+    },
+    {
+      "term": "fill rate",
+      "aliases": ["order fill rate", "line fill rate", "case fill rate"],
+      "definition": "Percentage of order quantity that can be fulfilled from available stock",
+      "sql_hint": "quantity_shipped / quantity_ordered * 100"
+    },
+    {
+      "term": "backorder",
+      "aliases": ["back order", "backorder quantity", "out of stock order"],
+      "definition": "Order line that cannot be fulfilled due to insufficient inventory",
+      "sql_hint": "status IN ('BACKORDERED','BACK_ORDER','OUT_OF_STOCK') OR quantity_shipped < quantity_ordered"
+    },
+    {
+      "term": "transit time",
+      "aliases": ["lead time", "shipping time", "days in transit"],
+      "definition": "Number of days from shipment pickup to delivery",
+      "sql_hint": "DATE_PART('day', delivery_date - pickup_date)"
+    },
+    {
+      "term": "freight spend",
+      "aliases": ["shipping cost", "transportation cost", "freight cost", "logistics cost"],
+      "definition": "Total cost charged for transportation services",
+      "sql_hint": "SUM(freight_charge) or SUM(total_cost) WHERE cost_type = 'FREIGHT'"
+    },
+    {
+      "term": "late shipment",
+      "aliases": ["delayed shipment", "overdue delivery", "late delivery"],
+      "definition": "Shipment that has not been delivered by the promised date",
+      "sql_hint": "actual_delivery_date > promised_delivery_date OR (status != 'DELIVERED' AND promised_delivery_date < CURRENT_DATE)"
+    }
+  ],
+  "suggested_questions": [
+    "What is the on-time delivery rate by carrier this month?",
+    "Which shipments are currently delayed and at risk of missing their window?",
+    "Show me OTIF performance by supplier for the last quarter",
+    "What is the average transit time by lane?",
+    "Which routes have the highest freight cost per unit?",
+    "Show me fill rate trend by product category",
+    "Which warehouses have the highest dwell time this week?",
+    "How many backorder lines do we have by supplier right now?"
+  ],
+  "kpi_definitions": [
+    {
+      "name": "On-Time Delivery Rate",
+      "formula_description": "deliveries_on_time / total_deliveries * 100",
+      "target_range": "> 95%",
+      "alert_threshold": 90,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "OTIF Rate",
+      "formula_description": "orders_on_time_in_full / total_orders * 100",
+      "target_range": "> 98%",
+      "alert_threshold": 95,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "Fill Rate",
+      "formula_description": "quantity_shipped / quantity_ordered * 100",
+      "target_range": "> 98%",
+      "alert_threshold": 95,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Average Transit Time",
+      "formula_description": "AVG(delivery_date - pickup_date) in days",
+      "target_range": "Route-specific SLA",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    }
+  ],
+  "alert_templates": [
+    {
+      "name": "Late Shipments Spike",
+      "description": "High proportion of active shipments are past their promised delivery date",
+      "metric_hint": "COUNT(*) FROM shipments WHERE promised_delivery_date < CURRENT_DATE AND actual_delivery_date IS NULL",
+      "threshold_type": "ABOVE",
+      "threshold_value": 20,
+      "severity": "HIGH"
+    },
+    {
+      "name": "Low Fill Rate",
+      "description": "Order fill rate has dropped below the minimum threshold",
+      "metric_hint": "AVG(quantity_shipped::float / NULLIF(quantity_ordered,0)) * 100 FROM orders WHERE order_date >= CURRENT_DATE - 7",
+      "threshold_type": "BELOW",
+      "threshold_value": 95,
+      "severity": "MEDIUM"
+    },
+    {
+      "name": "Carrier OTD Degradation",
+      "description": "A carrier's on-time delivery rate has fallen below the SLA",
+      "metric_hint": "COUNT(CASE WHEN actual_delivery_date <= promised_delivery_date THEN 1 END)::float / COUNT(*) * 100 GROUP BY carrier",
+      "threshold_type": "BELOW",
+      "threshold_value": 90,
+      "severity": "HIGH"
+    }
+  ]
+}

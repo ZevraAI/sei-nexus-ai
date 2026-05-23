@@ -1,0 +1,189 @@
+{
+  "pack_id": "retail-v1",
+  "industry": "RETAIL",
+  "display_name": "Retail & E-commerce",
+  "version": "1.0.0",
+  "description": "Semantic layer for retail stores, e-commerce, omnichannel, and consumer brands. Covers sales performance, inventory management, customer behaviour, and merchandising.",
+  "entities": [
+    {
+      "name": "Product",
+      "aliases": ["product", "sku", "item", "article", "variant"],
+      "table_patterns": ["product", "products", "item", "items", "sku", "skus", "article", "articles", "variant", "variants", "merchandise", "catalog"],
+      "key_column_patterns": ["product_id", "sku_id", "item_id", "article_id", "variant_id", "sku_code", "barcode", "upc", "ean"],
+      "description": "A sellable product or SKU in the assortment",
+      "operational_meaning": "Core entity for sales, inventory, margin, and assortment analytics"
+    },
+    {
+      "name": "Customer",
+      "aliases": ["customer", "shopper", "member", "account", "buyer"],
+      "table_patterns": ["customer", "customers", "shopper", "shoppers", "member", "members", "account", "accounts", "loyalty_member", "buyer"],
+      "key_column_patterns": ["customer_id", "shopper_id", "member_id", "account_id", "loyalty_number", "email"],
+      "description": "Individual or organisation that purchases products",
+      "operational_meaning": "Used for CLV, segmentation, churn, and personalisation analytics"
+    },
+    {
+      "name": "Transaction",
+      "aliases": ["transaction", "sale", "order", "purchase", "receipt"],
+      "table_patterns": ["transaction", "transactions", "sale", "sales", "order", "orders", "purchase", "purchases", "receipt", "receipts", "invoice", "invoices", "pos_transaction"],
+      "key_column_patterns": ["transaction_id", "order_id", "sale_id", "receipt_id", "invoice_number", "order_number"],
+      "description": "A completed sales event or purchase",
+      "operational_meaning": "Primary source for revenue, basket analysis, and conversion metrics"
+    },
+    {
+      "name": "Store",
+      "aliases": ["store", "location", "branch", "outlet", "shop"],
+      "table_patterns": ["store", "stores", "location", "locations", "branch", "branches", "outlet", "outlets", "shop", "shops", "site"],
+      "key_column_patterns": ["store_id", "location_id", "branch_id", "outlet_id", "store_code"],
+      "description": "Physical retail location or selling channel",
+      "operational_meaning": "Used for store performance benchmarking, cluster analysis, and space planning"
+    },
+    {
+      "name": "Category",
+      "aliases": ["category", "department", "classification", "segment", "division"],
+      "table_patterns": ["category", "categories", "department", "departments", "classification", "classifications", "segment", "hierarchy", "product_group"],
+      "key_column_patterns": ["category_id", "department_id", "class_id", "subclass_id", "category_code"],
+      "description": "Hierarchical grouping of products for merchandising",
+      "operational_meaning": "Used for category performance, space allocation, and buyer responsibility"
+    },
+    {
+      "name": "Inventory",
+      "aliases": ["inventory", "stock", "on_hand", "stock_level"],
+      "table_patterns": ["inventory", "stock", "stock_level", "on_hand", "inventory_position", "stock_balance", "wh_inventory"],
+      "key_column_patterns": ["inventory_id", "on_hand_qty", "available_qty", "stock_qty"],
+      "description": "Current quantity of a product available at a location",
+      "operational_meaning": "Used for stockout risk, over-stock identification, and replenishment decisions"
+    },
+    {
+      "name": "Return",
+      "aliases": ["return", "refund", "credit", "rma"],
+      "table_patterns": ["return", "returns", "refund", "refunds", "rma", "credit_note", "return_order", "exchange"],
+      "key_column_patterns": ["return_id", "rma_id", "refund_id", "return_number"],
+      "description": "Product returned by a customer for refund or exchange",
+      "operational_meaning": "Used for return rate, net revenue, and quality/fraud analysis"
+    },
+    {
+      "name": "Supplier",
+      "aliases": ["supplier", "vendor", "manufacturer"],
+      "table_patterns": ["supplier", "suppliers", "vendor", "vendors", "manufacturer", "manufacturers"],
+      "key_column_patterns": ["supplier_id", "vendor_id", "supplier_code", "vendor_code"],
+      "description": "Entity that supplies products to the retailer",
+      "operational_meaning": "Used for supplier fill rates, lead times, terms, and compliance"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "sell-through rate",
+      "aliases": ["sell through", "STR", "sold through", "sell-through"],
+      "definition": "Percentage of inventory received that was sold in a period",
+      "sql_hint": "units_sold / units_received * 100 for the period"
+    },
+    {
+      "term": "GMROI",
+      "aliases": ["gross margin return on investment", "gmroi", "inventory return"],
+      "definition": "Gross Margin Return on Inventory Investment — profit generated per unit of inventory cost",
+      "sql_hint": "gross_margin / average_inventory_cost * 100"
+    },
+    {
+      "term": "basket size",
+      "aliases": ["average basket", "UPT", "average order value", "AOV", "items per transaction"],
+      "definition": "Average number of items or value per transaction",
+      "sql_hint": "AVG(total_items) or AVG(transaction_value) FROM transactions"
+    },
+    {
+      "term": "stockout",
+      "aliases": ["out of stock", "OOS", "zero stock", "unavailable"],
+      "definition": "Product with zero or negative inventory at a selling location",
+      "sql_hint": "on_hand_qty <= 0 OR available_qty <= 0 OR status = 'OUT_OF_STOCK'"
+    },
+    {
+      "term": "shrinkage",
+      "aliases": ["shrink", "loss", "stock loss", "inventory loss"],
+      "definition": "Reduction in inventory value due to theft, damage, or administrative error",
+      "sql_hint": "expected_inventory - actual_inventory OR shrink_amount FROM inventory_adjustments WHERE reason_code = 'SHRINK'"
+    },
+    {
+      "term": "markdown",
+      "aliases": ["price reduction", "clearance", "promotion discount"],
+      "definition": "Permanent price reduction taken on a product to clear stock",
+      "sql_hint": "original_price - marked_down_price OR price_change_type = 'MARKDOWN'"
+    },
+    {
+      "term": "conversion rate",
+      "aliases": ["conversion", "traffic conversion", "visit conversion"],
+      "definition": "Percentage of store visits or website sessions that result in a purchase",
+      "sql_hint": "COUNT(transactions) / COUNT(visits) * 100"
+    },
+    {
+      "term": "replenishment",
+      "aliases": ["reorder", "restock", "auto-replenishment", "replen"],
+      "definition": "Process of restocking a location when inventory falls below a trigger point",
+      "sql_hint": "on_hand_qty <= reorder_point OR replenishment_needed = TRUE"
+    }
+  ],
+  "suggested_questions": [
+    "What are the top 10 products by revenue this week?",
+    "Which categories have the lowest sell-through rate this month?",
+    "Show me stockout risk by store for our top 50 SKUs",
+    "What is the return rate by product category for the last 30 days?",
+    "Which stores have the highest basket size this quarter?",
+    "Show me GMROI by department vs target",
+    "Which suppliers have the lowest fill rate this month?",
+    "What products are below their reorder point right now?"
+  ],
+  "kpi_definitions": [
+    {
+      "name": "Sell-Through Rate",
+      "formula_description": "units_sold / units_received * 100",
+      "target_range": "> 70% seasonally",
+      "alert_threshold": 40,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Stockout Rate",
+      "formula_description": "SKUs_out_of_stock / total_active_SKUs * 100",
+      "target_range": "< 2%",
+      "alert_threshold": 5,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "Return Rate",
+      "formula_description": "units_returned / units_sold * 100",
+      "target_range": "< 5% in-store, < 15% e-commerce",
+      "alert_threshold": 10,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Gross Margin",
+      "formula_description": "(net_sales - cost_of_goods) / net_sales * 100",
+      "target_range": "Category-specific target",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    }
+  ],
+  "alert_templates": [
+    {
+      "name": "Stockout Alert",
+      "description": "Critical SKUs have zero available inventory",
+      "metric_hint": "COUNT(*) FROM inventory WHERE on_hand_qty <= 0 AND sku_status = 'ACTIVE'",
+      "threshold_type": "ABOVE",
+      "threshold_value": 10,
+      "severity": "HIGH"
+    },
+    {
+      "name": "High Return Rate",
+      "description": "Return rate for a product or category has spiked",
+      "metric_hint": "COUNT(returns) / COUNT(sales) * 100 GROUP BY category WHERE period = CURRENT_WEEK",
+      "threshold_type": "ABOVE",
+      "threshold_value": 10,
+      "severity": "MEDIUM"
+    },
+    {
+      "name": "Low Sell-Through",
+      "description": "Seasonal product sell-through is running below target",
+      "metric_hint": "SUM(units_sold) / SUM(units_received) * 100 WHERE category = 'SEASONAL'",
+      "threshold_type": "BELOW",
+      "threshold_value": 50,
+      "severity": "MEDIUM"
+    }
+  ]
+}

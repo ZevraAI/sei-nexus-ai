@@ -9,7 +9,17 @@ import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.attachment.ChatAttachment;
+import com.sei.nexus.attachment.ChatAttachmentRepository;
 import com.sei.nexus.connection.ConnectionRepository;
+import com.sei.nexus.governance.ColumnMaskingService;
+import com.sei.nexus.governance.DataContractService;
+import com.sei.nexus.governance.GovernanceAuditService;
+import com.sei.nexus.governance.RowLevelSecurityService;
+import com.sei.nexus.governance.UserAttributesRepository;
+import com.sei.nexus.reasoning.EvidenceStore;
+import com.sei.nexus.reasoning.ReasoningEngine;
+import com.sei.nexus.reasoning.ReasoningEventBus;
 import com.sei.nexus.enterprise.EnterpriseMapService;
 import com.sei.nexus.knowledge.KnowledgeGap;
 import com.sei.nexus.knowledge.KnowledgeGapRepository;
@@ -17,13 +27,13 @@ import com.sei.nexus.memory.DocumentChunk;
 import com.sei.nexus.memory.DocumentMemoryService;
 import com.sei.nexus.query.QueryExecutionRepository;
 import com.sei.nexus.query.QueryGovernanceService;
-import com.sei.nexus.reasoning.Hypothesis;
 import com.sei.nexus.reasoning.OperationalFinding;
 import com.sei.nexus.reasoning.ReasoningRepository;
 import com.sei.nexus.reasoning.ReasoningSession;
-import com.sei.nexus.reasoning.ReasoningStep;
 import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
+import com.sei.nexus.semantic.LearningContextBuilder;
+import com.sei.nexus.semantic.SemanticLearningService;
 import com.sei.nexus.semantic.SemanticService;
 import com.sei.nexus.sql.DynamicSqlService;
 import com.sei.nexus.graph.KnowledgeGraphService;
@@ -57,8 +67,21 @@ public class ChatService {
     private final BaselineService baselineService;
     private final KnowledgeGapRepository knowledgeGapRepository;
     private final KnowledgeGraphService knowledgeGraphService;
-    private final AzureOpenAiClient aiClient;
-    private final ObjectMapper objectMapper;
+    private final AzureOpenAiClient        aiClient;
+    private final ObjectMapper             objectMapper;
+    private final ChatAttachmentRepository attachmentRepository;
+    // ── Governance chain (Phase 1) ────────────────────────────────────────────
+    private final DataContractService      dataContractService;
+    private final RowLevelSecurityService  rowLevelSecurityService;
+    private final ColumnMaskingService     columnMaskingService;
+    private final GovernanceAuditService   governanceAuditService;
+    private final UserAttributesRepository userAttributesRepository;
+    // ── Multi-step reasoning (Phase 2) ───────────────────────────────────────
+    private final ReasoningEngine          reasoningEngine;
+    private final ReasoningEventBus        reasoningEventBus;
+    // ── Semantic learning (Phase 3) ───────────────────────────────────────────
+    private final SemanticLearningService  semanticLearningService;
+    private final LearningContextBuilder   learningContextBuilder;
 
     public ChatService(RunRepository runRepository,
                        DocumentMemoryService documentMemoryService,
@@ -74,22 +97,42 @@ public class ChatService {
                        KnowledgeGapRepository knowledgeGapRepository,
                        KnowledgeGraphService knowledgeGraphService,
                        AzureOpenAiClient aiClient,
-                       ObjectMapper objectMapper) {
-        this.runRepository = runRepository;
-        this.documentMemoryService = documentMemoryService;
-        this.enterpriseMapService = enterpriseMapService;
-        this.semanticService = semanticService;
-        this.agentRepository = agentRepository;
-        this.connectionRepository = connectionRepository;
-        this.queryGovernanceService = queryGovernanceService;
+                       ObjectMapper objectMapper,
+                       ChatAttachmentRepository attachmentRepository,
+                       DataContractService dataContractService,
+                       RowLevelSecurityService rowLevelSecurityService,
+                       ColumnMaskingService columnMaskingService,
+                       GovernanceAuditService governanceAuditService,
+                       UserAttributesRepository userAttributesRepository,
+                       ReasoningEngine reasoningEngine,
+                       ReasoningEventBus reasoningEventBus,
+                       SemanticLearningService semanticLearningService,
+                       LearningContextBuilder learningContextBuilder) {
+        this.runRepository            = runRepository;
+        this.documentMemoryService    = documentMemoryService;
+        this.enterpriseMapService     = enterpriseMapService;
+        this.semanticService          = semanticService;
+        this.agentRepository          = agentRepository;
+        this.connectionRepository     = connectionRepository;
+        this.queryGovernanceService   = queryGovernanceService;
         this.queryExecutionRepository = queryExecutionRepository;
-        this.dynamicSqlService = dynamicSqlService;
-        this.reasoningRepository = reasoningRepository;
-        this.baselineService = baselineService;
-        this.knowledgeGapRepository = knowledgeGapRepository;
-        this.knowledgeGraphService = knowledgeGraphService;
-        this.aiClient = aiClient;
-        this.objectMapper = objectMapper;
+        this.dynamicSqlService        = dynamicSqlService;
+        this.reasoningRepository      = reasoningRepository;
+        this.baselineService          = baselineService;
+        this.knowledgeGapRepository   = knowledgeGapRepository;
+        this.knowledgeGraphService    = knowledgeGraphService;
+        this.aiClient                 = aiClient;
+        this.objectMapper             = objectMapper;
+        this.attachmentRepository     = attachmentRepository;
+        this.dataContractService      = dataContractService;
+        this.rowLevelSecurityService  = rowLevelSecurityService;
+        this.columnMaskingService     = columnMaskingService;
+        this.governanceAuditService   = governanceAuditService;
+        this.userAttributesRepository = userAttributesRepository;
+        this.reasoningEngine          = reasoningEngine;
+        this.reasoningEventBus        = reasoningEventBus;
+        this.semanticLearningService  = semanticLearningService;
+        this.learningContextBuilder   = learningContextBuilder;
     }
 
     // =========================================================================
@@ -111,7 +154,37 @@ public class ChatService {
             raw = raw.substring(7).trim();
             forceAsync = true;
         }
-        final String question = raw;
+        // STEP 1b: Load attachment content if present.
+        // IMPORTANT: the raw user question (raw) is kept separate from the enriched
+        // version (enrichedQuestion) that includes file content.
+        // - Routing, intent detection, agent selection all use `raw` — they must read
+        //   the user's intent, not the file contents.
+        // - SQL planning and answer composition use `enrichedQuestion` — they need the
+        //   file content to build WHERE IN clauses and incorporate reference data.
+        // - The run record stored in the DB also uses `raw` to keep it readable.
+        String attachmentContext = "";
+        String attachmentSummary = "";
+        if (request.attachmentKey() != null && !request.attachmentKey().isBlank()) {
+            try {
+                ChatAttachment att = attachmentRepository.findByKey(request.attachmentKey())
+                        .orElse(null);
+                if (att != null && att.extractedText() != null) {
+                    attachmentContext = att.extractedText();
+                    attachmentSummary = att.summary() != null ? att.summary() : att.fileName();
+                    log.info("Attachment '{}' ({}) injected into conversation context",
+                            att.fileName(), att.attachmentType());
+                }
+            } catch (Exception e) {
+                log.warn("Could not load attachment {}: {}", request.attachmentKey(), e.getMessage());
+            }
+        }
+
+        // enrichedQuestion is used only by the SQL planner and answer composer.
+        final String enrichedQuestion = attachmentContext.isBlank() ? raw
+                : "=== ATTACHED FILE: " + attachmentSummary + " ===\n"
+                + attachmentContext + "\n"
+                + "=== END OF ATTACHMENT ===\n\n"
+                + "User question: " + raw;
 
         // STEP 2: Conversation
         String conversationId = (request.conversationId() != null && !request.conversationId().isBlank())
@@ -120,64 +193,72 @@ public class ChatService {
         // STEP 3: Recent history
         List<NexusRun> history = runRepository.findConversationRuns(conversationId, 8);
 
-        // STEP 4: Route agent
-        NexusAgent agent = resolveAgent(request.agentKey(), question, history);
+        // STEP 4: Route agent — use raw question only (not file content)
+        NexusAgent agent = resolveAgent(request.agentKey(), raw, history);
         double routingConfidence = agent != null ? 0.9 : 0.5;
 
-        // STEP 5: Save run
-        String runKey = Keys.runKey();
+        // STEP 5: Save run — use client-provided key when present (enables SSE pre-subscription)
+        String runKey = (request.clientRunKey() != null && !request.clientRunKey().isBlank())
+                ? request.clientRunKey() : Keys.runKey();
         NexusRun run = new NexusRun(runKey, conversationId,
                 agent != null ? agent.agentKey() : null,
                 agent != null ? agent.domainKeys() : null,
-                userEmail, question, null, null, "RUNNING", null, null, null);
+                userEmail, raw, null, null, "RUNNING", null, null, null);
         runRepository.save(run);
 
         try {
             List<String> domainKeys = toDomainKeyList(agent);
             List<String> connKeys = toConnKeyList(agent);
 
-            // STEP 6: Memory retrieval
-            List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(question, domainKeys);
+            // STEP 6: Memory retrieval — semantic search on the user's intent, not the file
+            List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(raw, domainKeys);
 
             // STEP 7: Enterprise + Semantic + Anomaly + Findings context
-            Map<String, Object> entCtx = enterpriseMapService.operationalContext(domainKeys, connKeys, question);
-            String semCtx = semanticService.buildSemanticContext(domainKeys, question);
+            Map<String, Object> entCtx = enterpriseMapService.operationalContext(domainKeys, connKeys, raw);
+            String semCtx = semanticService.buildSemanticContext(domainKeys, raw);
             List<OperationalFinding> findings = reasoningRepository.findRecentFindings(domainKeys, 5);
             String anomalyCtx = baselineService.getAnomalyContext(domainKeys);
 
-            // STEP 8: Write intent boundary
-            if (isWriteIntent(question)) {
-                String ans = "SEI Nexus is a read-only operational reasoning system. I can help you " +
-                        "investigate and understand enterprise data, but cannot perform modifications. " +
+            // STEP 8: Write intent boundary — check user's question only
+            if (isWriteIntent(raw)) {
+                String ans = "Zevra is a read-only operational intelligence platform. I can help you " +
+                        "investigate and understand your business data, but cannot perform modifications. " +
                         "Use /request-source to request workflow integrations.";
                 runRepository.update(runKey, ans, "READ_ONLY_BOUNDARY", "COMPLETE", null);
                 return buildResponse(conversationId, runKey, ans, "READ_ONLY_BOUNDARY",
-                        agent, routingConfidence, false, List.of(), List.of(), List.of());
+                        agent, routingConfidence, false, List.of(), List.of(), List.of(), List.of(), List.of());
             }
 
             // STEP 9: Prior result check
             Optional<String> priorSnapshot = runRepository.latestResultSnapshot(conversationId);
 
-            // STEP 10: LLM decision
-            Map<String, Object> decision = getLlmDecision(question, memChunks, entCtx, semCtx,
+            // STEP 10: LLM decision — routes on user intent (raw), not file content.
+            // This is the key: the router sees "do these orders exist in the system?" and
+            // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
+            Map<String, Object> decision = getLlmDecision(raw, memChunks, entCtx, semCtx,
                     findings, anomalyCtx, history, priorSnapshot.isPresent(), agent);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
-            List<Map<String, Object>> asyncOps = new ArrayList<>();
-            List<Map<String, Object>> queryData = new ArrayList<>();
+            List<Map<String, Object>> asyncOps        = new ArrayList<>();
+            List<Map<String, Object>> queryData        = new ArrayList<>();
+            List<Map<String, Object>> reasoningSteps   = new ArrayList<>();
+            List<String>              learningsApplied  = new ArrayList<>();
             String resultSnapshot = null;
 
             switch (decisionType) {
                 case "ANSWER_FROM_PRIOR_RESULTS" -> {
                     if (priorSnapshot.isPresent()) {
-                        answer = answerFromPriorResults(question, priorSnapshot.get(), memChunks, history, agent);
+                        answer = answerFromPriorResults(raw, priorSnapshot.get(), memChunks, history, agent);
                     } else {
-                        answer = answerFromMemory(question, memChunks, semCtx, entCtx, agent);
+                        // enrichedQuestion so the file content is available if the question was about the file
+                        answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, entCtx, agent);
                     }
                 }
                 case "ANSWER_FROM_MEMORY" -> {
-                    answer = answerFromMemory(question, memChunks, semCtx, entCtx, agent);
+                    // enrichedQuestion: if the user uploaded a file and asked about it, this path
+                    // has the file content available so the AI can summarise / translate / explain it.
+                    answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, entCtx, agent);
                 }
                 case "ASK_CLARIFICATION" -> {
                     answer = (String) decision.getOrDefault("clarification_question",
@@ -187,7 +268,7 @@ public class ChatService {
                     String gapKey = Keys.uniqueKey("gap");
                     KnowledgeGap gap = new KnowledgeGap(gapKey,
                             agent != null ? agent.domainKeys() : null,
-                            "MISSING_KNOWLEDGE", runKey, question,
+                            "MISSING_KNOWLEDGE", runKey, raw,
                             "No approved knowledge or data sources found for this question.",
                             null, "OPEN", null, null, null, null);
                     knowledgeGapRepository.save(gap);
@@ -201,110 +282,73 @@ public class ChatService {
                     ReasoningSession session = new ReasoningSession(sessionKey, runKey, conversationId,
                             agent != null ? agent.agentKey() : null,
                             agent != null ? agent.domainKeys() : null,
-                            question, null, "ACTIVE", null, null, Instant.now(), null);
+                            raw, null, "ACTIVE", null, null, Instant.now(), null);
                     reasoningRepository.saveSession(session);
 
-                    // Playbook context
+                    // Build schema context string for the iterative planner.
+                    // enrichedQuestion (with attachment content) is passed separately so
+                    // the planner can extract WHERE IN values from uploaded files.
                     String playbookCtx = "";
                     if (agent != null) {
                         List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
-                        if (!playbooks.isEmpty()) {
-                            playbookCtx = "Playbook steps: " + playbooks.get(0).investigationSteps();
-                        }
+                        if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
+                    }
+                    String schemaCtx = buildContextSummary(memChunks, entCtx, semCtx, findings,
+                            anomalyCtx, false, history, agent);
+                    if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
+
+                    // ── Phase 3: inject learned business vocabulary into the planner context ──
+                    String agentDomainKey = agent != null ? agent.domainKeys() : null;
+                    LearningContextBuilder.LearningContext learningCtx =
+                            learningContextBuilder.build(agentDomainKey, conversationId);
+                    if (!learningCtx.isEmpty()) {
+                        schemaCtx = schemaCtx + "\n\n" + learningCtx.contextText();
+                        learningsApplied.addAll(learningCtx.termsApplied());
                     }
 
-                    // Generate investigation plan
-                    String planJson = generateInvestigationPlan(question, entCtx, semCtx,
-                            memChunks, findings, anomalyCtx, playbookCtx, history, agent);
-                    List<Map<String, Object>> steps = parsePlan(planJson);
+                    // Run the iterative reasoning loop (Phase 2).
+                    // The engine generates one SQL step at a time, executes it through the
+                    // governance chain, evaluates whether the evidence is sufficient, and
+                    // continues until the evaluator says SUFFICIENT, DEAD_END, or MAX_STEPS.
+                    ReasoningEngine.ReasoningResult reasonResult = reasoningEngine.reason(
+                            raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync);
 
-                    // Initial hypothesis
-                    String hypText = generateHypothesisText(question, agent);
-                    Hypothesis hyp = new Hypothesis(Keys.uniqueKey("hyp"), sessionKey, hypText,
-                            0.5, "[]", "[]", "ACTIVE", Instant.now(), null);
-                    reasoningRepository.saveHypothesis(hyp);
+                    resultSnapshot = reasonResult.resultSnapshot();
+                    queryData      = reasonResult.queryData();
 
-                    List<Map<String, Object>> execResults = new ArrayList<>();
-                    int stepNo = 1;
+                    // Convert EvidenceStore steps to the execResults format composeAnswer expects
+                    List<Map<String, Object>> execResults = evidenceToExecResults(reasonResult.evidence());
 
-                    for (Map<String, Object> step : steps) {
-                        String sql = (String) step.get("sql");
-                        String connKey = (String) step.get("connection_key");
-                        String objKeys = step.containsKey("object_keys") ? (String) step.get("object_keys") : "";
-                        String desc = step.containsKey("description") ? (String) step.get("description") : "Step " + stepNo;
+                    answer = composeAnswer(raw, attachmentSummary, execResults, memChunks, semCtx,
+                            findings, anomalyCtx, agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
 
-                        if (sql == null || connKey == null || connKey.isBlank()) {
-                            stepNo++;
-                            continue;
-                        }
+                    // Notify SSE clients the answer is ready, then close the stream
+                    reasoningEventBus.publish(runKey, "answer_ready", Map.of("answer", answer));
+                    reasoningEventBus.complete(runKey);
 
-                        // Validate the connection key exists before handing to governance.
-                        // The AI sometimes invents a key from context (table name, group label).
-                        // Skip the step gracefully rather than throwing a 500.
-                        if (connectionRepository.findByKeyOrName(connKey).isEmpty()) {
-                            log.warn("Step {} skipped — connection '{}' is referenced by data objects " +
-                                     "but no longer exists in nexus_connection. " +
-                                     "The connection may have been deleted after onboarding.",
-                                     stepNo, connKey);
-                            execResults.add(Map.of("step", stepNo, "error",
-                                    "The database connection configured during onboarding (" + connKey + ") " +
-                                    "no longer exists. Please re-add the connection in the Connections page " +
-                                    "and then use POST /onboarding/reset to re-run onboarding."));
-                            stepNo++;
-                            continue;
-                        }
-
-                        var gov = queryGovernanceService.govern(runKey, stepNo,
-                                agent != null ? agent.agentKey() : "", connKey, objKeys, sql, forceAsync);
-
-                        // Record reasoning step
-                        ReasoningStep rStep = new ReasoningStep(Keys.uniqueKey("rstep"), sessionKey, stepNo,
-                                "DATA_CHECK", desc, "[]", null, 0.0, gov.executionKey(), Instant.now());
-                        reasoningRepository.saveStep(rStep);
-
-                        if ("BLOCK".equals(gov.route())) {
-                            execResults.add(Map.of("step", stepNo, "blocked", true, "reason", gov.decisionReason()));
-                        } else if ("ASK_FOR_FILTER".equals(gov.route())) {
-                            execResults.add(Map.of("step", stepNo, "needs_filter", true, "reason", gov.decisionReason()));
-                        } else if ("EXECUTE_ASYNC".equals(gov.route())) {
-                            queryExecutionRepository.updateStatus(gov.executionKey(), "QUEUED", null, null, null);
-                            asyncOps.add(Map.of("execution_key", gov.executionKey(),
-                                    "description", desc, "status", "QUEUED"));
-                        } else {
-                            // EXECUTE_SYNC
-                            try {
-                                queryExecutionRepository.updateStatus(gov.executionKey(), "RUNNING", Instant.now(), null, null);
-                                List<Map<String, Object>> rows = dynamicSqlService.executeQuery(
-                                        connKey, gov.approvedSql(), gov.rowLimit());
-                                String rJson = objectMapper.writeValueAsString(rows);
-                                queryExecutionRepository.updateResult(gov.executionKey(), rJson, "SUCCESS", Instant.now());
-                                execResults.add(Map.of("step", stepNo, "rows", rows,
-                                        "sql", gov.approvedSql(), "execution_key", gov.executionKey()));
-                                resultSnapshot = rJson;
-                            } catch (Exception ex) {
-                                queryExecutionRepository.updateStatus(gov.executionKey(), "FAILED",
-                                        null, Instant.now(), ex.getMessage());
-                                execResults.add(Map.of("step", stepNo, "error", ex.getMessage()));
-                            }
-                        }
-                        stepNo++;
+                    // ── Phase 3: fire-and-forget learning from this successful run ──
+                    // Pick the SQL from the most data-rich step for term extraction.
+                    String bestSql = reasonResult.evidence().getSteps().stream()
+                            .filter(s -> !s.rows().isEmpty() && s.sql() != null)
+                            .max(java.util.Comparator.comparingInt(s -> s.rows().size()))
+                            .map(s -> s.sql())
+                            .orElse(null);
+                    if (bestSql != null) {
+                        semanticLearningService.learnFromRun(
+                                runKey, raw, bestSql, agentDomainKey, conversationId);
                     }
 
-                    answer = composeAnswer(question, execResults, memChunks, semCtx, findings, anomalyCtx,
-                            agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
-                    reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED", answer, 0.8, Instant.now());
-
-                    // Collect rows from the first successful sync step for frontend visualisation.
-                    // Capped at 100 rows — the chart never needs more than that.
-                    for (Map<String, Object> r : execResults) {
-                        if (r.containsKey("rows")) {
-                            @SuppressWarnings("unchecked")
-                            List<Map<String, Object>> stepRows = (List<Map<String, Object>>) r.get("rows");
-                            if (!stepRows.isEmpty()) {
-                                queryData = stepRows.size() > 100 ? stepRows.subList(0, 100) : stepRows;
-                            }
-                            break;
-                        }
+                    // Collect step summaries for the frontend reasoning trace
+                    for (EvidenceStore.StepEvidence s : reasonResult.evidence().getSteps()) {
+                        reasoningSteps.add(Map.of(
+                                "stepNo",             s.stepNo(),
+                                "description",        s.description() != null ? s.description() : "",
+                                "sql",                s.sql()         != null ? s.sql()         : "",
+                                "rowCount",           s.rows().size(),
+                                "rowSummary",         s.rowSummary()          != null ? s.rowSummary()          : "",
+                                "evaluatorDecision",  s.evaluatorDecision()   != null ? s.evaluatorDecision()   : "",
+                                "evaluatorRationale", s.evaluatorRationale()  != null ? s.evaluatorRationale()  : "",
+                                "executionMs",        s.executionMs()));
                     }
                 }
                 default -> {
@@ -318,9 +362,10 @@ public class ChatService {
                             "agent", agent != null ? agent.agentKey() : "none",
                             "memory_chunks", memChunks.size())));
 
-            List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, question);
+            List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, raw);
             return buildResponse(conversationId, runKey, answer, decisionType,
-                    agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType), quickRefs, asyncOps, queryData);
+                    agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType),
+                    quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied);
 
         } catch (Exception e) {
             log.error("Chat orchestration failed for run {}: {}", runKey, e.getMessage(), e);
@@ -389,6 +434,7 @@ public class ChatService {
                       "requiresClarification": false,
                       "clarification_question": ""
                     }
+
                     Routing rules (in priority order):
                     1. Use ANSWER_FROM_PRIOR_RESULTS ONLY when the question is specifically asking about
                        the previous answer itself — not new data. Examples: "explain that", "show me the SQL
@@ -439,6 +485,20 @@ public class ChatService {
                     - Use exact column names from the schema
                     - Joins, aggregations, GROUP BY, ORDER BY are all valid
                     - Do not use SELECT *; always name columns explicitly
+
+                    ATTACHED FILE RULE:
+                    If the question contains "=== ATTACHED FILE ===" markers, the content between those
+                    markers is reference data uploaded by the user. You MUST:
+                    1. Extract the relevant identifiers from the file (IDs, codes, reference numbers,
+                       names — whatever column in the file matches an identifier column in the database).
+                    2. Embed those values directly as literals in a SQL WHERE ... IN (...) clause or
+                       equivalent filter. Example: WHERE id IN ('REF-001','REF-002','REF-003')
+                    3. SELECT the database columns that let the user verify existence and compare status
+                       (e.g. id, name, status, date — not SELECT *).
+                    This is a cross-reference query: the file provides the lookup keys, the database
+                    provides the ground truth. Never skip the WHERE filter; without it the query returns
+                    unrelated rows.
+
                     Return a JSON array only (no extra text):
                     [{"step":1,"description":"...","sql":"SELECT ...","connection_key":"...","object_keys":"..."}]
                     """;
@@ -529,19 +589,21 @@ public class ChatService {
         }
     }
 
-    private String composeAnswer(String question, List<Map<String, Object>> execResults,
+    private String composeAnswer(String question, String attachmentSummary,
+            List<Map<String, Object>> execResults,
             List<DocumentChunk> memChunks, String semCtx, List<OperationalFinding> findings,
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
         try {
             StringBuilder ctx = new StringBuilder();
 
+            boolean anyRows = false;
+
             for (Map<String, Object> r : execResults) {
                 if (r.containsKey("rows")) {
                     @SuppressWarnings("unchecked")
                     List<Map<String, Object>> rows = (List<Map<String, Object>>) r.get("rows");
-                    // Build a statistical summary — do NOT dump raw rows. The frontend
-                    // renders the full table, so the AI only needs aggregate insight.
                     ctx.append(buildRowSummary(rows));
+                    if (!rows.isEmpty()) anyRows = true;
                 } else if (r.containsKey("error")) {
                     ctx.append("Query error: ").append(r.get("error")).append("\n");
                 } else if (r.containsKey("blocked")) {
@@ -560,16 +622,36 @@ public class ChatService {
                         ctx.append("\nContext: ").append(c.chunkText(), 0, Math.min(300, c.chunkText().length())));
             }
 
-            String prompt = "Question: " + question + "\n\nData summary:\n" + ctx;
-            return aiClient.chat(List.of(ChatMessage.user(prompt)), """
+            // When a file was attached and the database returned nothing, be explicit.
+            // Do not let the AI fall back to analysing the file content.
+            String attachmentNote = (attachmentSummary != null && !attachmentSummary.isBlank())
+                    ? "\nNote: the user uploaded a file (" + attachmentSummary + ") whose values were used as query parameters."
+                    : "";
+
+            String prompt = "Question: " + question + attachmentNote + "\n\nQuery results:\n" + ctx;
+
+            String systemPrompt = anyRows
+                    ? """
                     You are Zevra, an enterprise operational intelligence AI.
                     The full data is already shown to the user in a table and chart — do NOT list individual records or reproduce row-level data.
                     Write a concise analyst summary of 2-4 sentences covering:
-                    1. Total count and headline distribution (e.g. "10 orders: 5 received, 2 open, 3 overdue")
-                    2. The single most important insight or anomaly (e.g. "All overdue orders are from Supplier 3")
+                    1. Total count and headline distribution (e.g. "42 records: 28 active, 10 closed, 4 pending")
+                    2. The single most important insight or anomaly
                     3. One actionable recommendation only if clearly warranted
                     Use plain prose. Bold key numbers. No markdown headings or bullet lists unless there are multiple distinct anomalies.
-                    """);
+                    """
+                    : """
+                    You are Zevra, an enterprise operational intelligence AI.
+                    The database query returned zero matching rows.
+                    If the user uploaded a file, those values were used as lookup parameters — zero rows means
+                    those records do NOT exist in the connected database.
+                    State this clearly and concisely: what was searched for, what was found (nothing), and
+                    what the user should check next (e.g. wrong table, different ID format, data not yet loaded).
+                    Do NOT summarise or analyse the uploaded file content itself — it was input, not output.
+                    Keep the response to 2-3 sentences.
+                    """;
+
+            return aiClient.chat(List.of(ChatMessage.user(prompt)), systemPrompt);
         } catch (Exception e) {
             return "Investigation completed. " +
                     (execResults.stream().anyMatch(r -> r.containsKey("rows")) ? "Results are shown in the table below." : "No data returned.");
@@ -729,7 +811,7 @@ public class ChatService {
                 "KNOWLEDGE_PROPOSAL", "COMPLETE", null);
         return buildResponse(convId, runKey,
                 "Your knowledge proposal has been submitted for review by the domain owner. Ref: " + gapKey,
-                "KNOWLEDGE_PROPOSAL", null, 1.0, false, List.of(), List.of(), List.of());
+                "KNOWLEDGE_PROPOSAL", null, 1.0, false, List.of(), List.of(), List.of(), List.of(), List.of());
     }
 
     private ChatResponse handleSourceRequest(String text, String userEmail) {
@@ -745,7 +827,7 @@ public class ChatService {
         runRepository.update(runKey, "Source request submitted.", "SOURCE_REQUEST", "COMPLETE", null);
         return buildResponse(convId, runKey,
                 "Your source request has been submitted for review. Ref: " + gapKey,
-                "SOURCE_REQUEST", null, 1.0, false, List.of(), List.of(), List.of());
+                "SOURCE_REQUEST", null, 1.0, false, List.of(), List.of(), List.of(), List.of(), List.of());
     }
 
     // =========================================================================
@@ -755,7 +837,8 @@ public class ChatService {
     private ChatResponse buildResponse(String conversationId, String runKey, String answer,
             String decisionType, NexusAgent agent, double confidence, boolean needsKnowledge,
             List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps,
-            List<Map<String, Object>> queryData) {
+            List<Map<String, Object>> queryData, List<Map<String, Object>> reasoningSteps,
+            List<String> learningsApplied) {
         String evidenceMode = (decisionType.contains("QUERY") || decisionType.contains("HYBRID"))
                 ? "LIVE_DATA" : "MEMORY";
         OrchestratorDecision decision = new OrchestratorDecision(
@@ -772,12 +855,44 @@ public class ChatService {
                 agent != null ? agent.domainKeys() : null,
                 confidence, needsKnowledge, "",
                 quickRefs, asyncOps,
-                queryData != null ? queryData : List.of());
+                queryData        != null ? queryData        : List.of(),
+                reasoningSteps   != null ? reasoningSteps   : List.of(),
+                learningsApplied != null ? learningsApplied : List.of());
+    }
+
+    /** Converts EvidenceStore steps to the execResults format expected by composeAnswer. */
+    private List<Map<String, Object>> evidenceToExecResults(EvidenceStore evidence) {
+        List<Map<String, Object>> results = new java.util.ArrayList<>();
+        for (EvidenceStore.StepEvidence s : evidence.getSteps()) {
+            if (!s.rows().isEmpty()) {
+                results.add(Map.of("step", s.stepNo(), "rows", s.rows(),
+                        "sql", s.sql() != null ? s.sql() : ""));
+            } else if (s.evaluatorDecision() != null &&
+                    (s.evaluatorDecision().contains("BLOCK") || "ERROR".equals(s.evaluatorDecision()))) {
+                results.add(Map.of("step", s.stepNo(), "error",
+                        s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step failed"));
+            }
+        }
+        return results;
     }
 
     // =========================================================================
     // Utility helpers
     // =========================================================================
+
+    /**
+     * Parses a comma-separated string of object keys from an investigation plan step
+     * into a List for use by the governance chain.
+     */
+    private List<String> parseObjectKeys(String objKeys) {
+        if (objKeys == null || objKeys.isBlank()) return List.of();
+        List<String> result = new java.util.ArrayList<>();
+        for (String key : objKeys.split(",")) {
+            String trimmed = key.trim();
+            if (!trimmed.isEmpty()) result.add(trimmed);
+        }
+        return result;
+    }
 
     private List<String> toDomainKeyList(NexusAgent agent) {
         if (agent == null || agent.domainKeys() == null || agent.domainKeys().isBlank()) return List.of();

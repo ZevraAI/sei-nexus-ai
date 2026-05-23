@@ -1,5 +1,7 @@
 package com.sei.nexus.chat;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.auth.UserAccount;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
@@ -7,7 +9,9 @@ import com.sei.nexus.knowledge.KnowledgeGap;
 import com.sei.nexus.knowledge.KnowledgeGapRepository;
 import com.sei.nexus.query.QueryExecution;
 import com.sei.nexus.query.QueryExecutionRepository;
+import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
+import com.sei.nexus.semantic.SemanticLearningService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,6 +19,8 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -25,18 +31,24 @@ public class ChatController {
     private final RunRepository runRepository;
     private final QueryExecutionRepository queryExecutionRepository;
     private final KnowledgeGapRepository knowledgeGapRepository;
+    private final SemanticLearningService semanticLearningService;
     private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
 
     public ChatController(ChatService chatService,
                           RunRepository runRepository,
                           QueryExecutionRepository queryExecutionRepository,
                           KnowledgeGapRepository knowledgeGapRepository,
-                          JdbcTemplate jdbc) {
+                          SemanticLearningService semanticLearningService,
+                          JdbcTemplate jdbc,
+                          ObjectMapper objectMapper) {
         this.chatService = chatService;
         this.runRepository = runRepository;
         this.queryExecutionRepository = queryExecutionRepository;
         this.knowledgeGapRepository = knowledgeGapRepository;
+        this.semanticLearningService = semanticLearningService;
         this.jdbc = jdbc;
+        this.objectMapper = objectMapper;
     }
 
     // ── POST /chat/ask ────────────────────────────────────────────────────────
@@ -73,6 +85,15 @@ public class ChatController {
         runRepository.saveEvidence(evidenceKey, runKey, "FEEDBACK",
                 "{\"rating\":\"" + rating + "\",\"comment\":" + jsonString(comment) + "}");
 
+        // Positive feedback → reinforce any learned term mappings applied to this run
+        if ("POSITIVE".equalsIgnoreCase(rating) || "THUMBS_UP".equalsIgnoreCase(rating)
+                || "HELPFUL".equalsIgnoreCase(rating)) {
+            NexusRun run = runRepository.findByKey(runKey).orElse(null);
+            if (run != null) {
+                semanticLearningService.reinforceFromFeedback(runKey, run.domainKey());
+            }
+        }
+
         // If KNOWLEDGE_GAP rating, create a knowledge gap record
         if ("KNOWLEDGE_GAP".equalsIgnoreCase(rating)) {
             String gapKey = Keys.uniqueKey("gap");
@@ -97,10 +118,44 @@ public class ChatController {
 
     // ── GET /chat/conversations/{conversationId} ──────────────────────────────
 
+    /**
+     * Returns all runs in a conversation, each shaped so the frontend can fully
+     * restore the chat view — including the data table from {@code result_snapshot}.
+     *
+     * <p>Fields returned per run:
+     * <pre>
+     *   run_key, question, answer, decision_type, status,
+     *   query_data   — parsed List from result_snapshot (empty array when absent),
+     *   created_at
+     * </pre>
+     */
     @GetMapping("/chat/conversations/{conversationId}")
-    public ResponseEntity<List<com.sei.nexus.run.NexusRun>> getConversation(
+    public ResponseEntity<List<Map<String, Object>>> getConversation(
             @PathVariable String conversationId) {
-        return ResponseEntity.ok(runRepository.findConversationRuns(conversationId, 50));
+        List<NexusRun> runs = runRepository.findConversationRuns(conversationId, 50);
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (NexusRun run : runs) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("run_key",       run.runKey());
+            m.put("question",      run.question());
+            m.put("answer",        run.answer());
+            m.put("decision_type", run.decisionType());
+            m.put("status",        run.status());
+            m.put("query_data",    parseSnapshot(run.resultSnapshot()));
+            m.put("created_at",    run.createdAt() != null ? run.createdAt().toString() : null);
+            result.add(m);
+        }
+        return ResponseEntity.ok(result);
+    }
+
+    /** Safely parses the result_snapshot JSON string to a List of row Maps. */
+    private List<Map<String, Object>> parseSnapshot(String json) {
+        if (json == null || json.isBlank() || json.equals("[]")) return List.of();
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 
     // ── DELETE /chat/conversations/{conversationId} ───────────────────────────

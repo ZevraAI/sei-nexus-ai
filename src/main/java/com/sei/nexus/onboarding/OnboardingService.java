@@ -46,6 +46,7 @@ public class OnboardingService {
     private final AgentService                agentService;
     private final AgentRepository             agentRepository;
     private final RelationshipDiscoveryService relationshipDiscovery;
+    private final com.sei.nexus.pack.IndustryPackService industryPackService;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -57,7 +58,8 @@ public class OnboardingService {
                               JdbcTemplate jdbc,
                               AgentService agentService,
                               AgentRepository agentRepository,
-                              RelationshipDiscoveryService relationshipDiscovery) {
+                              RelationshipDiscoveryService relationshipDiscovery,
+                              com.sei.nexus.pack.IndustryPackService industryPackService) {
         this.settings              = settings;
         this.connectionRepository  = connectionRepository;
         this.dynamicSqlService     = dynamicSqlService;
@@ -69,6 +71,7 @@ public class OnboardingService {
         this.agentService          = agentService;
         this.agentRepository       = agentRepository;
         this.relationshipDiscovery = relationshipDiscovery;
+        this.industryPackService   = industryPackService;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -138,6 +141,32 @@ public class OnboardingService {
             if (!result.containsKey("suggested_questions")) {
                 result.put("suggested_questions", List.of());
             }
+
+            // ── Phase 4: include pack recommendation ───────────────────────────
+            // Only recommend if no pack has been applied yet
+            try {
+                List<com.sei.nexus.pack.TenantPack> appliedPacks = industryPackService.listAppliedPacks();
+                result.put("applied_packs", appliedPacks.stream()
+                        .map(tp -> java.util.Map.of(
+                                "pack_key",      tp.packKey(),
+                                "display_name",  tp.displayName() != null ? tp.displayName() : "",
+                                "coverage_score", tp.coverageScore() != null ? tp.coverageScore() : 0.0))
+                        .toList());
+
+                if (appliedPacks.isEmpty()) {
+                    industryPackService.recommendForCurrentTenant("PLATFORM").ifPresent(rec -> {
+                        java.util.Map<String, Object> packRec = new java.util.LinkedHashMap<>();
+                        packRec.put("pack_key",       rec.packKey());
+                        packRec.put("display_name",   rec.displayName());
+                        packRec.put("coverage_score", rec.coverageScore());
+                        packRec.put("matched_tables", rec.matchedTables());
+                        result.put("recommended_pack", packRec);
+                    });
+                }
+            } catch (Exception e) {
+                log.debug("Pack recommendation failed during status check: {}", e.getMessage());
+            }
+
             return result;
         }
 
@@ -226,7 +255,7 @@ public class OnboardingService {
                 Identify the 10-15 most important BUSINESS tables for initial setup.
 
                 Prioritise tables that:
-                - Represent core business entities (customers, orders, products, invoices, bookings, shipments, employees, contracts, transactions)
+                - Represent core business entities (customers, transactions, products, employees, contracts, locations, events, assets, appointments, reservations)
                 - Are frequently referenced by other tables (indicated by "id" columns matching other table names)
                 - Have meaningful business column names (not just technical fields)
 
@@ -239,7 +268,7 @@ public class OnboardingService {
                     {
                       "table_name": "exact_table_name",
                       "reason": "one sentence explaining why this is important",
-                      "category": "Customers|Orders|Finance|Inventory|Logistics|HR|Other",
+                      "category": "Customers|Transactions|Finance|Operations|Products|HR|Other",
                       "priority": 1
                     }
                   ]

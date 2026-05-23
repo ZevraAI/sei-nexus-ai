@@ -78,6 +78,7 @@ nexus:
     max-row-limit: 500
   retention:
     conversation-days: 3
+    audit-log-days: 90       # delete audit_event rows older than this; 0 = keep forever
   alerts:
     app-url: ${NEXUS_APP_URL:http://localhost:5176}
 

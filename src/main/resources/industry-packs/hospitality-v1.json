@@ -1,0 +1,181 @@
+{
+  "pack_id": "hospitality-v1",
+  "industry": "HOSPITALITY",
+  "display_name": "Hospitality & Travel",
+  "version": "1.0.0",
+  "description": "Semantic layer for hotels, resorts, serviced apartments, and hospitality groups. Covers reservations, revenue management, guest experience, and property operations.",
+  "entities": [
+    {
+      "name": "Reservation",
+      "aliases": ["reservation", "booking", "stay", "folio"],
+      "table_patterns": ["reservation", "reservations", "booking", "bookings", "stay", "stays", "folio", "folios", "res", "rsvp"],
+      "key_column_patterns": ["reservation_id", "booking_id", "booking_number", "confirmation_number", "res_id", "folio_id"],
+      "description": "A guest's confirmed or tentative booking for accommodation",
+      "operational_meaning": "Core entity for revenue, occupancy, and guest journey analytics"
+    },
+    {
+      "name": "Room",
+      "aliases": ["room", "unit", "suite", "accommodation", "inventory_item"],
+      "table_patterns": ["room", "rooms", "unit", "units", "suite", "suites", "accommodation", "accommodations", "room_type", "room_inventory"],
+      "key_column_patterns": ["room_id", "room_number", "unit_id", "suite_id"],
+      "description": "A physical accommodation unit available for sale",
+      "operational_meaning": "Used for occupancy tracking, yield management, and maintenance scheduling"
+    },
+    {
+      "name": "Guest",
+      "aliases": ["guest", "customer", "profile", "loyalty_member"],
+      "table_patterns": ["guest", "guests", "customer", "customers", "profile", "profiles", "loyalty_member", "member", "visitor", "visitors"],
+      "key_column_patterns": ["guest_id", "customer_id", "profile_id", "loyalty_number", "member_id"],
+      "description": "Person staying at or interacting with the property",
+      "operational_meaning": "Drives loyalty analytics, segment performance, and repeat visit tracking"
+    },
+    {
+      "name": "Property",
+      "aliases": ["property", "hotel", "resort", "location", "venue"],
+      "table_patterns": ["property", "properties", "hotel", "hotels", "resort", "resorts", "location", "locations", "venue", "venues", "site"],
+      "key_column_patterns": ["property_id", "hotel_id", "resort_id", "location_id", "property_code"],
+      "description": "A physical accommodation property in the portfolio",
+      "operational_meaning": "Used for multi-property benchmarking, portfolio-level KPIs"
+    },
+    {
+      "name": "Rate",
+      "aliases": ["rate", "rate_plan", "tariff", "pricing", "rate_code"],
+      "table_patterns": ["rate", "rates", "rate_plan", "rate_plans", "tariff", "tariffs", "pricing", "rate_code", "rate_codes"],
+      "key_column_patterns": ["rate_id", "rate_code", "rate_plan_id", "tariff_id"],
+      "description": "A priced accommodation offer or contract rate",
+      "operational_meaning": "Drives rate strategy, channel mix, and revenue optimisation"
+    },
+    {
+      "name": "Revenue",
+      "aliases": ["revenue", "charge", "transaction", "invoice", "billing"],
+      "table_patterns": ["revenue", "revenues", "charge", "charges", "transaction", "transactions", "invoice", "invoices", "billing", "payment", "payments", "posting"],
+      "key_column_patterns": ["revenue_id", "charge_id", "transaction_id", "invoice_id", "posting_id"],
+      "description": "A financial charge posted against a guest folio",
+      "operational_meaning": "Used for RevPAR, ADR, TRevPAR, and department revenue analysis"
+    },
+    {
+      "name": "Review",
+      "aliases": ["review", "feedback", "rating", "survey", "score"],
+      "table_patterns": ["review", "reviews", "feedback", "survey", "surveys", "rating", "ratings", "guest_survey", "nps_response"],
+      "key_column_patterns": ["review_id", "feedback_id", "survey_id", "rating_id"],
+      "description": "Guest satisfaction feedback or public review",
+      "operational_meaning": "Used for reputation management, service recovery, and NPS tracking"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "RevPAR",
+      "aliases": ["revenue per available room", "rev par", "revpar"],
+      "definition": "Revenue Per Available Room — total room revenue divided by available rooms",
+      "sql_hint": "SUM(room_revenue) / COUNT(available_rooms) or ADR * occupancy_rate / 100"
+    },
+    {
+      "term": "ADR",
+      "aliases": ["average daily rate", "average room rate", "ARR"],
+      "definition": "Average Daily Rate — average revenue per occupied room",
+      "sql_hint": "SUM(room_revenue) / COUNT(rooms_sold) for the period"
+    },
+    {
+      "term": "occupancy",
+      "aliases": ["occupancy rate", "occ", "room occupancy"],
+      "definition": "Percentage of available rooms that were sold in a period",
+      "sql_hint": "COUNT(rooms_occupied) / COUNT(rooms_available) * 100"
+    },
+    {
+      "term": "no-show",
+      "aliases": ["no show", "DNS", "did not show", "failed arrival"],
+      "definition": "Reservation where the guest did not arrive and did not cancel",
+      "sql_hint": "status IN ('NO_SHOW','NO_ARRIVAL','DNS') OR (check_in_date < CURRENT_DATE AND actual_arrival IS NULL AND status = 'CONFIRMED')"
+    },
+    {
+      "term": "GOPPAR",
+      "aliases": ["gross operating profit per available room", "gop par"],
+      "definition": "Gross Operating Profit Per Available Room — profitability metric across all revenue streams",
+      "sql_hint": "SUM(total_revenue - operating_expenses) / COUNT(available_rooms)"
+    },
+    {
+      "term": "pace",
+      "aliases": ["booking pace", "pace report", "pickup"],
+      "definition": "Rate at which reservations are being booked for a future date compared to prior periods",
+      "sql_hint": "COUNT(reservations WHERE stay_date BETWEEN x AND y AND booking_date <= reference_date)"
+    },
+    {
+      "term": "early departure",
+      "aliases": ["early check-out", "short stay", "shortened stay"],
+      "definition": "Guest checking out before their scheduled departure date",
+      "sql_hint": "actual_departure < scheduled_departure OR departure_type = 'EARLY'"
+    },
+    {
+      "term": "walk-in",
+      "aliases": ["walk in", "no-reservation guest", "direct arrival"],
+      "definition": "Guest who arrives without a prior reservation",
+      "sql_hint": "reservation_type IN ('WALKIN','WALK_IN','DIRECT') OR reservation_id IS NULL"
+    }
+  ],
+  "suggested_questions": [
+    "What is the RevPAR trend by property for the last 3 months?",
+    "Which room types had the highest ADR this week?",
+    "Show me occupancy rate vs last year by month",
+    "What is the no-show rate by booking channel this quarter?",
+    "Which guests have stayed more than 5 times in the last year?",
+    "Show me the pace report for next 30 days vs same period last year",
+    "What is the average review score by property this month?",
+    "Which booking channels generate the highest RevPAR?"
+  ],
+  "kpi_definitions": [
+    {
+      "name": "RevPAR",
+      "formula_description": "Total room revenue / available rooms",
+      "target_range": "Market benchmark varies by segment",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Occupancy Rate",
+      "formula_description": "Rooms occupied / rooms available * 100",
+      "target_range": "65–85% depending on segment",
+      "alert_threshold": 50,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "ADR",
+      "formula_description": "Room revenue / rooms sold",
+      "target_range": "Market benchmark",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "No-Show Rate",
+      "formula_description": "no_shows / total_reservations * 100",
+      "target_range": "< 5%",
+      "alert_threshold": 10,
+      "alert_severity": "MEDIUM"
+    }
+  ],
+  "alert_templates": [
+    {
+      "name": "Low Occupancy Alert",
+      "description": "Property occupancy has fallen below the minimum threshold",
+      "metric_hint": "COUNT(rooms_occupied) / total_rooms * 100 for current date",
+      "threshold_type": "BELOW",
+      "threshold_value": 50,
+      "severity": "HIGH"
+    },
+    {
+      "name": "High No-Show Rate",
+      "description": "No-show rate for upcoming arrivals is elevated",
+      "metric_hint": "COUNT(status = 'NO_SHOW') / COUNT(*) * 100 FROM reservations WHERE arrival_date = CURRENT_DATE",
+      "threshold_type": "ABOVE",
+      "threshold_value": 10,
+      "severity": "MEDIUM"
+    },
+    {
+      "name": "Low Review Score",
+      "description": "Property review score has dropped below target",
+      "metric_hint": "AVG(overall_score) FROM reviews WHERE review_date >= CURRENT_DATE - INTERVAL '30 days'",
+      "threshold_type": "BELOW",
+      "threshold_value": 4.0,
+      "severity": "MEDIUM"
+    }
+  ]
+}

@@ -1,0 +1,181 @@
+{
+  "pack_id": "finance-v1",
+  "industry": "FINANCE",
+  "display_name": "Financial Services & Accounting",
+  "version": "1.0.0",
+  "description": "Semantic layer for banks, insurers, investment firms, accounting teams, and corporate finance. Covers accounts receivable, cash flow, budgeting, GL reconciliation, and portfolio management.",
+  "entities": [
+    {
+      "name": "Account",
+      "aliases": ["account", "gl_account", "ledger_account", "client_account", "portfolio"],
+      "table_patterns": ["account", "accounts", "gl_account", "gl_accounts", "ledger", "ledgers", "chart_of_accounts", "coa", "client_account", "portfolio"],
+      "key_column_patterns": ["account_id", "account_number", "account_code", "gl_code", "ledger_code"],
+      "description": "Financial account in the general ledger or client portfolio",
+      "operational_meaning": "Foundation for P&L, balance sheet, and client-level financial analytics"
+    },
+    {
+      "name": "Transaction",
+      "aliases": ["transaction", "journal_entry", "posting", "ledger_entry"],
+      "table_patterns": ["transaction", "transactions", "journal", "journal_entry", "journal_entries", "posting", "postings", "ledger_entry", "gl_transaction", "financial_transaction"],
+      "key_column_patterns": ["transaction_id", "journal_id", "posting_id", "entry_id", "reference_number"],
+      "description": "A financial event recorded in the general ledger",
+      "operational_meaning": "Primary source for cash flow, reconciliation, and financial reporting"
+    },
+    {
+      "name": "Invoice",
+      "aliases": ["invoice", "bill", "receivable", "payable", "ar_invoice", "ap_invoice"],
+      "table_patterns": ["invoice", "invoices", "bill", "bills", "receivable", "receivables", "payable", "payables", "ar", "ap", "ar_invoice", "ap_invoice"],
+      "key_column_patterns": ["invoice_id", "invoice_number", "bill_id", "reference_id"],
+      "description": "A billing document for goods or services rendered",
+      "operational_meaning": "Central to AR aging, DSO, and collection analytics"
+    },
+    {
+      "name": "Payment",
+      "aliases": ["payment", "receipt", "remittance", "disbursement"],
+      "table_patterns": ["payment", "payments", "receipt", "receipts", "remittance", "disbursement", "disbursements", "cash_receipt", "bank_receipt"],
+      "key_column_patterns": ["payment_id", "receipt_id", "remittance_id", "payment_reference"],
+      "description": "A cash inflow or outflow recorded against an invoice or account",
+      "operational_meaning": "Used for cash flow, payment performance, and reconciliation"
+    },
+    {
+      "name": "Budget",
+      "aliases": ["budget", "forecast", "plan", "estimate", "target"],
+      "table_patterns": ["budget", "budgets", "forecast", "forecasts", "plan", "plans", "estimate", "estimates", "annual_plan", "financial_plan"],
+      "key_column_patterns": ["budget_id", "forecast_id", "plan_id", "budget_code", "budget_version"],
+      "description": "Planned or forecasted financial figures for a period",
+      "operational_meaning": "Used for variance analysis, budget vs actuals, and reforecasting"
+    },
+    {
+      "name": "Cost Centre",
+      "aliases": ["cost_centre", "department", "cost_center", "division", "business_unit"],
+      "table_patterns": ["cost_centre", "cost_center", "cost_centres", "cost_centers", "department", "departments", "division", "divisions", "business_unit", "profit_centre"],
+      "key_column_patterns": ["cost_centre_id", "cost_center_id", "department_id", "division_id", "cc_code"],
+      "description": "Organisational unit responsible for a portion of costs",
+      "operational_meaning": "Used for departmental P&L, cost allocation, and responsibility accounting"
+    },
+    {
+      "name": "Client",
+      "aliases": ["client", "customer", "counterparty", "entity"],
+      "table_patterns": ["client", "clients", "customer", "customers", "counterparty", "counterparties", "entity", "entities", "business_partner"],
+      "key_column_patterns": ["client_id", "customer_id", "counterparty_id", "entity_id", "account_holder_id"],
+      "description": "Organisation or individual with a financial relationship",
+      "operational_meaning": "Used for client-level profitability, exposure, and relationship metrics"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "AR aging",
+      "aliases": ["accounts receivable aging", "debtor aging", "aging schedule", "aged receivables"],
+      "definition": "Classification of outstanding invoices by how long they have been unpaid",
+      "sql_hint": "CURRENT_DATE - invoice_date or due_date bucketed into 0-30, 31-60, 61-90, 90+ days"
+    },
+    {
+      "term": "DSO",
+      "aliases": ["days sales outstanding", "debtor days", "collection period"],
+      "definition": "Average number of days taken to collect payment after a sale",
+      "sql_hint": "AVG(payment_date - invoice_date) or (accounts_receivable / annual_revenue) * 365"
+    },
+    {
+      "term": "overdue",
+      "aliases": ["past due", "delinquent", "outstanding", "unpaid", "late payment"],
+      "definition": "Invoice or payment that has passed its due date without being settled",
+      "sql_hint": "due_date < CURRENT_DATE AND status NOT IN ('PAID','CLEARED','SETTLED','CLOSED')"
+    },
+    {
+      "term": "budget variance",
+      "aliases": ["variance", "over budget", "under budget", "budget vs actual"],
+      "definition": "Difference between actual financial result and the budgeted amount",
+      "sql_hint": "actual_amount - budget_amount (positive = over budget for costs)"
+    },
+    {
+      "term": "burn rate",
+      "aliases": ["cash burn", "spending rate", "monthly burn"],
+      "definition": "Rate at which cash or budget is being consumed in a period",
+      "sql_hint": "SUM(expenses) / period_count for monthly or weekly rate"
+    },
+    {
+      "term": "accrual",
+      "aliases": ["accrued expense", "accrued income", "prepayment", "accruals"],
+      "definition": "Revenue earned or expense incurred but not yet received or paid",
+      "sql_hint": "entry_type IN ('ACCRUAL','ACCRUED') or posting_type = 'ACCRUAL'"
+    },
+    {
+      "term": "reconciliation",
+      "aliases": ["reconcile", "bank reconciliation", "GL reconciliation", "rec"],
+      "definition": "Process of matching transactions in two systems to identify discrepancies",
+      "sql_hint": "unmatched_transactions WHERE bank_statement_id IS NULL or gl_entry_id IS NULL"
+    },
+    {
+      "term": "working capital",
+      "aliases": ["net working capital", "NWC", "current assets minus liabilities"],
+      "definition": "Current assets minus current liabilities — measure of operational liquidity",
+      "sql_hint": "SUM(current_assets) - SUM(current_liabilities)"
+    }
+  ],
+  "suggested_questions": [
+    "What is the AR aging summary by client as of today?",
+    "Which invoices are overdue by more than 60 days?",
+    "Show me budget vs actuals by cost centre this quarter",
+    "What is the DSO trend by month for the past year?",
+    "Which clients have the highest outstanding balance right now?",
+    "Show me the cash flow forecast vs actual for this month",
+    "What is our current burn rate compared to budget?",
+    "Which accounts have unreconciled transactions this period?"
+  ],
+  "kpi_definitions": [
+    {
+      "name": "Days Sales Outstanding (DSO)",
+      "formula_description": "accounts_receivable / (annual_revenue / 365)",
+      "target_range": "30–45 days",
+      "alert_threshold": 60,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "Budget Utilisation",
+      "formula_description": "actual_spend / budget_amount * 100",
+      "target_range": "Within ±10% of budget",
+      "alert_threshold": 110,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Overdue Receivables",
+      "formula_description": "overdue_amount / total_receivables * 100",
+      "target_range": "< 10%",
+      "alert_threshold": 15,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "Cash Conversion Cycle",
+      "formula_description": "DSO + DIO - DPO (days inventory outstanding - days payable outstanding)",
+      "target_range": "Industry-specific",
+      "alert_threshold": null,
+      "alert_severity": "MEDIUM"
+    }
+  ],
+  "alert_templates": [
+    {
+      "name": "High Overdue Receivables",
+      "description": "Overdue invoices have exceeded the risk threshold",
+      "metric_hint": "SUM(outstanding_amount) FROM invoices WHERE due_date < CURRENT_DATE AND status != 'PAID'",
+      "threshold_type": "ABOVE",
+      "threshold_value": 100000,
+      "severity": "HIGH"
+    },
+    {
+      "name": "Budget Overspend",
+      "description": "A cost centre has exceeded its approved budget",
+      "metric_hint": "SUM(actual_amount) - SUM(budget_amount) FROM financials GROUP BY cost_centre WHERE period = CURRENT_MONTH",
+      "threshold_type": "ABOVE",
+      "threshold_value": 0,
+      "severity": "MEDIUM"
+    },
+    {
+      "name": "Unreconciled Transactions",
+      "description": "Number of unreconciled transactions has exceeded the threshold",
+      "metric_hint": "COUNT(*) FROM transactions WHERE reconciliation_status = 'UNMATCHED' AND transaction_date < CURRENT_DATE - 7",
+      "threshold_type": "ABOVE",
+      "threshold_value": 50,
+      "severity": "MEDIUM"
+    }
+  ]
+}
