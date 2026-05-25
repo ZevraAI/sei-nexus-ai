@@ -43,6 +43,8 @@ public class SecurityConfig {
                     .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                     // Public auth endpoints — no token required
                     .requestMatchers("/auth/signup", "/auth/login").permitAll()
+                    // Automation webhook triggers — public, protected by slug secrecy
+                    .requestMatchers(HttpMethod.POST, "/automations/run/**").permitAll()
                     // Health and metrics — no token required
                     .requestMatchers("/actuator/**").permitAll()
                     // Admin tenant management — authenticated + ADMIN role enforced in controller
