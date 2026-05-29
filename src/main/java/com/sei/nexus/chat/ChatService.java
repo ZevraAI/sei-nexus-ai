@@ -32,6 +32,10 @@ import com.sei.nexus.reasoning.ReasoningRepository;
 import com.sei.nexus.reasoning.ReasoningSession;
 import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
+import com.sei.nexus.agentrunner.AgentRunner;
+import com.sei.nexus.agentrunner.ZevraAgent;
+import com.sei.nexus.agentrunner.ZevraAgentRouter;
+import com.sei.nexus.agentrunner.ZevraSession;
 import com.sei.nexus.semantic.LearningContextBuilder;
 import com.sei.nexus.semantic.SemanticLearningService;
 import com.sei.nexus.semantic.SemanticService;
@@ -82,6 +86,9 @@ public class ChatService {
     // ── Semantic learning (Phase 3) ───────────────────────────────────────────
     private final SemanticLearningService  semanticLearningService;
     private final LearningContextBuilder   learningContextBuilder;
+    // ── Zevra Agentic AI routing ──────────────────────────────────────────────
+    private final ZevraAgentRouter         zevraAgentRouter;
+    private final AgentRunner              agentRunner;
 
     public ChatService(RunRepository runRepository,
                        DocumentMemoryService documentMemoryService,
@@ -107,7 +114,9 @@ public class ChatService {
                        ReasoningEngine reasoningEngine,
                        ReasoningEventBus reasoningEventBus,
                        SemanticLearningService semanticLearningService,
-                       LearningContextBuilder learningContextBuilder) {
+                       LearningContextBuilder learningContextBuilder,
+                       ZevraAgentRouter zevraAgentRouter,
+                       AgentRunner agentRunner) {
         this.runRepository            = runRepository;
         this.documentMemoryService    = documentMemoryService;
         this.enterpriseMapService     = enterpriseMapService;
@@ -133,6 +142,8 @@ public class ChatService {
         this.reasoningEventBus        = reasoningEventBus;
         this.semanticLearningService  = semanticLearningService;
         this.learningContextBuilder   = learningContextBuilder;
+        this.zevraAgentRouter         = zevraAgentRouter;
+        this.agentRunner              = agentRunner;
     }
 
     // =========================================================================
@@ -154,7 +165,44 @@ public class ChatService {
             raw = raw.substring(7).trim();
             forceAsync = true;
         }
-        // STEP 1b: Load attachment content if present.
+        // STEP 1b: Zevra Agent routing — semantic dispatch, no keywords.
+        // Check active agents before loading attachment or running the full pipeline.
+        // Falls through silently if no agent matches or routing fails.
+        String tenantSchemaForRouting = com.sei.nexus.tenant.TenantContext.getSchema();
+        java.util.Optional<ZevraAgent> routedZevraAgent =
+                zevraAgentRouter.route(raw, tenantSchemaForRouting);
+        if (routedZevraAgent.isPresent()) {
+            ZevraAgent za = routedZevraAgent.get();
+            String convId  = (request.conversationId() != null && !request.conversationId().isBlank())
+                    ? request.conversationId() : Keys.conversationKey();
+            String runKey  = (request.clientRunKey() != null && !request.clientRunKey().isBlank())
+                    ? request.clientRunKey() : Keys.runKey();
+
+            NexusRun run = new NexusRun(runKey, convId, za.slug(), null,
+                    userEmail, raw, null, null, "RUNNING", null, null, null);
+            runRepository.save(run);
+            try {
+                ZevraSession session = agentRunner.run(za, raw);
+                String answer = session.finalOutput() != null
+                        ? session.finalOutput()
+                        : "The agent completed but produced no response.";
+                runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", null);
+
+                OrchestratorDecision decision = new OrchestratorDecision(
+                        "ZEVRA_AGENT", "OPERATIONAL_INVESTIGATION", "LIVE_DATA",
+                        true, false, false);
+                return new ChatResponse(convId, runKey, answer, List.of(), decision,
+                        za.slug(), za.name(), null, 0.9, false, "",
+                        List.of(), List.of(), List.of(), List.of(), List.of());
+            } catch (Exception e) {
+                log.warn("ZevraAgent '{}' failed, falling through to normal chat: {}",
+                        za.name(), e.getMessage());
+                runRepository.update(runKey, null, "ZEVRA_AGENT", "FAILED", null);
+                // Fall through to normal chat pipeline below
+            }
+        }
+
+        // STEP 1d: Load attachment content if present.
         // IMPORTANT: the raw user question (raw) is kept separate from the enriched
         // version (enrichedQuestion) that includes file content.
         // - Routing, intent detection, agent selection all use `raw` — they must read

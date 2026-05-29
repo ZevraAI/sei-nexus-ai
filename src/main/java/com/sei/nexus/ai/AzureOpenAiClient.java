@@ -136,6 +136,73 @@ public class AzureOpenAiClient {
         return doChat(messages, systemPrompt, true);
     }
 
+    /**
+     * Sends a tool-calling request (OpenAI function calling).
+     * Returns either a tool call the LLM wants to make, or a final text answer.
+     *
+     * @param messages    conversation history (user + assistant + tool results)
+     * @param systemPrompt agent persona and goal
+     * @param tools       list of tool definitions in OpenAI format
+     */
+    public AgentToolResponse chatWithTools(List<AgentMessage> messages,
+                                            String systemPrompt,
+                                            List<Map<String, Object>> tools) {
+        String url = BASE_URL + "/chat/completions";
+
+        List<Map<String, Object>> messageList = new ArrayList<>();
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messageList.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        for (AgentMessage msg : messages) {
+            Map<String, Object> m = new HashMap<>();
+            m.put("role", msg.role());
+            if (msg.toolCalls() != null && !msg.toolCalls().isEmpty()) {
+                m.put("tool_calls", msg.toolCalls());
+            } else {
+                m.put("content", msg.content() != null ? msg.content() : "");
+            }
+            if (msg.toolCallId() != null) {
+                m.put("tool_call_id", msg.toolCallId());
+            }
+            messageList.add(m);
+        }
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", chatModel);
+        requestBody.put("messages", messageList);
+        requestBody.put("tools", tools);
+        requestBody.put("tool_choice", "auto");
+        requestBody.put("temperature", 0.2);
+        requestBody.put("max_tokens", 4096);
+
+        String responseBody = executeWithRetry(url, requestBody);
+
+        try {
+            JsonNode root    = objectMapper.readTree(responseBody);
+            JsonNode message = root.path("choices").get(0).path("message");
+            JsonNode toolCalls = message.path("tool_calls");
+
+            if (toolCalls.isArray() && toolCalls.size() > 0) {
+                JsonNode call     = toolCalls.get(0);
+                String toolCallId = call.path("id").asText();
+                String toolName   = call.path("function").path("name").asText();
+                String argsJson   = call.path("function").path("arguments").asText();
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> args = objectMapper.readValue(argsJson, Map.class);
+                return AgentToolResponse.ofToolCall(toolName, toolCallId, args);
+            }
+
+            // No tool call — treat content as final answer
+            String content = message.path("content").asText();
+            return AgentToolResponse.ofFinal(content);
+
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse tool-call response: " + e.getMessage());
+        }
+    }
+
     private String doChat(List<ChatMessage> messages, String systemPrompt, boolean jsonMode) {
         String url = BASE_URL + "/chat/completions";
 
