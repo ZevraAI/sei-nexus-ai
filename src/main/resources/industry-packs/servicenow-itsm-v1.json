@@ -1,0 +1,246 @@
+{
+  "pack_id": "servicenow-itsm-v1",
+  "category": "INTEGRATION",
+  "system": "ServiceNow",
+  "industry": "IT_SERVICE_MANAGEMENT",
+  "display_name": "ServiceNow ITSM",
+  "version": "1.0.0",
+  "icon": "SN",
+  "tagline": "Incident, change, and problem management intelligence",
+  "description": "Complete ITSM intelligence for ServiceNow. Pre-maps all incident states, change types, SLA logic, and priority codes so your team can ask operational questions from day one — no schema archaeology required.",
+  "what_you_can_ask": [
+    "Show me all P1 incidents open more than 4 hours",
+    "How many changes are scheduled this weekend?",
+    "What is our SLA breach rate this month?",
+    "Which assignment groups have the most open incidents?",
+    "Show me all changes that failed in the last 30 days",
+    "What recurring problems are still unresolved?",
+    "How many incidents were reopened this week?",
+    "Which CI has caused the most incidents this quarter?"
+  ],
+  "connection_hints": {
+    "jdbc_note": "Connect via ServiceNow JDBC driver (instance URL + credentials) or a data warehouse mirror (Snowflake, BigQuery, Redshift).",
+    "expected_tables": ["incident", "change_request", "problem", "sys_user", "sys_user_group", "task_sla", "cmdb_ci"],
+    "warehouse_prefix_examples": ["sn_", "servicenow_", "snow_"]
+  },
+  "entities": [
+    {
+      "name": "Incident",
+      "aliases": ["incident", "ticket", "issue", "it_incident", "support_ticket"],
+      "table_patterns": ["incident", "incidents", "it_incident", "support_ticket", "sn_incident", "servicenow_incident", "snow_incident"],
+      "key_column_patterns": ["number", "incident_id", "sys_id", "ticket_id", "inc_number"],
+      "description": "An unplanned interruption or reduction in quality of an IT service",
+      "operational_meaning": "Primary entity for MTTR, SLA compliance, resolution rate, and P1/P2 tracking"
+    },
+    {
+      "name": "Change Request",
+      "aliases": ["change", "change_request", "rfc", "cr"],
+      "table_patterns": ["change_request", "change_requests", "rfc", "sn_change_request", "servicenow_change", "snow_change"],
+      "key_column_patterns": ["number", "change_id", "sys_id", "cr_number", "rfc_number"],
+      "description": "A formal request to alter one or more configuration items in the IT environment",
+      "operational_meaning": "Used for change success rate, CAB throughput, emergency change frequency, and failed change impact"
+    },
+    {
+      "name": "Problem",
+      "aliases": ["problem", "root_cause", "known_error"],
+      "table_patterns": ["problem", "problems", "sn_problem", "servicenow_problem", "snow_problem"],
+      "key_column_patterns": ["number", "problem_id", "sys_id", "prb_number"],
+      "description": "The cause of one or more incidents, often unknown at initial identification",
+      "operational_meaning": "Used for recurring incident root cause analysis and known error tracking"
+    },
+    {
+      "name": "IT User",
+      "aliases": ["user", "employee", "assignee", "caller", "sys_user"],
+      "table_patterns": ["sys_user", "users", "employees", "it_users", "sn_user", "servicenow_user"],
+      "key_column_patterns": ["sys_id", "user_id", "user_name", "email", "employee_id"],
+      "description": "A person who interacts with the ITSM system as a caller, assignee, or approver",
+      "operational_meaning": "Used for workload distribution, resolver performance, and VIP incident prioritisation"
+    },
+    {
+      "name": "Assignment Group",
+      "aliases": ["group", "team", "resolver_group", "support_group"],
+      "table_patterns": ["sys_user_group", "user_groups", "assignment_groups", "support_groups", "sn_user_group"],
+      "key_column_patterns": ["sys_id", "group_id", "name"],
+      "description": "A team or group responsible for resolving incidents, changes, or problems",
+      "operational_meaning": "Used for team workload, escalation patterns, and group SLA performance"
+    },
+    {
+      "name": "SLA Record",
+      "aliases": ["sla", "sla_record", "task_sla", "service_level"],
+      "table_patterns": ["task_sla", "sla_records", "service_level_agreements", "sn_task_sla", "servicenow_sla"],
+      "key_column_patterns": ["sys_id", "task", "sla_id", "stage"],
+      "description": "A record tracking whether a service level agreement has been met for a specific task",
+      "operational_meaning": "Core entity for SLA compliance reporting, breach prediction, and pause/reset analysis"
+    },
+    {
+      "name": "Configuration Item",
+      "aliases": ["ci", "cmdb_ci", "asset", "configuration_item", "service"],
+      "table_patterns": ["cmdb_ci", "configuration_items", "assets", "cis", "sn_cmdb_ci", "servicenow_ci"],
+      "key_column_patterns": ["sys_id", "ci_id", "name", "asset_tag", "serial_number"],
+      "description": "Any component that needs to be managed in order to deliver an IT service",
+      "operational_meaning": "Used for change impact analysis, incident-to-CI mapping, and service topology"
+    }
+  ],
+  "vocabulary": [
+    {
+      "term": "open incidents",
+      "aliases": ["active incidents", "unresolved incidents", "outstanding incidents"],
+      "definition": "Incidents that are currently active and have not been resolved or closed",
+      "sql_hint": "WHERE state IN (1, 2, 3, 4, 5) AND active = true"
+    },
+    {
+      "term": "critical incidents",
+      "aliases": ["P1 incidents", "priority 1", "sev 1", "severity 1"],
+      "definition": "Incidents with the highest priority — service completely unavailable",
+      "sql_hint": "WHERE priority = 1"
+    },
+    {
+      "term": "high priority incidents",
+      "aliases": ["P1 P2 incidents", "priority 1 and 2", "high severity"],
+      "definition": "Incidents with P1 or P2 priority requiring urgent attention",
+      "sql_hint": "WHERE priority IN (1, 2)"
+    },
+    {
+      "term": "new incidents",
+      "aliases": ["unassigned incidents", "inbox incidents"],
+      "definition": "Incidents that have been logged but not yet picked up by a resolver",
+      "sql_hint": "WHERE state = 1"
+    },
+    {
+      "term": "in progress incidents",
+      "aliases": ["active working", "being worked"],
+      "definition": "Incidents currently being investigated and resolved by a team",
+      "sql_hint": "WHERE state = 2"
+    },
+    {
+      "term": "on hold incidents",
+      "aliases": ["pending incidents", "waiting incidents"],
+      "definition": "Incidents paused pending information from user or third party",
+      "sql_hint": "WHERE state = 3"
+    },
+    {
+      "term": "resolved incidents",
+      "aliases": ["fixed incidents", "completed incidents"],
+      "definition": "Incidents where the fix has been applied and is awaiting user confirmation",
+      "sql_hint": "WHERE state IN (6, 7)"
+    },
+    {
+      "term": "overdue incidents",
+      "aliases": ["breached incidents", "sla breached", "past due"],
+      "definition": "Incidents where the SLA resolution target has been exceeded",
+      "sql_hint": "WHERE sla_due < NOW() AND state NOT IN (6, 7)"
+    },
+    {
+      "term": "MTTR",
+      "aliases": ["mean time to resolution", "mean time to resolve", "average resolution time"],
+      "definition": "Average time from incident creation to resolution",
+      "sql_hint": "AVG(EXTRACT(EPOCH FROM (resolved_at - opened_at)) / 3600)"
+    },
+    {
+      "term": "open changes",
+      "aliases": ["active changes", "pending changes"],
+      "definition": "Change requests that have not yet been implemented or cancelled",
+      "sql_hint": "WHERE state NOT IN (3, 4) AND active = true"
+    },
+    {
+      "term": "scheduled changes",
+      "aliases": ["planned changes", "approved changes", "upcoming changes"],
+      "definition": "Change requests approved and scheduled for future implementation",
+      "sql_hint": "WHERE state = 1 AND start_date > NOW()"
+    },
+    {
+      "term": "emergency changes",
+      "aliases": ["ECAB changes", "urgent changes"],
+      "definition": "Change requests that bypass standard CAB approval due to urgency",
+      "sql_hint": "WHERE type = 'emergency' OR change_type = 'emergency'"
+    },
+    {
+      "term": "failed changes",
+      "aliases": ["unsuccessful changes", "backed out changes"],
+      "definition": "Change requests where implementation was attempted but unsuccessful",
+      "sql_hint": "WHERE state = 4"
+    },
+    {
+      "term": "open problems",
+      "aliases": ["active problems", "unresolved problems", "known errors"],
+      "definition": "Problem records that have not been permanently resolved",
+      "sql_hint": "WHERE state NOT IN (4, 5, 6) AND active = true"
+    },
+    {
+      "term": "SLA compliance",
+      "aliases": ["sla met", "within sla", "sla adherence"],
+      "definition": "Percentage of incidents resolved within their agreed service level target",
+      "sql_hint": "COUNT(CASE WHEN has_breached = false THEN 1 END) * 100.0 / COUNT(*)"
+    }
+  ],
+  "lifecycle_states": [
+    {
+      "entity": "Incident",
+      "states": [
+        {"code": "1", "name": "New",               "meaning": "Logged, not yet assigned",          "is_exception": false},
+        {"code": "2", "name": "In Progress",        "meaning": "Actively being worked",              "is_exception": false},
+        {"code": "3", "name": "On Hold",            "meaning": "Paused — awaiting info",             "is_exception": false},
+        {"code": "4", "name": "Awaiting User Info", "meaning": "Pending caller response",            "is_exception": false},
+        {"code": "5", "name": "Awaiting Evidence",  "meaning": "Pending test/confirmation",         "is_exception": false},
+        {"code": "6", "name": "Resolved",           "meaning": "Fix applied, awaiting confirmation","is_terminal": false},
+        {"code": "7", "name": "Closed",             "meaning": "Permanently closed",                "is_terminal": true}
+      ]
+    },
+    {
+      "entity": "Change Request",
+      "states": [
+        {"code": "-5", "name": "New",              "meaning": "Draft, not yet submitted"},
+        {"code": "-4", "name": "Assess",           "meaning": "Under initial assessment"},
+        {"code": "-3", "name": "Authorize",        "meaning": "Awaiting CAB approval"},
+        {"code": "-2", "name": "Scheduled",        "meaning": "Approved and scheduled"},
+        {"code": "-1", "name": "Implement",        "meaning": "Currently being implemented"},
+        {"code": "0",  "name": "Review",           "meaning": "Post-implementation review"},
+        {"code": "3",  "name": "Closed",           "meaning": "Completed and closed",     "is_terminal": true},
+        {"code": "4",  "name": "Cancelled",        "meaning": "Change cancelled",          "is_terminal": true}
+      ]
+    }
+  ],
+  "suggestedQuestions": [
+    "Show me all P1 incidents open more than 4 hours",
+    "What is our SLA compliance rate this month?",
+    "Which assignment groups have the highest incident backlog?",
+    "How many changes failed in the last 30 days?",
+    "Show me recurring problems affecting the same CI",
+    "What is the average MTTR for P2 incidents this quarter?",
+    "How many incidents were reopened this week?",
+    "Which CIs have caused the most incidents this year?",
+    "Show me all scheduled changes for this weekend",
+    "Which users have the most unresolved incidents assigned to them?"
+  ],
+  "agent_definition": {
+    "name": "IT Operations Agent",
+    "slug": "it-operations-agent",
+    "description": "ITSM intelligence agent for ServiceNow — monitors incidents, changes, problems, and SLA compliance.",
+    "persona": "You are an IT operations analyst with deep ServiceNow expertise. You understand ITSM processes, priority codes, and SLA frameworks. Your role is to surface operational risks, SLA threats, and resolution bottlenecks from live ITSM data.",
+    "goal": "Monitor ITSM health — track open incidents by priority and SLA status, upcoming and at-risk changes, recurring problems, and team workload. Surface anything that needs attention before it becomes a crisis.",
+    "max_iterations": 8
+  },
+  "kpiDefinitions": [
+    {
+      "name": "P1 Incident MTTR",
+      "description": "Mean time to resolve critical incidents",
+      "target": "< 4 hours",
+      "alert_threshold_hours": 4,
+      "alert_severity": "HIGH"
+    },
+    {
+      "name": "SLA Compliance Rate",
+      "description": "Percentage of incidents resolved within SLA",
+      "target": "> 95%",
+      "alert_threshold_pct": 90,
+      "alert_severity": "MEDIUM"
+    },
+    {
+      "name": "Change Success Rate",
+      "description": "Percentage of changes implemented without failure",
+      "target": "> 95%",
+      "alert_threshold_pct": 90,
+      "alert_severity": "MEDIUM"
+    }
+  ]
+}

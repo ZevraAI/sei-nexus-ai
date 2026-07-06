@@ -121,6 +121,7 @@ public class ScheduledReportService {
         for (int i = 0; i < questions.size(); i++) {
             String question = questions.get(i);
             try {
+                com.sei.nexus.usage.UsageContext.set("report", runAsEmail);
                 ChatRequest req = new ChatRequest(report.agentKey(), Keys.conversationKey(), question, null, null);
                 ChatResponse resp = chatService.ask(req, runAsEmail);
 

@@ -1,8 +1,13 @@
 package com.sei.nexus.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.auth.AuthRepository;
 import com.sei.nexus.auth.NexusAuthFilter;
+import com.sei.nexus.auth.SupabaseAuthFilter;
+import com.sei.nexus.auth.TenantDomainRepository;
+import com.sei.nexus.auth.UserProfileRepository;
 import com.sei.nexus.tenant.TenantRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -16,13 +21,34 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 public class SecurityConfig {
 
-    private final AuthRepository   authRepository;
-    private final TenantRepository tenantRepository;
+    private final AuthRepository         authRepository;
+    private final TenantRepository       tenantRepository;
+    private final UserProfileRepository  userProfileRepository;
+    private final TenantDomainRepository tenantDomainRepository;
+    private final ObjectMapper           objectMapper;
+
+    @Value("${supabase.jwt-secret}")
+    private String supabaseJwtSecret;
+
+    @Value("${supabase.url}")
+    private String supabaseUrl;
 
     public SecurityConfig(AuthRepository authRepository,
-                           TenantRepository tenantRepository) {
-        this.authRepository   = authRepository;
-        this.tenantRepository = tenantRepository;
+                           TenantRepository tenantRepository,
+                           UserProfileRepository userProfileRepository,
+                           TenantDomainRepository tenantDomainRepository,
+                           ObjectMapper objectMapper) {
+        this.authRepository         = authRepository;
+        this.tenantRepository       = tenantRepository;
+        this.userProfileRepository  = userProfileRepository;
+        this.tenantDomainRepository = tenantDomainRepository;
+        this.objectMapper           = objectMapper;
+    }
+
+    @Bean
+    public SupabaseAuthFilter supabaseAuthFilter() {
+        return new SupabaseAuthFilter(userProfileRepository, tenantDomainRepository,
+                supabaseJwtSecret, supabaseUrl, objectMapper);
     }
 
     @Bean
@@ -52,7 +78,9 @@ public class SecurityConfig {
                     // Everything else requires authentication
                     .anyRequest().authenticated()
             )
-            .addFilterBefore(nexusAuthFilter(), UsernamePasswordAuthenticationFilter.class);
+            // Supabase JWT filter runs first; NexusAuthFilter handles legacy X-Nexus-Token
+            .addFilterBefore(supabaseAuthFilter(), UsernamePasswordAuthenticationFilter.class)
+            .addFilterAfter(nexusAuthFilter(), SupabaseAuthFilter.class);
 
         return http.build();
     }

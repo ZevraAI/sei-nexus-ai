@@ -59,9 +59,13 @@ public class NexusAuthFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         try {
-            String rawToken = request.getHeader(TOKEN_HEADER);
-            if (rawToken != null && !rawToken.isBlank()) {
-                resolveAuthentication(rawToken.trim());
+            // Skip if SupabaseAuthFilter already authenticated this request
+            if (SecurityContextHolder.getContext().getAuthentication() == null
+                    || !SecurityContextHolder.getContext().getAuthentication().isAuthenticated()) {
+                String rawToken = request.getHeader(TOKEN_HEADER);
+                if (rawToken != null && !rawToken.isBlank()) {
+                    resolveAuthentication(rawToken.trim());
+                }
             }
             filterChain.doFilter(request, response);
         } finally {

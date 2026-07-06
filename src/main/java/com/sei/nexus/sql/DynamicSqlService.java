@@ -202,11 +202,13 @@ public class DynamicSqlService {
                      ORDER BY t.table_name
                     """;
         } else {
+            // Include udt_name (e.g. varchar, int4, numeric) so the LLM knows
+            // each column's type and generates correct SQL without type mismatches.
             sql = """
                     SELECT t.table_name,
-                           COUNT(c.column_name)                                      AS column_count,
-                           STRING_AGG(c.column_name, ', '
-                               ORDER BY c.ordinal_position)                          AS column_names
+                           COUNT(c.column_name)                                            AS column_count,
+                           STRING_AGG(c.column_name || ' (' || c.udt_name || ')', ', '
+                               ORDER BY c.ordinal_position)                                AS column_names
                       FROM information_schema.tables  t
                       JOIN information_schema.columns c ON c.table_name  = t.table_name
                                                        AND c.table_schema = t.table_schema

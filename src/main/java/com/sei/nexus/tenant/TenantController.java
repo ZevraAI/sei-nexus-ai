@@ -1,5 +1,7 @@
 package com.sei.nexus.tenant;
 
+import com.sei.nexus.auth.TenantDomain;
+import com.sei.nexus.auth.TenantDomainRepository;
 import com.sei.nexus.auth.UserAccount;
 import com.sei.nexus.common.NexusException;
 import org.springframework.http.HttpStatus;
@@ -28,11 +30,14 @@ public class TenantController {
 
     private final TenantRepository          tenantRepository;
     private final TenantProvisioningService provisioningService;
+    private final TenantDomainRepository    tenantDomainRepository;
 
     public TenantController(TenantRepository tenantRepository,
-                             TenantProvisioningService provisioningService) {
-        this.tenantRepository    = tenantRepository;
-        this.provisioningService = provisioningService;
+                             TenantProvisioningService provisioningService,
+                             TenantDomainRepository tenantDomainRepository) {
+        this.tenantRepository       = tenantRepository;
+        this.provisioningService    = provisioningService;
+        this.tenantDomainRepository = tenantDomainRepository;
     }
 
     /**
@@ -153,6 +158,89 @@ public class TenantController {
     public ResponseEntity<Void> suspendTenant(@PathVariable String slug) {
         requireAdmin();
         provisioningService.suspend(slug);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * POST /admin/tenants/{slug}/reinvite
+     * Resends the Supabase invite email to a user in this tenant.
+     * Useful when the original invite email was lost or never delivered.
+     *
+     * <p>Body: { "email": "admin@acme.com" }
+     */
+    @PostMapping("/{slug}/reinvite")
+    public ResponseEntity<?> reinviteTenantUser(@PathVariable String slug,
+                                                 @RequestBody Map<String, Object> body) {
+        requireAdmin();
+        Tenant tenant = tenantRepository.findBySlug(slug)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Tenant not found: " + slug));
+        String email = requireString(body, "email");
+        java.util.Optional<String> recoveryLink = provisioningService.reinvite(tenant, email);
+
+        if (recoveryLink.isPresent()) {
+            // User already existed in Supabase Auth — return a one-time recovery link
+            // for the platform admin to share directly with the user.
+            return ResponseEntity.ok(Map.of(
+                    "mode",    "recovery_link",
+                    "message", "User already registered. Share the recovery link below directly with " + email + ".",
+                    "link",    recoveryLink.get()));
+        }
+        return ResponseEntity.ok(Map.of(
+                "mode",    "invite_sent",
+                "message", "Invite email sent to " + email));
+    }
+
+    // ── Domain management ─────────────────────────────────────────────────────
+
+    /** GET /admin/tenants/{slug}/domains — list SSO domains for a tenant. */
+    @GetMapping("/{slug}/domains")
+    public ResponseEntity<?> listDomains(@PathVariable String slug) {
+        requireAdmin();
+        Tenant tenant = tenantRepository.findBySlug(slug)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Tenant not found: " + slug));
+        return ResponseEntity.ok(tenantDomainRepository.findByTenantSchema(tenant.schemaName()));
+    }
+
+    /** POST /admin/tenants/{slug}/domains — register an SSO domain. Body: { "domain": "acme.com", "default_role": "ANALYST" } */
+    @PostMapping("/{slug}/domains")
+    public ResponseEntity<?> addDomain(@PathVariable String slug,
+                                        @RequestBody Map<String, Object> body) {
+        requireAdmin();
+        Tenant tenant = tenantRepository.findBySlug(slug)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Tenant not found: " + slug));
+
+        String domain      = requireString(body, "domain").toLowerCase().replaceAll("^@", "");
+        String defaultRole = body.containsKey("default_role")
+                ? body.get("default_role").toString() : "ANALYST";
+
+        if (!List.of("ADMIN", "ANALYST", "DOMAIN_OWNER").contains(defaultRole)) {
+            throw new NexusException(HttpStatus.BAD_REQUEST, "Invalid default_role: " + defaultRole);
+        }
+
+        String callerEmail = null;
+        Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (principal instanceof UserAccount ua) callerEmail = ua.email();
+
+        tenantDomainRepository.create(new TenantDomain(
+                domain, tenant.schemaName(), defaultRole, callerEmail, null));
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(Map.of("domain", domain, "tenant_schema", tenant.schemaName(),
+                             "default_role", defaultRole));
+    }
+
+    /** DELETE /admin/tenants/{slug}/domains/{domain} — remove an SSO domain. */
+    @DeleteMapping("/{slug}/domains/{domain}")
+    public ResponseEntity<Void> removeDomain(@PathVariable String slug,
+                                              @PathVariable String domain) {
+        requireAdmin();
+        Tenant tenant = tenantRepository.findBySlug(slug)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Tenant not found: " + slug));
+        tenantDomainRepository.delete(domain, tenant.schemaName());
         return ResponseEntity.noContent().build();
     }
 

@@ -24,5 +24,17 @@ public record IndustryPack(
         List<PackVocabularyTerm> vocabulary,
         List<String>             suggestedQuestions,
         List<PackKpiDefinition>  kpiDefinitions,
-        List<PackAlertTemplate>  alertTemplates
-) {}
+        List<PackAlertTemplate>  alertTemplates,
+        // Integration template fields (null for standard industry packs)
+        String                   category,         // "INTEGRATION" flags this as a system template
+        String                   system,           // e.g. "ServiceNow"
+        String                   icon,             // short display abbreviation e.g. "SN"
+        String                   tagline,          // one-line pitch
+        List<String>             whatYouCanAsk,    // example questions shown in the UI
+        PackAgentDefinition      agentDefinition   // pre-built agent created on apply
+) {
+    /** True when this pack is a system integration template rather than a generic industry pack. */
+    public boolean isIntegration() {
+        return "INTEGRATION".equals(category);
+    }
+}

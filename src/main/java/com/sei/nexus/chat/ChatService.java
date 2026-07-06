@@ -90,6 +90,12 @@ public class ChatService {
     private final ZevraAgentRouter         zevraAgentRouter;
     private final AgentRunner              agentRunner;
 
+    // Max characters for entity schema context per LLM call.
+    // Configurable via nexus.context.max-entity-chars — keeps prompts lean
+    // without hardcoding tenant-specific table counts.
+    @org.springframework.beans.factory.annotation.Value("${nexus.context.max-entity-chars:1500}")
+    private int maxEntityContextChars;
+
     public ChatService(RunRepository runRepository,
                        DocumentMemoryService documentMemoryService,
                        EnterpriseMapService enterpriseMapService,
@@ -153,6 +159,7 @@ public class ChatService {
     public ChatResponse ask(ChatRequest request, String userEmail) {
         String raw = request.question() != null ? request.question().trim() : "";
         boolean forceAsync = false;
+        com.sei.nexus.usage.UsageContext.set("chat", userEmail);
 
         // STEP 1: Slash command routing
         if (raw.startsWith("/knowledge ")) {
@@ -341,7 +348,7 @@ public class ChatService {
                         List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
                         if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
                     }
-                    String schemaCtx = buildContextSummary(memChunks, entCtx, semCtx, findings,
+                    String schemaCtx = buildContextSummary(raw, memChunks, entCtx, semCtx, findings,
                             anomalyCtx, false, history, agent);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
@@ -441,7 +448,7 @@ public class ChatService {
             }
             String prompt = "Question: " + question + "\n\n" + ctx +
                     "\nRespond with JSON only: {\"agent_key\": \"...\", \"confidence\": 0.9}";
-            String resp = aiClient.chat(List.of(ChatMessage.user(prompt)),
+            String resp = aiClient.chatWithJsonFast(List.of(ChatMessage.user(prompt)),
                     "You are an agent router. Select the most appropriate agent for the question. Return JSON only.");
             Map<?, ?> parsed = objectMapper.readValue(extractJson(resp), Map.class);
             String chosen = (String) parsed.get("agent_key");
@@ -469,7 +476,7 @@ public class ChatService {
             Map<String, Object> entCtx, String semCtx, List<OperationalFinding> findings,
             String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent) {
         try {
-            String ctx = buildContextSummary(memChunks, entCtx, semCtx, findings, anomalyCtx, hasPrior, history, agent);
+            String ctx = buildContextSummary(question, memChunks, entCtx, semCtx, findings, anomalyCtx, hasPrior, history, agent);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
             String sys = """
                     You are the SEI Nexus orchestration engine. Decide the best answer mode.
@@ -518,7 +525,7 @@ public class ChatService {
             String semCtx, List<DocumentChunk> memChunks, List<OperationalFinding> findings,
             String anomalyCtx, String playbookCtx, List<NexusRun> history, NexusAgent agent) {
         try {
-            String ctx = buildContextSummary(memChunks, entCtx, semCtx, findings, anomalyCtx, false, history, agent);
+            String ctx = buildContextSummary(question, memChunks, entCtx, semCtx, findings, anomalyCtx, false, history, agent);
             log.info("Investigation plan context:\n{}", ctx);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx +
                     (playbookCtx.isBlank() ? "" : "\n\nPlaybook:\n" + playbookCtx);
@@ -750,8 +757,8 @@ public class ChatService {
     // Context building
     // =========================================================================
 
-    private String buildContextSummary(List<DocumentChunk> memChunks, Map<String, Object> entCtx,
-            String semCtx, List<OperationalFinding> findings,
+    private String buildContextSummary(String question, List<DocumentChunk> memChunks,
+            Map<String, Object> entCtx, String semCtx, List<OperationalFinding> findings,
             String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent) {
         StringBuilder sb = new StringBuilder();
 
@@ -760,20 +767,29 @@ public class ChatService {
               .append(" | Domain: ").append(agent.domainKeys()).append("\n\n");
         }
 
-        // ── Knowledge graph context (entities + JOIN paths) ───────────────────
+        // ── Knowledge graph context — filtered to entities relevant to the question ──
+        // Sending the full graph (50+ entities) on every call wastes thousands of tokens.
+        // We extract keywords from the question and only include matching entities.
         List<String> domainKeys = toDomainKeyList(agent);
         if (!domainKeys.isEmpty()) {
             String graphCtx = knowledgeGraphService.buildGraphContext(domainKeys);
             if (!graphCtx.isBlank()) {
-                sb.append(graphCtx).append("\n");
+                String filteredGraph = filterGraphContext(graphCtx, question);
+                if (!filteredGraph.isBlank()) sb.append(filteredGraph).append("\n");
             }
         }
 
-        // ── Enterprise map entity context (columns, scan data) ────────────────
+        // ── Enterprise map entity context — truncated to configurable limit ───────
+        // Full table schema can be 2000-3000 tokens. We truncate to maxEntityContextChars
+        // (default 1500 chars ≈ 375 tokens) to cap the cost on every reasoning call.
+        // This is a per-deployment setting, not a hardcoded value.
         boolean hasMemory = memChunks != null && !memChunks.isEmpty();
         String ec = entCtx.containsKey("entityContext") ? (String) entCtx.get("entityContext") : null;
         if (ec != null && !ec.isBlank()) {
-            sb.append("=== TABLE SCHEMA ===\n").append(ec).append("\n");
+            String truncated = ec.length() > maxEntityContextChars
+                    ? ec.substring(0, maxEntityContextChars) + "\n[schema truncated — use describe_schema for more detail]"
+                    : ec;
+            sb.append("=== TABLE SCHEMA ===\n").append(truncated).append("\n");
         } else {
             sb.append("=== TABLE SCHEMA ===\n");
             sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
@@ -945,6 +961,44 @@ public class ChatService {
     private List<String> toDomainKeyList(NexusAgent agent) {
         if (agent == null || agent.domainKeys() == null || agent.domainKeys().isBlank()) return List.of();
         return List.of(agent.domainKeys().split(",\\s*"));
+    }
+
+    /**
+     * Filters the full knowledge graph context string to lines/sections that contain
+     * at least one keyword from the user's question. Avoids sending 50+ entities
+     * when only 2-3 are relevant to the question.
+     *
+     * Falls back to the full context if filtering produces nothing (safety net).
+     */
+    private String filterGraphContext(String fullGraph, String question) {
+        if (question == null || question.isBlank()) return fullGraph;
+
+        // Extract meaningful keywords (3+ chars, skip stop words)
+        java.util.Set<String> stops = java.util.Set.of(
+                "show", "me", "all", "get", "find", "list", "the", "a", "an",
+                "what", "which", "how", "many", "give", "tell", "and", "or", "for");
+        java.util.Set<String> keywords = java.util.Arrays.stream(
+                        question.toLowerCase().split("[\\s,?!.;:]+"))
+                .filter(w -> w.length() >= 3 && !stops.contains(w))
+                .collect(java.util.stream.Collectors.toSet());
+
+        if (keywords.isEmpty()) return fullGraph;
+
+        // Keep lines that mention at least one keyword, plus header/footer lines
+        StringBuilder filtered = new StringBuilder();
+        for (String line : fullGraph.split("\n")) {
+            String lower = line.toLowerCase();
+            boolean isStructural = lower.startsWith("===") || lower.startsWith("---")
+                    || lower.startsWith("[group") || lower.isBlank();
+            boolean hasKeyword = keywords.stream().anyMatch(lower::contains);
+            if (isStructural || hasKeyword) {
+                filtered.append(line).append("\n");
+            }
+        }
+
+        String result = filtered.toString().trim();
+        // Safety: if filtering removed everything meaningful, return the full context
+        return result.isBlank() || result.length() < 50 ? fullGraph : result;
     }
 
     private List<String> toConnKeyList(NexusAgent agent) {

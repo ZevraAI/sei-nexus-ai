@@ -3,6 +3,7 @@ package com.sei.nexus.ai;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.usage.UsageService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -20,11 +21,13 @@ import java.util.Map;
 @Service
 public class AzureOpenAiClient {
 
-    private static final int MAX_RETRIES = 3;
-    private static final long INITIAL_BACKOFF_MS = 1000L;
+    private static final int MAX_RETRIES = 4;
+    private static final long INITIAL_BACKOFF_MS    = 1_000L;   // for general errors
+    private static final long RATE_LIMIT_BACKOFF_MS = 20_000L;  // 20s first wait on 429
 
-    private final HttpClient httpClient;
+    private final HttpClient   httpClient;
     private final ObjectMapper objectMapper;
+    private final UsageService usageService;
 
     private static final String BASE_URL = "https://api.openai.com/v1";
 
@@ -34,11 +37,15 @@ public class AzureOpenAiClient {
     @Value("${nexus.openai.chat-model:gpt-4o}")
     private String chatModel;
 
+    @Value("${nexus.openai.routing-model:gpt-4o-mini}")
+    private String routingModel;
+
     @Value("${nexus.openai.embedding-model:text-embedding-ada-002}")
     private String embeddingModel;
 
-    public AzureOpenAiClient(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
+    public AzureOpenAiClient(ObjectMapper objectMapper, UsageService usageService) {
+        this.objectMapper  = objectMapper;
+        this.usageService  = usageService;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
@@ -75,7 +82,7 @@ public class AzureOpenAiClient {
      * Sends a chat completion request and returns the assistant's text response.
      */
     public String chat(List<ChatMessage> messages, String systemPrompt) {
-        return doChat(messages, systemPrompt, false);
+        return doChat(messages, systemPrompt, false, chatModel);
     }
 
     /**
@@ -133,7 +140,16 @@ public class AzureOpenAiClient {
      * Returns the assistant's content as a raw JSON string.
      */
     public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
-        return doChat(messages, systemPrompt, true);
+        return doChat(messages, systemPrompt, true, chatModel);
+    }
+
+    /**
+     * Lightweight JSON call using the routing model (gpt-4o-mini by default).
+     * Use for routing/classification tasks — same accuracy for simple decisions,
+     * ~16x cheaper than gpt-4o.
+     */
+    public String chatWithJsonFast(List<ChatMessage> messages, String systemPrompt) {
+        return doChat(messages, systemPrompt, true, routingModel);
     }
 
     /**
@@ -179,6 +195,7 @@ public class AzureOpenAiClient {
 
         try {
             JsonNode root    = objectMapper.readTree(responseBody);
+            recordUsage(root, chatModel);
             JsonNode message = root.path("choices").get(0).path("message");
             JsonNode toolCalls = message.path("tool_calls");
 
@@ -203,7 +220,8 @@ public class AzureOpenAiClient {
         }
     }
 
-    private String doChat(List<ChatMessage> messages, String systemPrompt, boolean jsonMode) {
+    private String doChat(List<ChatMessage> messages, String systemPrompt,
+                          boolean jsonMode, String model) {
         String url = BASE_URL + "/chat/completions";
 
         List<Map<String, String>> messageList = new ArrayList<>();
@@ -221,7 +239,7 @@ public class AzureOpenAiClient {
         }
 
         Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("model", chatModel);
+        requestBody.put("model", model);
         requestBody.put("messages", messageList);
         requestBody.put("temperature", 0.2);
         requestBody.put("max_tokens", 4096);
@@ -236,10 +254,27 @@ public class AzureOpenAiClient {
 
         try {
             JsonNode root = objectMapper.readTree(responseBody);
+            recordUsage(root, model);
             return root.path("choices").get(0).path("message").path("content").asText();
+        } catch (NexusException e) {
+            throw e;
         } catch (Exception e) {
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Failed to parse chat response: " + e.getMessage());
+        }
+    }
+
+    /** Extracts token counts from an OpenAI response and records them for billing. */
+    private void recordUsage(JsonNode root, String model) {
+        try {
+            JsonNode usage = root.path("usage");
+            if (!usage.isMissingNode()) {
+                int prompt     = usage.path("prompt_tokens").asInt(0);
+                int completion = usage.path("completion_tokens").asInt(0);
+                usageService.record(model, prompt, completion);
+            }
+        } catch (Exception ignored) {
+            // Usage tracking is non-fatal — never break the main flow
         }
     }
 
@@ -275,10 +310,10 @@ public class AzureOpenAiClient {
                 }
 
                 if (statusCode == 429) {
-                    // Rate limit — retry with exponential backoff
+                    // Rate limit — use a longer backoff than general errors (20s → 40s → 80s)
                     if (attempt < MAX_RETRIES - 1) {
-                        Thread.sleep(backoffMs);
-                        backoffMs *= 2;
+                        long rateLimitWait = RATE_LIMIT_BACKOFF_MS * (1L << attempt);
+                        Thread.sleep(rateLimitWait);
                         continue;
                     }
                     throw new NexusException(HttpStatus.TOO_MANY_REQUESTS,

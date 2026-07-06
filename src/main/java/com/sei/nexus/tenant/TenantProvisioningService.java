@@ -1,5 +1,6 @@
 package com.sei.nexus.tenant;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
 import org.flywaydb.core.Flyway;
 import org.slf4j.Logger;
@@ -10,10 +11,15 @@ import org.springframework.security.crypto.bcrypt.BCrypt;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -46,6 +52,8 @@ public class TenantProvisioningService {
 
     private final TenantRepository tenantRepository;
     private final DataSource       rawDataSource;   // unwrapped — bypasses tenant routing
+    private final ObjectMapper     mapper;
+    private final HttpClient       httpClient;
 
     @Value("${nexus.security.jwt-secret}")
     private String jwtSecret;
@@ -53,10 +61,22 @@ public class TenantProvisioningService {
     @Value("${nexus.security.session-expiry-hours:24}")
     private int sessionExpiryHours;
 
+    @Value("${supabase.url}")
+    private String supabaseUrl;
+
+    @Value("${supabase.service-role-key}")
+    private String supabaseServiceRoleKey;
+
+    @Value("${nexus.app-url:}")
+    private String appUrl;
+
     public TenantProvisioningService(TenantRepository tenantRepository,
-                                      DataSource rawDataSource) {
+                                      DataSource rawDataSource,
+                                      ObjectMapper mapper) {
         this.tenantRepository = tenantRepository;
         this.rawDataSource    = rawDataSource;
+        this.mapper           = mapper;
+        this.httpClient       = HttpClient.newHttpClient();
     }
 
     // ── Provisioning ──────────────────────────────────────────────────────────
@@ -83,9 +103,14 @@ public class TenantProvisioningService {
         validateEmail(adminEmail);
         validatePassword(adminPassword);
 
-        if (tenantRepository.findBySlug(slug).isPresent()) {
-            throw new NexusException(HttpStatus.CONFLICT, "Tenant slug already exists: " + slug);
-        }
+        tenantRepository.findBySlug(slug).ifPresent(existing -> {
+            if (!"DEPROVISIONED".equals(existing.status())) {
+                throw new NexusException(HttpStatus.CONFLICT,
+                        "Tenant slug already exists: " + slug);
+            }
+            // DEPROVISIONED slug — allow re-provisioning (schema was dropped on failure/teardown)
+            log.info("Re-provisioning previously deprovisioned tenant '{}'", slug);
+        });
 
         String schemaName = SCHEMA_PREFIX + slug.replace('-', '_').toLowerCase();
         if (!SAFE_SCHEMA.matcher(schemaName).matches()) {
@@ -137,7 +162,74 @@ public class TenantProvisioningService {
         }
 
         log.info("Tenant '{}' provisioned successfully (schema: {})", slug, schemaName);
+
+        // 6. Send Supabase invite so the admin can set their password and log in.
+        //    Non-fatal: if this fails the tenant is still provisioned; platform admin
+        //    can re-invite manually via the Team page.
+        try {
+            sendSupabaseInvite(adminEmail, schemaName);
+            log.info("Supabase invite sent to tenant admin '{}'", adminEmail);
+        } catch (Exception ex) {
+            log.warn("Tenant '{}' provisioned but Supabase invite failed for '{}': {}",
+                    slug, adminEmail, ex.getMessage());
+        }
+
         return tenantRepository.findBySlug(slug).orElse(tenant);
+    }
+
+    // ── Reinvite ──────────────────────────────────────────────────────────────
+
+    /**
+     * Resends the Supabase invite email for an existing tenant user.
+     * Also ensures the user has an INVITED/ACTIVE row in nexus_user_profile.
+     *
+     * <p>Returns an {@code Optional<String>} containing a one-time recovery link
+     * if the user already exists in Supabase Auth (invite email cannot be resent).
+     * The link should be shared directly with the user by the platform admin.
+     * Returns {@code Optional.empty()} when a fresh invite email was sent.
+     *
+     * @param tenant the target tenant
+     * @param email  the user's email address
+     */
+    public java.util.Optional<String> reinvite(Tenant tenant, String email) {
+        validateEmail(email);
+
+        // Ensure the profile row exists before sending the invite
+        // (it may be missing if the original provisioning partially failed)
+        try (Connection conn = rawDataSource.getConnection();
+             Statement  stmt = conn.createStatement()) {
+            stmt.execute(String.format("""
+                    INSERT INTO public.nexus_user_profile
+                        (email, tenant_schema, role, status, display_name, created_at, updated_at)
+                    VALUES ('%s', '%s', 'ADMIN', 'INVITED', 'Tenant Administrator', NOW(), NOW())
+                    ON CONFLICT (email) DO UPDATE
+                        SET status     = CASE WHEN EXCLUDED.status = 'INACTIVE'
+                                             THEN 'INVITED' ELSE nexus_user_profile.status END,
+                            updated_at = NOW()
+                    """, escSql(email.toLowerCase()), escSql(tenant.schemaName())));
+        } catch (SQLException ex) {
+            log.warn("Could not upsert nexus_user_profile for reinvite of '{}': {}", email, ex.getMessage());
+        }
+
+        try {
+            sendSupabaseInvite(email, tenant.schemaName());
+            log.info("Supabase reinvite sent to '{}' for tenant '{}'", email, tenant.slug());
+            return java.util.Optional.empty(); // invite email sent — no link needed
+        } catch (EmailExistsException ex) {
+            // User already registered in Supabase Auth — send a recovery link instead.
+            // generateRecoveryLink uses the admin API which bypasses email rate limits.
+            log.info("User '{}' already exists in Supabase Auth — generating recovery link", email);
+            try {
+                String link = generateRecoveryLink(email);
+                return java.util.Optional.of(link);
+            } catch (Exception linkEx) {
+                throw new NexusException(HttpStatus.BAD_GATEWAY,
+                        "User exists but recovery link generation failed: " + linkEx.getMessage());
+            }
+        } catch (Exception ex) {
+            throw new NexusException(HttpStatus.BAD_GATEWAY,
+                    "Failed to send invite email: " + ex.getMessage());
+        }
     }
 
     // ── Deprovisioning ────────────────────────────────────────────────────────
@@ -217,7 +309,8 @@ public class TenantProvisioningService {
                 .baselineOnMigrate(true)
                 .baselineVersion("0")
                 .outOfOrder(false)
-                .validateOnMigrate(false);   // skip checksum re-validation on phase-2
+                .validateOnMigrate(false)
+                .placeholderReplacement(false);  // V026 contains ${{ }} expressions that are not Flyway placeholders
     }
 
     /**
@@ -240,7 +333,7 @@ public class TenantProvisioningService {
                     ON CONFLICT (domain_key) DO NOTHING
                     """, escSql(tenantName + " Platform"), escSql(tenantName)));
 
-            // Admin user
+            // Admin user in tenant schema
             stmt.execute(String.format("""
                     INSERT INTO nexus_user_account
                         (email, display_name, password_hash, role, status, created_at, updated_at)
@@ -248,8 +341,103 @@ public class TenantProvisioningService {
                     ON CONFLICT (email) DO NOTHING
                     """, escSql(adminEmail), escSql(passwordHash)));
 
+            // Admin user in public nexus_user_profile so SupabaseAuthFilter can resolve
+            // their tenant and role from a JWT without knowing the tenant upfront.
+            // Status is INVITED until they accept the Supabase invite email.
+            stmt.execute(String.format("""
+                    INSERT INTO public.nexus_user_profile
+                        (email, tenant_schema, role, status, display_name, created_at, updated_at)
+                    VALUES ('%s', '%s', 'ADMIN', 'INVITED', 'Tenant Administrator', NOW(), NOW())
+                    ON CONFLICT (email) DO UPDATE
+                        SET tenant_schema = EXCLUDED.tenant_schema,
+                            role          = EXCLUDED.role,
+                            status        = EXCLUDED.status,
+                            updated_at    = NOW()
+                    """, escSql(adminEmail.toLowerCase()), escSql(schemaName)));
+
             stmt.execute("RESET search_path");
         }
+    }
+
+    /** Thrown when Supabase responds with email_exists (HTTP 422). */
+    private static class EmailExistsException extends Exception {
+        EmailExistsException() { super("email_exists"); }
+    }
+
+    private void sendSupabaseInvite(String email, String tenantSchema)
+            throws Exception {
+        String body = mapper.writeValueAsString(Map.of(
+                "email", email,
+                "data",  Map.of("tenant_schema", tenantSchema, "role", "ADMIN")));
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(supabaseUrl.replaceAll("/+$", "") + "/auth/v1/invite"))
+                .header("apikey",        supabaseServiceRoleKey)
+                .header("Authorization", "Bearer " + supabaseServiceRoleKey)
+                .header("Content-Type",  "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+
+        HttpResponse<String> response =
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() == 422 && response.body().contains("email_exists")) {
+            throw new EmailExistsException();
+        }
+        if (response.statusCode() >= 300) {
+            throw new RuntimeException("Supabase returned HTTP " +
+                    response.statusCode() + ": " + response.body());
+        }
+    }
+
+    /**
+     * Uses the Supabase admin API to generate a one-time password-recovery link
+     * for an already-registered user. Bypasses email rate limits entirely —
+     * the platform admin copies the link and shares it directly with the user.
+     *
+     * @return the {@code action_link} URL from Supabase
+     */
+    @SuppressWarnings("unchecked")
+    private String generateRecoveryLink(String email) throws Exception {
+        var bodyMap = new java.util.LinkedHashMap<String, Object>();
+        bodyMap.put("type",  "recovery");
+        bodyMap.put("email", email);
+        // redirect_to tells Supabase where to send the user after they click the link.
+        // Use the configured app URL; fall back to the Supabase project's own Site URL
+        // (which is already set in the Supabase dashboard) if not configured here.
+        if (appUrl != null && !appUrl.isBlank()) {
+            bodyMap.put("redirect_to", appUrl.replaceAll("/+$", ""));
+        }
+        String body = mapper.writeValueAsString(bodyMap);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(supabaseUrl.replaceAll("/+$", "") + "/auth/v1/admin/generate_link"))
+                .header("apikey",        supabaseServiceRoleKey)
+                .header("Authorization", "Bearer " + supabaseServiceRoleKey)
+                .header("Content-Type",  "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+
+        HttpResponse<String> response =
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() >= 300) {
+            throw new RuntimeException("Supabase returned HTTP " +
+                    response.statusCode() + ": " + response.body());
+        }
+
+        Map<String, Object> json = mapper.readValue(response.body(), Map.class);
+        // Supabase wraps the link inside properties.action_link
+        Object props = json.get("properties");
+        if (props instanceof Map<?, ?> propsMap) {
+            Object link = propsMap.get("action_link");
+            if (link instanceof String s && !s.isBlank()) return s;
+        }
+        // Fallback: some versions return action_link at the top level
+        Object topLink = json.get("action_link");
+        if (topLink instanceof String s && !s.isBlank()) return s;
+
+        throw new RuntimeException("Supabase response did not contain an action_link");
     }
 
     private Tenant requireTenant(String slug) {
