@@ -19,7 +19,7 @@ public class ReportHtmlComposer {
     private static final DateTimeFormatter DATE_FMT =
             DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy 'at' h:mm a z");
 
-    @Value("${nexus.alerts.app-url:http://localhost:5176}")
+    @Value("${nexus.alerts.app-url:https://zevra-ui.vercel.app}")
     private String appUrl;
 
     // ── Public API ────────────────────────────────────────────────────────────

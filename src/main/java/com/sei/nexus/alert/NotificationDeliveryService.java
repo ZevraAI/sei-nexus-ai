@@ -33,7 +33,7 @@ public class NotificationDeliveryService {
     @Value("${spring.mail.username:}")
     private String mailFrom;
 
-    @Value("${nexus.alerts.app-url:https://app.zevra.ai}")
+    @Value("${nexus.alerts.app-url:https://zevra-ui.vercel.app}")
     private String appUrl;
 
     private final HttpClient httpClient = HttpClient.newBuilder()

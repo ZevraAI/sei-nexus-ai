@@ -366,9 +366,13 @@ public class TenantProvisioningService {
 
     private void sendSupabaseInvite(String email, String tenantSchema)
             throws Exception {
-        String body = mapper.writeValueAsString(Map.of(
-                "email", email,
-                "data",  Map.of("tenant_schema", tenantSchema, "role", "ADMIN")));
+        var bodyMap = new java.util.LinkedHashMap<String, Object>();
+        bodyMap.put("email", email);
+        bodyMap.put("data",  Map.of("tenant_schema", tenantSchema, "role", "ADMIN"));
+        if (appUrl != null && !appUrl.isBlank()) {
+            bodyMap.put("redirect_to", appUrl.replaceAll("/+$", ""));
+        }
+        String body = mapper.writeValueAsString(bodyMap);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(supabaseUrl.replaceAll("/+$", "") + "/auth/v1/invite"))

@@ -57,7 +57,7 @@ supabase:
   service-role-key: ${SUPABASE_SERVICE_ROLE_KEY}
 
 nexus:
-  app-url: ${NEXUS_APP_URL:http://localhost:5176/}
+  app-url: ${NEXUS_APP_URL:https://zevra-ui.vercel.app}
   cors:
     allowed-origins: ${NEXUS_CORS_ALLOWED_ORIGINS:*}
   storage:
@@ -93,6 +93,6 @@ nexus:
     conversation-days: 3
     audit-log-days: 90       # delete audit_event rows older than this; 0 = keep forever
   alerts:
-    app-url: ${NEXUS_APP_URL:http://localhost:5176}
+    app-url: ${NEXUS_APP_URL:https://zevra-ui.vercel.app}
 
 
