@@ -144,13 +144,13 @@ public class IntegrationTemplateService {
         }
 
         log.info("Integration template '{}' applied: {} entities, {} vocab, agent={}",
-                templateId, packResult.entitiesCreated(), packResult.vocabAdded(), agentId);
+                templateId, packResult.entitiesCreated(), packResult.vocabularyTermsAdded(), agentId);
 
         return new TemplateApplicationResult(
                 templateId,
                 template.displayName(),
                 packResult.entitiesCreated(),
-                packResult.vocabAdded(),
+                packResult.vocabularyTermsAdded(),
                 agentId,
                 domainKey,
                 connectionKey);
