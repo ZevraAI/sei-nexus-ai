@@ -28,5 +28,9 @@ public record ChatResponse(
         // Business terms Zevra learned from this team and applied to this query.
         // Shown as a subtle badge in the chat UI for transparency.
         // Empty when no learned context was available.
-        List<String> learningsApplied
+        List<String> learningsApplied,
+        // Zevra Agent session id when the answer came from an autonomous agent.
+        // Lets the UI fetch and display the executed tool-call trace.
+        // Null for all other decision types.
+        String agentSessionId
 ) {}

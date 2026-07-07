@@ -100,6 +100,13 @@ public class AgentRunner {
             List<AgentMessage> messages = new ArrayList<>();
             messages.add(AgentMessage.user(inputMessage));
 
+            // Cache of tool results for this session, keyed by tool + args.
+            // If the LLM repeats an identical call (typically because pruning
+            // dropped the earlier result from its context), we return the cached
+            // result instead of re-executing — re-injecting it into the recent
+            // window, which breaks repeat loops at their cause.
+            Map<String, String> toolResultCache = new LinkedHashMap<>();
+
             // 5. ReAct loop — set usage context so every LLM call is attributed
             com.sei.nexus.usage.UsageContext.set("agent", null, agent.name());
             int iterations = 0;
@@ -111,16 +118,18 @@ public class AgentRunner {
                 // Without pruning the prompt grows with every iteration: by step 4 the LLM
                 // re-reads all previous queries and results, doubling token cost each time.
                 AgentToolResponse response =
-                        openAi.chatWithTools(pruneHistory(messages, 2), systemPrompt, tools);
+                        openAi.chatWithTools(pruneHistory(messages, HISTORY_KEEP_PAIRS),
+                                systemPrompt, tools);
 
-                if (response.finalAnswer()) {
+                String answer = extractFinalAnswer(response);
+                if (answer != null) {
                     steps.add(step("FINAL_ANSWER",
-                            Map.of("answer", response.answer()),
+                            Map.of("answer", answer),
                             null, System.currentTimeMillis() - callStart));
 
                     String stepsJson = mapper.writeValueAsString(steps);
                     repository.completeSession(sessionId, "COMPLETED",
-                            stepsJson, response.answer(), null, iterations);
+                            stepsJson, answer, null, iterations);
 
                     return repository.findSessionById(sessionId, agent.tenantSchema())
                             .orElseThrow();
@@ -129,27 +138,57 @@ public class AgentRunner {
                 // LLM called a tool
                 String toolName   = response.toolName();
                 Map<String, Object> args = response.args();
+                String argsJson   = mapper.writeValueAsString(args);
 
-                String toolResult = toolRegistry.execute(toolName, args,
-                        agent.connectionKeys());
+                String cacheKey = toolName + ":" + argsJson;
+                String cached   = toolResultCache.get(cacheKey);
+
+                String toolResult;
+                if (cached != null) {
+                    toolResult = "NOTE: You already made this exact call — the result is " +
+                            "repeated below. Do not run it again; use the data you have " +
+                            "to progress toward final_answer.\n" + cached;
+                } else {
+                    toolResult = toolRegistry.execute(toolName, args,
+                            agent.connectionKeys());
+                    toolResultCache.put(cacheKey, toolResult);
+                }
 
                 long callMs = System.currentTimeMillis() - callStart;
                 steps.add(step("TOOL_CALL",
-                        Map.of("tool", toolName, "input", args),
-                        toolResult, callMs));
+                        cached != null
+                                ? Map.of("tool", toolName, "input", args, "cached", true)
+                                : Map.of("tool", toolName, "input", args),
+                        cached != null ? null : toolResult, callMs));
 
                 // Append to conversation: assistant tool_call + tool result
-                String argsJson = mapper.writeValueAsString(args);
                 messages.add(AgentMessage.assistantToolCall(
                         response.toolCallId(), toolName, argsJson));
                 messages.add(AgentMessage.toolResult(
                         response.toolCallId(), toolResult));
             }
 
-            // Max iterations reached
-            String stepsJson = mapper.writeValueAsString(steps);
-            repository.completeSession(sessionId, "MAX_ITER", stepsJson,
-                    null, "Maximum iterations reached without a final answer", iterations);
+            // Max iterations reached — force one last best-effort answer from the
+            // information already gathered, with no further tool use allowed.
+            long salvageStart = System.currentTimeMillis();
+            String salvaged = salvageAnswer(messages, systemPrompt, tools);
+
+            String stepsJson;
+            if (salvaged != null) {
+                steps.add(step("FINAL_ANSWER",
+                        Map.of("answer", salvaged, "forcedAtMaxIterations", true),
+                        null, System.currentTimeMillis() - salvageStart));
+                stepsJson = mapper.writeValueAsString(steps);
+                repository.completeSession(sessionId, "COMPLETED", stepsJson,
+                        salvaged, null, iterations);
+            } else {
+                stepsJson = mapper.writeValueAsString(steps);
+                repository.completeSession(sessionId, "MAX_ITER", stepsJson,
+                        "I couldn't complete this request within the allowed number of steps ("
+                                + agent.maxIterations() + "). Try narrowing the question, "
+                                + "or increase this agent's max iterations.",
+                        "Maximum iterations reached without a final answer", iterations);
+            }
 
         } catch (Exception e) {
             try {
@@ -166,6 +205,48 @@ public class AgentRunner {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Returns the final answer text if this LLM response is terminal, else null.
+     * Terminal means either plain text (no tool call) or a call to the
+     * {@code final_answer} tool — both end the ReAct loop.
+     */
+    private String extractFinalAnswer(AgentToolResponse response) {
+        if (response.finalAnswer()) {
+            return response.answer() != null ? response.answer() : "";
+        }
+        if ("final_answer".equals(response.toolName())) {
+            Object answer = response.args() != null ? response.args().get("answer") : null;
+            return answer != null ? answer.toString() : "";
+        }
+        return null;
+    }
+
+    /**
+     * Called when the iteration budget is exhausted: makes one final LLM call
+     * instructing the model to answer from what it has already gathered.
+     * Returns the answer, or null if the model still didn't produce one.
+     */
+    private String salvageAnswer(List<AgentMessage> messages, String systemPrompt,
+                                  List<Map<String, Object>> tools) {
+        try {
+            // Prune first, then append — appending before pruning could split an
+            // assistant tool_call from its tool result, which the API rejects.
+            List<AgentMessage> salvageMessages =
+                    new ArrayList<>(pruneHistory(messages, HISTORY_KEEP_PAIRS));
+            salvageMessages.add(AgentMessage.user(
+                    "You have reached the maximum number of steps. Do not call any more tools. " +
+                    "Give your best final answer now using only the information already gathered, " +
+                    "and state clearly anything you could not verify."));
+
+            AgentToolResponse response =
+                    openAi.chatWithTools(salvageMessages, systemPrompt, tools);
+            String answer = extractFinalAnswer(response);
+            return (answer != null && !answer.isBlank()) ? answer : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     // Column names that typically hold a small set of string values —
     // we fetch DISTINCT values for these so the LLM uses the exact strings stored.
     private static final java.util.Set<String> STATUS_COLUMNS = java.util.Set.of(
@@ -175,6 +256,12 @@ public class AgentRunner {
     // Max tables to include per connection in the schema context.
     // Sending every table bloats the prompt — we only include the most relevant ones.
     private static final int MAX_SCHEMA_TABLES = 8;
+
+    // Tool-call/result pairs kept in the LLM's context window. Must comfortably
+    // exceed the number of distinct queries a typical task needs at once —
+    // a window smaller than the task's working set makes the model re-run
+    // queries whose results were pruned, looping until max iterations.
+    private static final int HISTORY_KEEP_PAIRS = 6;
 
     private String buildSchemaContext(List<String> connectionKeys, String question) {
         Set<String> keywords = extractKeywords(question);

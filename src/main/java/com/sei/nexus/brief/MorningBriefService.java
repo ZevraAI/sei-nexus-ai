@@ -109,10 +109,43 @@ public class MorningBriefService {
         this.mapper           = mapper;
     }
 
+    // A brief still GENERATING after this long is orphaned (e.g. the app was
+    // restarted mid-generation) — mark it FAILED so the UI offers a retry.
+    private static final java.time.Duration GENERATING_TIMEOUT =
+            java.time.Duration.ofMinutes(10);
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     public Optional<MorningBrief> getTodaysBrief(String tenantSchema) {
-        return briefRepository.findByDate(tenantSchema, LocalDate.now(ZoneId.of("UTC")));
+        Optional<MorningBrief> brief =
+                briefRepository.findByDate(tenantSchema, todayFor(tenantSchema));
+
+        if (brief.isPresent() && "GENERATING".equals(brief.get().status())
+                && brief.get().createdAt() != null
+                && brief.get().createdAt().isBefore(
+                        java.time.Instant.now().minus(GENERATING_TIMEOUT))) {
+            log.warn("Brief '{}' stuck in GENERATING for over {} minutes — marking FAILED",
+                    brief.get().id(), GENERATING_TIMEOUT.toMinutes());
+            briefRepository.updateBriefFailed(brief.get().id());
+            return briefRepository.findByDate(tenantSchema, todayFor(tenantSchema));
+        }
+        return brief;
+    }
+
+    /**
+     * Today's date in the tenant's configured timezone (UTC when unset or invalid).
+     * The brief "day" must follow the executive's clock, not the server's: with
+     * UTC dates, an evening visit in a western timezone looks for tomorrow's
+     * brief, which doesn't exist yet, and the page has nothing to show.
+     */
+    private LocalDate todayFor(String tenantSchema) {
+        ZoneId zone = briefRepository.findConfig(tenantSchema)
+                .map(cfg -> {
+                    try { return ZoneId.of(cfg.timezone()); }
+                    catch (Exception e) { return ZoneId.of("UTC"); }
+                })
+                .orElse(ZoneId.of("UTC"));
+        return LocalDate.now(zone);
     }
 
     public Optional<MorningBriefConfig> getConfig(String tenantSchema) {
@@ -136,7 +169,7 @@ public class MorningBriefService {
      * generation runs asynchronously.
      */
     public String requestGeneration(String tenantSchema) {
-        LocalDate today = LocalDate.now(ZoneId.of("UTC"));
+        LocalDate today = todayFor(tenantSchema);
 
         // Delete any existing brief for today (allows regeneration)
         briefRepository.deleteBrief(tenantSchema, today);
@@ -160,20 +193,22 @@ public class MorningBriefService {
      */
     public void generateIfDue(MorningBriefConfig config) {
         String tenantSchema = config.tenantSchema();
-        LocalDate today = LocalDate.now(ZoneId.of("UTC"));
 
-        if (briefRepository.findByDate(tenantSchema, today).isPresent()) return;
-
-        // Check if schedule_time has passed (compare HH:mm in tenant timezone)
+        // Both the brief date and the schedule check use the tenant's timezone
+        // so the "day" rolls over on the executive's clock, not the server's.
+        ZoneId tz;
+        java.time.LocalTime scheduledTime;
         try {
-            ZoneId tz = ZoneId.of(config.timezone());
-            java.time.LocalTime scheduledTime = java.time.LocalTime.parse(config.scheduleTime());
-            java.time.LocalTime nowInTz = java.time.LocalTime.now(tz);
-            if (nowInTz.isBefore(scheduledTime)) return;
+            tz = ZoneId.of(config.timezone());
+            scheduledTime = java.time.LocalTime.parse(config.scheduleTime());
         } catch (Exception e) {
             log.warn("Invalid schedule config for tenant {}: {}", tenantSchema, e.getMessage());
             return;
         }
+        LocalDate today = LocalDate.now(tz);
+
+        if (briefRepository.findByDate(tenantSchema, today).isPresent()) return;
+        if (java.time.LocalTime.now(tz).isBefore(scheduledTime)) return;
 
         log.info("Generating morning brief for tenant '{}'", tenantSchema);
         String briefId = Keys.uniqueKey("brief");

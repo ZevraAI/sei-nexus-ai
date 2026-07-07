@@ -1,14 +1,24 @@
 package com.sei.nexus.tenant;
 
+import com.sei.nexus.auth.ImpersonationFilter;
 import com.sei.nexus.auth.TenantDomain;
 import com.sei.nexus.auth.TenantDomainRepository;
 import com.sei.nexus.auth.UserAccount;
+import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.governance.AuditEvent;
+import com.sei.nexus.governance.AuditEventRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 
@@ -28,16 +38,22 @@ import java.util.Map;
 @RequestMapping("/admin/tenants")
 public class TenantController {
 
+    private static final Logger log = LoggerFactory.getLogger(TenantController.class);
+
     private final TenantRepository          tenantRepository;
     private final TenantProvisioningService provisioningService;
     private final TenantDomainRepository    tenantDomainRepository;
+    private final AuditEventRepository      auditEventRepository;
+    private final SecureRandom              secureRandom = new SecureRandom();
 
     public TenantController(TenantRepository tenantRepository,
                              TenantProvisioningService provisioningService,
-                             TenantDomainRepository tenantDomainRepository) {
+                             TenantDomainRepository tenantDomainRepository,
+                             AuditEventRepository auditEventRepository) {
         this.tenantRepository       = tenantRepository;
         this.provisioningService    = provisioningService;
         this.tenantDomainRepository = tenantDomainRepository;
+        this.auditEventRepository   = auditEventRepository;
     }
 
     /**
@@ -241,6 +257,96 @@ public class TenantController {
                 .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
                         "Tenant not found: " + slug));
         tenantDomainRepository.delete(domain, tenant.schemaName());
+        return ResponseEntity.noContent().build();
+    }
+
+    // ── Impersonation ─────────────────────────────────────────────────────────
+
+    /**
+     * POST /admin/tenants/{slug}/impersonate
+     * Issues a 30-minute impersonation token scoped to the target tenant.
+     * Platform admin only (schema=public, role=ADMIN).
+     */
+    @PostMapping("/{slug}/impersonate")
+    public ResponseEntity<Map<String, Object>> startImpersonation(
+            @PathVariable String slug) {
+        requireAdmin();
+
+        Tenant tenant = tenantRepository.findBySlug(slug)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Tenant not found: " + slug));
+        if ("DEPROVISIONED".equals(tenant.status())) {
+            throw new NexusException(HttpStatus.BAD_REQUEST,
+                    "Cannot impersonate a deprovisioned tenant");
+        }
+
+        UserAccount caller = (UserAccount) SecurityContextHolder.getContext()
+                .getAuthentication().getPrincipal();
+
+        // Generate cryptographically random 32-byte token
+        byte[] bytes = new byte[32];
+        secureRandom.nextBytes(bytes);
+        String rawToken = HexFormat.of().formatHex(bytes);
+
+        String tokenHash;
+        try {
+            tokenHash = ImpersonationFilter.sha256Hex(rawToken);
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Token generation failed");
+        }
+
+        Instant expiresAt = Instant.now().plus(30, ChronoUnit.MINUTES);
+        tenantRepository.writeSessionIndex(
+                tokenHash, tenant.schemaName(), caller.email(), expiresAt);
+
+        auditEventRepository.save(new AuditEvent(
+                Keys.uniqueKey("audit"), "IMPERSONATION_START",
+                caller.email(), "ADMIN", null, null,
+                new String[]{slug}, new String[0], new String[0],
+                new String[0], new String[0], new String[0],
+                null, null, null, null, null, null, Instant.now()));
+
+        log.info("Platform admin '{}' started impersonation of tenant '{}'",
+                caller.email(), slug);
+
+        return ResponseEntity.ok(Map.of(
+                "token",      rawToken,
+                "tenantSlug", slug,
+                "tenantName", tenant.name(),
+                "expiresAt",  expiresAt.toString()));
+    }
+
+    /**
+     * DELETE /admin/tenants/impersonate
+     * Revokes an active impersonation session.
+     * Must be called without the X-Nexus-Impersonate header (i.e., as platform admin).
+     */
+    @DeleteMapping("/impersonate")
+    public ResponseEntity<Void> exitImpersonation(
+            @RequestBody Map<String, Object> body) {
+        requireAdmin();
+        String rawToken = requireString(body, "token");
+
+        String tokenHash;
+        try {
+            tokenHash = ImpersonationFilter.sha256Hex(rawToken);
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.BAD_REQUEST, "Invalid token");
+        }
+
+        tenantRepository.deleteSessionIndex(tokenHash);
+
+        UserAccount caller = (UserAccount) SecurityContextHolder.getContext()
+                .getAuthentication().getPrincipal();
+
+        auditEventRepository.save(new AuditEvent(
+                Keys.uniqueKey("audit"), "IMPERSONATION_END",
+                caller.email(), "ADMIN", null, null,
+                new String[0], new String[0], new String[0],
+                new String[0], new String[0], new String[0],
+                null, null, null, null, null, null, Instant.now()));
+
+        log.info("Platform admin '{}' exited impersonation", caller.email());
         return ResponseEntity.noContent().build();
     }
 

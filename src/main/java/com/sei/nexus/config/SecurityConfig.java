@@ -2,6 +2,7 @@ package com.sei.nexus.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.auth.AuthRepository;
+import com.sei.nexus.auth.ImpersonationFilter;
 import com.sei.nexus.auth.NexusAuthFilter;
 import com.sei.nexus.auth.SupabaseAuthFilter;
 import com.sei.nexus.auth.TenantDomainRepository;
@@ -57,6 +58,11 @@ public class SecurityConfig {
     }
 
     @Bean
+    public ImpersonationFilter impersonationFilter() {
+        return new ImpersonationFilter(tenantRepository);
+    }
+
+    @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
             .csrf(csrf -> csrf.disable())
@@ -79,8 +85,10 @@ public class SecurityConfig {
                     .anyRequest().authenticated()
             )
             // Supabase JWT filter runs first; NexusAuthFilter handles legacy X-Nexus-Token
+            // ImpersonationFilter overrides TenantContext for platform admins
             .addFilterBefore(supabaseAuthFilter(), UsernamePasswordAuthenticationFilter.class)
-            .addFilterAfter(nexusAuthFilter(), SupabaseAuthFilter.class);
+            .addFilterAfter(nexusAuthFilter(), SupabaseAuthFilter.class)
+            .addFilterAfter(impersonationFilter(), NexusAuthFilter.class);
 
         return http.build();
     }

@@ -190,7 +190,7 @@ public class ChatService {
             runRepository.save(run);
             try {
                 ZevraSession session = agentRunner.run(za, raw);
-                String answer = session.finalOutput() != null
+                String answer = session.finalOutput() != null && !session.finalOutput().isBlank()
                         ? session.finalOutput()
                         : "The agent completed but produced no response.";
                 runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", null);
@@ -200,7 +200,8 @@ public class ChatService {
                         true, false, false);
                 return new ChatResponse(convId, runKey, answer, List.of(), decision,
                         za.slug(), za.name(), null, 0.9, false, "",
-                        List.of(), List.of(), List.of(), List.of(), List.of());
+                        List.of(), List.of(), List.of(), List.of(), List.of(),
+                        session.id());
             } catch (Exception e) {
                 log.warn("ZevraAgent '{}' failed, falling through to normal chat: {}",
                         za.name(), e.getMessage());
@@ -921,7 +922,8 @@ public class ChatService {
                 quickRefs, asyncOps,
                 queryData        != null ? queryData        : List.of(),
                 reasoningSteps   != null ? reasoningSteps   : List.of(),
-                learningsApplied != null ? learningsApplied : List.of());
+                learningsApplied != null ? learningsApplied : List.of(),
+                null);
     }
 
     /** Converts EvidenceStore steps to the execResults format expected by composeAnswer. */
