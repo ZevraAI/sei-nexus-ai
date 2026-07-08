@@ -143,8 +143,9 @@ public class EnterpriseMapRepository {
                 INSERT INTO nexus_data_column
                     (column_key, object_key, column_name, data_type, is_nullable,
                      business_meaning, is_identifier, is_status, is_error,
-                     is_sensitive, is_filterable, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     is_sensitive, is_filterable, udt_name, value_domain_key,
+                     created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (object_key, column_name) DO UPDATE SET
                     data_type        = EXCLUDED.data_type,
                     is_nullable      = EXCLUDED.is_nullable,
@@ -159,12 +160,15 @@ public class EnterpriseMapRepository {
                     is_error         = EXCLUDED.is_error,
                     is_sensitive     = EXCLUDED.is_sensitive,
                     is_filterable    = EXCLUDED.is_filterable,
+                    udt_name         = EXCLUDED.udt_name,
+                    value_domain_key = EXCLUDED.value_domain_key,
                     updated_at       = NOW()
                 """,
                 col.columnKey(), col.objectKey(), col.columnName(), col.dataType(),
                 col.isNullable(), col.businessMeaning(),
                 col.isIdentifier(), col.isStatus(), col.isError(),
                 col.isSensitive(), col.isFilterable(),
+                col.udtName(), col.valueDomainKey(),
                 Timestamp.from(col.createdAt() != null ? col.createdAt() : Instant.now()),
                 Timestamp.from(col.updatedAt() != null ? col.updatedAt() : Instant.now()));
     }
@@ -194,6 +198,53 @@ public class EnterpriseMapRepository {
 
     public void deleteColumnsByObject(String objectKey) {
         jdbc.update("DELETE FROM nexus_data_column WHERE object_key = ?", objectKey);
+    }
+
+    // -------------------------------------------------------------------------
+    // ValueDomain (PRO-10)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Inserts or refreshes a value domain, keyed by its natural identity
+     * (connection, source schema, domain name, source). Returns the persisted
+     * domain_value_key — the existing one when the domain was already known,
+     * so re-scans never create duplicates.
+     */
+    public String upsertValueDomain(ValueDomain d) {
+        return jdbc.queryForObject("""
+                INSERT INTO nexus_value_domain
+                    (domain_value_key, connection_key, source_schema, domain_name,
+                     source, is_authoritative, domain_values, scanned_at, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?::jsonb,NOW(),NOW(),NOW())
+                ON CONFLICT (connection_key, source_schema, domain_name, source) DO UPDATE SET
+                    domain_values    = EXCLUDED.domain_values,
+                    is_authoritative = EXCLUDED.is_authoritative,
+                    scanned_at       = NOW(),
+                    updated_at       = NOW()
+                RETURNING domain_value_key
+                """,
+                String.class,
+                d.domainValueKey(), d.connectionKey(), d.sourceSchema(), d.domainName(),
+                d.source(), d.isAuthoritative(), d.domainValuesJson());
+    }
+
+    public Optional<ValueDomain> findValueDomainByKey(String domainValueKey) {
+        List<ValueDomain> rows = jdbc.query(
+                "SELECT * FROM nexus_value_domain WHERE domain_value_key = ?",
+                valueDomainMapper(), domainValueKey);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    private RowMapper<ValueDomain> valueDomainMapper() {
+        return (rs, rowNum) -> new ValueDomain(
+                rs.getString("domain_value_key"),
+                rs.getString("connection_key"),
+                rs.getString("source_schema"),
+                rs.getString("domain_name"),
+                rs.getString("source"),
+                rs.getBoolean("is_authoritative"),
+                rs.getString("domain_values"),
+                toInstant(rs, "scanned_at"));
     }
 
     // -------------------------------------------------------------------------
@@ -286,6 +337,8 @@ public class EnterpriseMapRepository {
                 rs.getBoolean("is_error"),
                 rs.getBoolean("is_sensitive"),
                 rs.getBoolean("is_filterable"),
+                rs.getString("udt_name"),
+                rs.getString("value_domain_key"),
                 toInstant(rs, "created_at"),
                 toInstant(rs, "updated_at"));
     }

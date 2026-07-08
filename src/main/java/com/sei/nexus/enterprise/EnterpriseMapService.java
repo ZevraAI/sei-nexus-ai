@@ -192,6 +192,10 @@ public class EnterpriseMapService {
         // connection has been deleted. Avoids re-querying on every iteration.
         String fallbackConnKey = null;
 
+        // Value domains rendered once per key — several columns can share one
+        // enum type across the object list (PRO-10).
+        Map<String, String> renderedDomains = new HashMap<>();
+
         // Build entity context string
         StringBuilder entityContext = new StringBuilder();
         for (DataObject obj : dataObjects) {
@@ -239,8 +243,21 @@ public class EnterpriseMapService {
             if (!cols.isEmpty()) {
                 entityContext.append("Columns:\n");
                 for (DataColumn col : cols) {
+                    // For domain-linked columns, replace the opaque type label
+                    // (e.g. USER-DEFINED) with the domain name and its legal
+                    // values so the planner never guesses literals (PRO-10):
+                    //   status (store_status: open | temporarily_closed | ...)
+                    String typeLabel = col.dataType();
+                    if (col.valueDomainKey() != null) {
+                        String rendered = renderedDomains.computeIfAbsent(
+                                col.valueDomainKey(),
+                                k -> repository.findValueDomainByKey(k)
+                                        .map(this::renderValueDomain)
+                                        .orElse(""));
+                        if (!rendered.isBlank()) typeLabel = rendered;
+                    }
                     entityContext.append("  - ").append(col.columnName())
-                            .append(" (").append(col.dataType()).append(")");
+                            .append(" (").append(typeLabel).append(")");
                     if (col.businessMeaning() != null && !col.businessMeaning().isBlank()) {
                         entityContext.append(": ").append(col.businessMeaning());
                     }
@@ -462,6 +479,9 @@ public class EnterpriseMapService {
                         Boolean.TRUE.equals(colMap.get("isError")),
                         Boolean.TRUE.equals(colMap.get("isSensitive")),
                         Boolean.TRUE.equals(colMap.get("isFilterable")),
+                        // Null in snapshots created before V034 — restored as absent.
+                        (String) colMap.get("udtName"),
+                        (String) colMap.get("valueDomainKey"),
                         now, now);
                 repository.saveColumn(col);
             }
@@ -526,6 +546,40 @@ public class EnterpriseMapService {
                     .forEach(c -> existingCols.put(c.columnName().toLowerCase(), c));
         }
 
+        // ── Value-domain discovery (PRO-10) ─────────────────────────────────
+        // When the table has USER-DEFINED (enum) columns, one batched pg_enum
+        // query resolves the legal values of every enum type this table uses.
+        // Domains are upserted by natural key (connection, schema, type) so
+        // re-scans refresh rather than duplicate. Non-fatal by design: a
+        // discovery failure must never break the column scan itself.
+        Map<String, String> domainKeyByUdtName = new HashMap<>();
+        try {
+            Set<String> usedEnumTypes = new java.util.LinkedHashSet<>();
+            for (Map<String, Object> col : schemaInfo) {
+                String dt  = String.valueOf(col.getOrDefault("data_type", col.get("dataType")));
+                String udt = (String) col.get("udt_name");
+                if ("USER-DEFINED".equalsIgnoreCase(dt) && udt != null && !udt.isBlank()) {
+                    usedEnumTypes.add(udt);
+                }
+            }
+            if (!usedEnumTypes.isEmpty()) {
+                Map<String, List<String>> enums =
+                        dynamicSqlService.listEnumDomains(connectionKey, schemaName);
+                for (String enumType : usedEnumTypes) {
+                    List<String> values = enums.get(enumType);
+                    if (values == null || values.isEmpty()) continue;
+                    String domainKey = repository.upsertValueDomain(new ValueDomain(
+                            Keys.uniqueKey("vdom"), connectionKey, schemaName,
+                            enumType, "ENUM", true,
+                            objectMapper.writeValueAsString(values), null));
+                    domainKeyByUdtName.put(enumType, domainKey);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Value-domain discovery failed for {}.{}: {}",
+                    schemaName, tableName, e.getMessage());
+        }
+
         List<DataColumn> columns = new ArrayList<>();
         Instant now = Instant.now();
 
@@ -566,9 +620,23 @@ public class EnterpriseMapService {
                     ? existing.columnKey()
                     : Keys.uniqueKey("col");
 
+            // Value-domain binding (PRO-10): link the column to its discovered
+            // enum domain. When this scan produced no domain (non-Postgres source
+            // or transient discovery failure), keep the existing link rather than
+            // erasing it.
+            String udtName = (String) col.get("udt_name");
+            if ((udtName == null || udtName.isBlank()) && existing != null) {
+                udtName = existing.udtName();
+            }
+            String valueDomainKey = udtName != null ? domainKeyByUdtName.get(udtName) : null;
+            if (valueDomainKey == null && existing != null) {
+                valueDomainKey = existing.valueDomainKey();
+            }
+
             DataColumn dataColumn = new DataColumn(
                     columnKey, objectKey, colName, dataType, nullable,
                     businessMeaning, isIdentifier, isStatus, isError, isSensitive, isFilterable,
+                    udtName, valueDomainKey,
                     existing != null ? existing.createdAt() : now, now);
 
             repository.saveColumn(dataColumn);
@@ -576,6 +644,28 @@ public class EnterpriseMapService {
         }
 
         return columns;
+    }
+
+    /**
+     * Renders a value domain as a compact type label for the LLM context:
+     * {@code store_status: open | temporarily_closed | seasonal | ...}.
+     * Long domains are capped to keep the entity context within its
+     * truncation budget. PRO-10.
+     */
+    private String renderValueDomain(ValueDomain domain) {
+        final int maxValues = 20;
+        try {
+            List<String> values = objectMapper.readValue(
+                    domain.domainValuesJson(), new TypeReference<List<String>>() {});
+            if (values.isEmpty()) return domain.domainName();
+            List<String> shown = values.size() > maxValues
+                    ? values.subList(0, maxValues) : values;
+            String joined = String.join(" | ", shown);
+            if (values.size() > maxValues) joined += " | …";
+            return domain.domainName() + ": " + joined;
+        } catch (Exception e) {
+            return domain.domainName();
+        }
     }
 
     private void createVersionSnapshot(DataObject obj, List<DataColumn> columns,
@@ -614,6 +704,8 @@ public class EnterpriseMapService {
                 m.put("isError", c.isError());
                 m.put("isSensitive", c.isSensitive());
                 m.put("isFilterable", c.isFilterable());
+                m.put("udtName", c.udtName());
+                m.put("valueDomainKey", c.valueDomainKey());
                 return m;
             }).collect(Collectors.toList());
             snapshot.put("columns", colMaps);

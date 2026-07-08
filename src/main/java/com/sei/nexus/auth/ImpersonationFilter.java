@@ -46,6 +46,17 @@ public class ImpersonationFilter extends OncePerRequestFilter {
         this.tenantRepository = tenantRepository;
     }
 
+    /**
+     * Platform-admin endpoints always run in the caller's real (public) context.
+     * Overriding TenantContext there would make {@code requireAdmin()} reject the
+     * platform admin with 403 while impersonating — locking them out of listing
+     * tenants, switching to another tenant, or ending the impersonation session.
+     */
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return request.getServletPath().startsWith("/admin/");
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest  request,
                                     HttpServletResponse response,

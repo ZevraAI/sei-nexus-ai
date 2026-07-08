@@ -117,7 +117,7 @@ public class RelationshipDiscoveryService {
                 String relKey = createRelationship(
                         sourceEntityKey, targetEntityKey,
                         "REFERENCES", fkCol, pkCol,
-                        buildJoinGuidance(fkTable, fkCol, pkTable, pkCol),
+                        buildJoinGuidance(schemaName, fkTable, fkCol, pkTable, pkCol),
                         "N:1", false, domainKey);
                 if (relKey != null) created.add(relKey);
 
@@ -125,7 +125,7 @@ public class RelationshipDiscoveryService {
                 String invKey = createRelationship(
                         targetEntityKey, sourceEntityKey,
                         "HAS_MANY", pkCol, fkCol,
-                        buildJoinGuidance(pkTable, pkCol, fkTable, fkCol),
+                        buildJoinGuidance(schemaName, pkTable, pkCol, fkTable, fkCol),
                         "1:N", false, domainKey);
                 if (invKey != null) created.add(invKey);
             }
@@ -206,7 +206,7 @@ public class RelationshipDiscoveryService {
                         String relKey = createRelationship(
                                 sourceEntityKey, targetEntityKey,
                                 "REFERENCES", col, col,
-                                buildJoinGuidance(sourceTable, col, targetTable, col),
+                                buildJoinGuidance(schemaName, sourceTable, col, targetTable, col),
                                 "N:1", false, domainKey);
                         if (relKey != null) {
                             created.add(relKey);
@@ -217,7 +217,7 @@ public class RelationshipDiscoveryService {
                         String invKey = createRelationship(
                                 targetEntityKey, sourceEntityKey,
                                 "HAS_MANY", col, col,
-                                buildJoinGuidance(targetTable, col, sourceTable, col),
+                                buildJoinGuidance(schemaName, targetTable, col, sourceTable, col),
                                 "1:N", false, domainKey);
                         if (invKey != null) created.add(invKey);
                     }
@@ -362,8 +362,16 @@ public class RelationshipDiscoveryService {
         }
     }
 
-    private String buildJoinGuidance(String srcTable, String srcCol, String tgtTable, String tgtCol) {
-        return String.format("JOIN %s ON %s.%s = %s.%s", tgtTable, tgtTable, tgtCol, srcTable, srcCol);
+    private String buildJoinGuidance(String schema, String srcTable, String srcCol,
+                                     String tgtTable, String tgtCol) {
+        // The joined table must carry its schema: the generated SQL runs against the
+        // external connection with no search_path set, so a bare name only resolves
+        // when the table happens to live in the connection's default schema (public).
+        // Column refs stay bare — Postgres resolves them against the qualified tables.
+        String joinTable = (schema != null && !schema.isBlank())
+                ? schema + "." + tgtTable
+                : tgtTable;
+        return String.format("JOIN %s ON %s.%s = %s.%s", joinTable, tgtTable, tgtCol, srcTable, srcCol);
     }
 
     private String invertType(String type) {

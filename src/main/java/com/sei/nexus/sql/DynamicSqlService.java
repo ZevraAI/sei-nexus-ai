@@ -141,9 +141,12 @@ public class DynamicSqlService {
                     schemaName != null ? schemaName.toUpperCase() : null,
                     tableName.toUpperCase()};
         } else {
-            // Postgres and other ANSI-compliant sources
+            // Postgres and other ANSI-compliant sources.
+            // udt_name preserves the underlying type identity (e.g. the ENUM type
+            // name when data_type = 'USER-DEFINED') so value domains can be
+            // resolved downstream (PRO-10).
             querySql = """
-                    SELECT column_name, data_type, is_nullable
+                    SELECT column_name, data_type, is_nullable, udt_name
                       FROM information_schema.columns
                      WHERE table_schema = ?
                        AND table_name   = ?
@@ -170,6 +173,57 @@ public class DynamicSqlService {
                     schemaName, tableName, connectionKey, ex.getMessage());
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Could not describe table: " + ex.getMessage());
         }
+    }
+
+    /**
+     * Returns every ENUM type defined in the given schema with its ordered legal
+     * values — in a single round-trip against the PostgreSQL system catalogs
+     * (pg_enum is authoritative and ordered; enums are not exposed through
+     * information_schema at all). PRO-10.
+     *
+     * <p>Non-Postgres connection types return an empty map (Oracle has no native
+     * enums; CHECK-constraint domains are a future source). Failures also return
+     * an empty map — value-domain discovery must never break a column scan.
+     *
+     * @return insertion-ordered map: enum type name → ordered value list
+     */
+    public Map<String, List<String>> listEnumDomains(String connectionKey, String schemaName) {
+        NexusConnection conn = requireConnection(connectionKey);
+        if (!"POSTGRES".equalsIgnoreCase(conn.connectionType())) {
+            return Map.of();
+        }
+        String secret = conn.encryptedSecret(); // PRODUCTION: decrypt via Vault here
+
+        String sql = """
+                SELECT t.typname   AS enum_type,
+                       e.enumlabel AS enum_value
+                  FROM pg_type      t
+                  JOIN pg_enum      e ON e.enumtypid = t.oid
+                  JOIN pg_namespace n ON n.oid       = t.typnamespace
+                 WHERE n.nspname = ?
+                 ORDER BY t.typname, e.enumsortorder
+                """;
+
+        Map<String, List<String>> domains = new LinkedHashMap<>();
+        try (Connection jdbc = DriverManager.getConnection(
+                conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+
+            ps.setString(1, schemaName);
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    domains.computeIfAbsent(rs.getString("enum_type"), k -> new ArrayList<>())
+                           .add(rs.getString("enum_value"));
+                }
+            }
+        } catch (SQLException ex) {
+            log.warn("Enum domain discovery failed for {}/{}: {}",
+                    connectionKey, schemaName, ex.getMessage());
+            return Map.of();
+        }
+        return domains;
     }
 
     /**

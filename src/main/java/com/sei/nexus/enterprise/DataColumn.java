@@ -18,6 +18,11 @@ public record DataColumn(
         boolean isError,
         boolean isSensitive,
         boolean isFilterable,
+        // Raw type name from information_schema (e.g. the ENUM type name when
+        // data_type = 'USER-DEFINED'); null for plain built-in types. PRO-10.
+        String udtName,
+        // Reference to nexus_value_domain when a discovered domain matches udtName.
+        String valueDomainKey,
         Instant createdAt,
         Instant updatedAt
 ) {}
