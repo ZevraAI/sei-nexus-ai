@@ -68,6 +68,8 @@ class ValueDomainDiscoveryTest {
     static class FakeDynamicSql extends DynamicSqlService {
         List<Map<String, Object>> describeResult = List.of();
         Map<String, List<String>> enumResult     = Map.of();
+        Map<String, List<String>> distinctValues = Map.of();
+        final List<String> probedColumns = new ArrayList<>();
         int enumCalls = 0;
 
         FakeDynamicSql() { super(null); }
@@ -78,6 +80,12 @@ class ValueDomainDiscoveryTest {
         @Override public Map<String, List<String>> listEnumDomains(String c, String s) {
             enumCalls++;
             return enumResult;
+        }
+        @Override public List<String> listDistinctValues(String c, String s, String t,
+                                                          String column, int limit) {
+            probedColumns.add(column);
+            List<String> values = distinctValues.getOrDefault(column, List.of());
+            return values.size() > limit ? values.subList(0, limit) : values;
         }
     }
 
@@ -108,7 +116,7 @@ class ValueDomainDiscoveryTest {
         repository = new FakeRepository();
         dynamicSql = new FakeDynamicSql();
         service = new EnterpriseMapService(repository, new FakeConnectionRepository(),
-                dynamicSql, new SqlSafetyService(), null, new ObjectMapper());
+                dynamicSql, new SqlSafetyService(), null, new ObjectMapper(), null);
     }
 
     // ── discovery ────────────────────────────────────────────────────────────
@@ -167,7 +175,7 @@ class ValueDomainDiscoveryTest {
         repository.existingColumns = List.of(new DataColumn(
                 "col-1", OBJ_KEY, "status", "USER-DEFINED",
                 false, "", false, true, false, false, true,
-                "store_status", "vdom-old", Instant.now(), Instant.now()));
+                "store_status", "vdom-old", "INFERRED", Instant.now(), Instant.now()));
         dynamicSql.describeResult = List.of(
                 Map.of("column_name", "status", "data_type", "USER-DEFINED",
                        "is_nullable", "NO", "udt_name", "store_status"));
@@ -181,7 +189,291 @@ class ValueDomainDiscoveryTest {
                 "existing domain link must survive a scan that discovered nothing");
     }
 
+    // ── OBSERVED value-domain discovery (PRO-24) ─────────────────────────────
+
+    private static Map<String, Object> textCol(String name) {
+        return Map.of("column_name", name, "data_type", "character varying",
+                "is_nullable", "YES", "udt_name", "varchar");
+    }
+
+    @Test
+    void observedDomainDiscoveredForTextualDiscriminatorColumn() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("state_province"), textCol("name"));
+        dynamicSql.distinctValues = Map.of("state_province",
+                List.of("Texas", "Alabama", "California"));   // unsorted on purpose
+
+        service.scanObject(OBJ_KEY);
+
+        assertEquals(List.of("state_province"), dynamicSql.probedColumns,
+                "only the status-hinted column is probed; 'name' is not a discriminator");
+        assertEquals(1, repository.upsertedDomains.size());
+        ValueDomain d = repository.upsertedDomains.get(0);
+        assertEquals("OBSERVED", d.source());
+        assertFalse(d.isAuthoritative(), "sampled values are advisory");
+        assertEquals("stores.state_province", d.domainName(),
+                "table-qualified so the natural key never collides across tables");
+        assertEquals("[\"Alabama\",\"California\",\"Texas\"]", d.domainValuesJson(),
+                "values sorted for stable JSON across rescans");
+
+        DataColumn col = repository.savedColumns.stream()
+                .filter(c -> c.columnName().equals("state_province")).findFirst().orElseThrow();
+        assertEquals("vdom-123", col.valueDomainKey(), "column linked to the observed domain");
+    }
+
+    @Test
+    void cardinalityGateSkipsHighCardinalityColumns() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("state_province"));
+        List<String> many = new ArrayList<>();
+        for (int i = 0; i < 30; i++) many.add("v" + i);       // > default cap of 25
+        dynamicSql.distinctValues = Map.of("state_province", many);
+
+        service.scanObject(OBJ_KEY);
+
+        assertTrue(repository.upsertedDomains.isEmpty(), "cap+1 rows back → no domain");
+        DataColumn col = repository.savedColumns.get(0);
+        assertNull(col.valueDomainKey());
+    }
+
+    @Test
+    void enumColumnsAreNeverProbed() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(
+                Map.of("column_name", "status", "data_type", "USER-DEFINED",
+                       "is_nullable", "NO", "udt_name", "store_status"));
+        dynamicSql.enumResult = Map.of("store_status", List.of("open", "closed"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertTrue(dynamicSql.probedColumns.isEmpty(),
+                "USER-DEFINED is not textual — enum discovery owns it");
+        assertEquals("ENUM", repository.upsertedDomains.get(0).source());
+    }
+
+    @Test
+    void identifierSensitiveAndNonTextualColumnsAreExcluded() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(
+                textCol("state_code"),                                      // "code" → identifier hint
+                textCol("status_token"),                                    // "token" → sensitive
+                Map.of("column_name", "priority_flag", "data_type", "integer",
+                       "is_nullable", "YES", "udt_name", "int4"));          // status hint but not textual
+        dynamicSql.distinctValues = Map.of(
+                "state_code", List.of("TX"), "status_token", List.of("x"),
+                "priority_flag", List.of("1"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertTrue(dynamicSql.probedColumns.isEmpty(), "all three exclusion gates hold");
+        assertTrue(repository.upsertedDomains.isEmpty());
+    }
+
+    @Test
+    void probeBudgetCapsColumnsPerTable() {
+        repository.object = storesObject();
+        List<Map<String, Object>> cols = new ArrayList<>();
+        Map<String, List<String>> values = new java.util.HashMap<>();
+        for (int i = 0; i < 12; i++) {                        // 12 eligible, budget is 8
+            cols.add(textCol("status_" + i));
+            values.put("status_" + i, List.of("a", "b"));
+        }
+        dynamicSql.describeResult = cols;
+        dynamicSql.distinctValues = values;
+
+        service.scanObject(OBJ_KEY);
+
+        assertEquals(8, dynamicSql.probedColumns.size(), "default observed-columns-per-table");
+    }
+
+    @Test
+    void emptyProbePreservesExistingObservedLink() {
+        repository.object = storesObject();
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "state_province", "character varying",
+                true, "", false, true, false, false, true,
+                "varchar", "vdom-old-observed", "INFERRED", Instant.now(), Instant.now()));
+        dynamicSql.describeResult = List.of(textCol("state_province"));
+        dynamicSql.distinctValues = Map.of();                 // probe fails / returns nothing
+
+        service.scanObject(OBJ_KEY);
+
+        DataColumn saved = repository.savedColumns.get(0);
+        assertEquals("vdom-old-observed", saved.valueDomainKey(),
+                "a failed probe must never erase an existing link");
+    }
+
+    // ── Semantic Role ownership (PRO-29) ─────────────────────────────────────
+
+    @Test
+    void confirmedHumanVetoBlocksProbeAndSurvivesRescan() {
+        // Human un-marked state_province as a status column (PATCH → CONFIRMED).
+        // The name hint says "status"; the persisted role says no. Role wins —
+        // and the rescan must not recompute the flag back to true.
+        repository.object = storesObject();
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "state_province", "character varying",
+                true, "", false, false, false, false, false,
+                "varchar", null, "CONFIRMED", Instant.now(), Instant.now()));
+        dynamicSql.describeResult = List.of(textCol("state_province"));
+        dynamicSql.distinctValues = Map.of("state_province", List.of("Texas", "Utah"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertTrue(dynamicSql.probedColumns.isEmpty(),
+                "human veto is authoritative over the name-hint producer");
+        DataColumn saved = repository.savedColumns.get(0);
+        assertFalse(saved.isStatus(), "CONFIRMED flags are never recomputed away");
+        assertEquals("CONFIRMED", saved.roleSource());
+    }
+
+    @Test
+    void confirmedHumanOptInProbesNonHintedColumn() {
+        // Human marked "city" filterable via PATCH — no name hint, no request,
+        // yet discovery must honor the persisted CONFIRMED role.
+        repository.object = storesObject();
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "city", "character varying",
+                true, "", false, false, false, false, true,
+                "varchar", null, "CONFIRMED", Instant.now(), Instant.now()));
+        dynamicSql.describeResult = List.of(textCol("city"));
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin", "Dallas"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertEquals(List.of("city"), dynamicSql.probedColumns);
+        assertEquals("stores.city", repository.upsertedDomains.get(0).domainName());
+    }
+
+    @Test
+    void declaredRoleSurvivesRequestlessRescan() {
+        // W2 closed: an onboarding declaration (safeFilterColumns) persisted the
+        // role as DECLARED; the rescan passes NO request, and the persisted role
+        // must keep the column eligible — previously it silently lost eligibility.
+        repository.object = storesObject();
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "city", "character varying",
+                true, "", false, false, false, false, true,
+                "varchar", null, "DECLARED", Instant.now(), Instant.now()));
+        dynamicSql.describeResult = List.of(textCol("city"));
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin", "Dallas"));
+
+        service.scanObject(OBJ_KEY);   // request = Map.of() on this path
+
+        assertEquals(List.of("city"), dynamicSql.probedColumns,
+                "declared eligibility must not evaporate on rescan");
+        DataColumn saved = repository.savedColumns.get(0);
+        assertTrue(saved.isFilterable(), "declared flags kept verbatim");
+        assertEquals("DECLARED", saved.roleSource());
+    }
+
+    @Test
+    void inferredRolesRemainRecomputableAndProvenanced() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("state_province"));
+        dynamicSql.distinctValues = Map.of("state_province", List.of("Texas"));
+
+        service.scanObject(OBJ_KEY);
+
+        DataColumn saved = repository.savedColumns.get(0);
+        assertTrue(saved.isStatus(), "name-hint inference still produces roles");
+        assertEquals("INFERRED", saved.roleSource());
+    }
+
+    @Test
+    void freshDeclarationUpgradesProvenanceToDeclared() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("city"));
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin"));
+
+        service.createOrUpdateObject(new java.util.HashMap<>(Map.of(
+                "domainKey", "PLATFORM", "connectionKey", "conn-1",
+                "schemaName", "retail_core", "tableName", "stores",
+                "safeFilterColumns", "city")), "user@x.com");
+
+        DataColumn saved = repository.savedColumns.get(0);
+        assertTrue(saved.isFilterable());
+        assertEquals("DECLARED", saved.roleSource());
+    }
+
+    @Test
+    void piiShapedSamplesAreNeverPersisted() {
+        // PRO-27: the W1 scenario — a small table whose probed column contains
+        // person names. The probe runs (name gates passed), but content
+        // classification blocks persistence and the column stays unlinked.
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("owner_status"));   // status-hinted name
+        dynamicSql.distinctValues = Map.of("owner_status",
+                List.of("John Smith", "Mary Johnson", "Robert Lee"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertEquals(List.of("owner_status"), dynamicSql.probedColumns, "probe itself runs");
+        assertTrue(repository.upsertedDomains.isEmpty(),
+                "person-name-shaped sample must never become a domain");
+        assertNull(repository.savedColumns.get(0).valueDomainKey());
+    }
+
+    @Test
+    void explicitSafeFilterColumnsMakeNonHintedColumnsEligible() {
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("city"));  // no status hint in the name
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin", "Dallas"));
+
+        service.createOrUpdateObject(new java.util.HashMap<>(Map.of(
+                "domainKey", "PLATFORM", "connectionKey", "conn-1",
+                "schemaName", "retail_core", "tableName", "stores",
+                "safeFilterColumns", "city")), "user@x.com");
+
+        assertEquals(List.of("city"), dynamicSql.probedColumns,
+                "AI-declared safe-filter columns extend eligibility (PRO-21 passthrough consumer)");
+        assertEquals("stores.city", repository.upsertedDomains.get(0).domainName());
+    }
+
     // ── runtime consumption ──────────────────────────────────────────────────
+
+    @Test
+    void operationalContextRendersObservedValuesWithTypeKept() {
+        repository.objectsByDomain = List.of(storesObject());
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "state_province", "character varying",
+                true, "", false, true, false, false, true,
+                "varchar", "vdom-obs", "INFERRED", Instant.now(), Instant.now()));
+        repository.domainByKey = new ValueDomain("vdom-obs", "conn-1", "retail_core",
+                "stores.state_province", "OBSERVED", false,
+                "[\"Alabama\",\"California\",\"Texas\"]", Instant.now());
+
+        Map<String, Object> ctx = service.operationalContext(
+                List.of("PLATFORM"), List.of("conn-1"), "show me stores");
+
+        String entityContext = (String) ctx.get("entityContext");
+        assertTrue(entityContext.contains(
+                        "state_province (character varying; observed: Alabama | California | Texas)"),
+                "OBSERVED keeps the type and appends the advisory sample, got:\n" + entityContext);
+        assertFalse(entityContext.contains("stores.state_province"),
+                "the table-qualified domain name is not rendered — redundant next to its column");
+    }
+
+    @Test
+    void observedRenderingCapsAtTwentyValuesWithOverflowMarker() {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < 25; i++) json.append(i > 0 ? "," : "").append("\"v").append(i).append("\"");
+        json.append("]");
+        repository.objectsByDomain = List.of(storesObject());
+        repository.existingColumns = List.of(new DataColumn(
+                "col-1", OBJ_KEY, "region_name", "character varying",
+                true, "", false, true, false, false, true,
+                "varchar", "vdom-obs", "INFERRED", Instant.now(), Instant.now()));
+        repository.domainByKey = new ValueDomain("vdom-obs", "conn-1", "retail_core",
+                "stores.region_name", "OBSERVED", false, json.toString(), Instant.now());
+
+        Map<String, Object> ctx = service.operationalContext(
+                List.of("PLATFORM"), List.of("conn-1"), "q");
+
+        String entityContext = (String) ctx.get("entityContext");
+        assertTrue(entityContext.contains("| …"), "overflow marker after 20 values");
+        assertFalse(entityContext.contains("v21"), "values beyond the render cap are not shown");
+    }
 
     @Test
     void operationalContextRendersDomainValuesInsteadOfOpaqueType() {
@@ -189,7 +481,7 @@ class ValueDomainDiscoveryTest {
         repository.existingColumns = List.of(new DataColumn(
                 "col-1", OBJ_KEY, "status", "USER-DEFINED",
                 false, "", false, true, false, false, true,
-                "store_status", "vdom-123", Instant.now(), Instant.now()));
+                "store_status", "vdom-123", "INFERRED", Instant.now(), Instant.now()));
         repository.domainByKey = new ValueDomain("vdom-123", "conn-1", "retail_core",
                 "store_status", "ENUM", true,
                 "[\"open\",\"temporarily_closed\",\"seasonal\",\"under_construction\",\"closed\"]",

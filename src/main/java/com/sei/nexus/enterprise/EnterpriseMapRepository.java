@@ -144,8 +144,8 @@ public class EnterpriseMapRepository {
                     (column_key, object_key, column_name, data_type, is_nullable,
                      business_meaning, is_identifier, is_status, is_error,
                      is_sensitive, is_filterable, udt_name, value_domain_key,
-                     created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     role_source, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (object_key, column_name) DO UPDATE SET
                     data_type        = EXCLUDED.data_type,
                     is_nullable      = EXCLUDED.is_nullable,
@@ -162,6 +162,7 @@ public class EnterpriseMapRepository {
                     is_filterable    = EXCLUDED.is_filterable,
                     udt_name         = EXCLUDED.udt_name,
                     value_domain_key = EXCLUDED.value_domain_key,
+                    role_source      = EXCLUDED.role_source,
                     updated_at       = NOW()
                 """,
                 col.columnKey(), col.objectKey(), col.columnName(), col.dataType(),
@@ -169,10 +170,13 @@ public class EnterpriseMapRepository {
                 col.isIdentifier(), col.isStatus(), col.isError(),
                 col.isSensitive(), col.isFilterable(),
                 col.udtName(), col.valueDomainKey(),
+                col.roleSource() != null ? col.roleSource() : DataColumn.ROLE_INFERRED,
                 Timestamp.from(col.createdAt() != null ? col.createdAt() : Instant.now()),
                 Timestamp.from(col.updatedAt() != null ? col.updatedAt() : Instant.now()));
     }
 
+    /** Human role assertion (PRO-29): the edit is CONFIRMED — authoritative over
+     *  every producer; scans never recompute these flags away. */
     public void updateColumn(String objectKey, String columnName, String businessMeaning,
                              boolean isIdentifier, boolean isStatus, boolean isError,
                              boolean isSensitive, boolean isFilterable) {
@@ -184,6 +188,7 @@ public class EnterpriseMapRepository {
                        is_error         = ?,
                        is_sensitive     = ?,
                        is_filterable    = ?,
+                       role_source      = 'CONFIRMED',
                        updated_at       = NOW()
                  WHERE object_key = ? AND column_name = ?
                 """, businessMeaning, isIdentifier, isStatus, isError,
@@ -339,6 +344,7 @@ public class EnterpriseMapRepository {
                 rs.getBoolean("is_filterable"),
                 rs.getString("udt_name"),
                 rs.getString("value_domain_key"),
+                rs.getString("role_source"),
                 toInstant(rs, "created_at"),
                 toInstant(rs, "updated_at"));
     }

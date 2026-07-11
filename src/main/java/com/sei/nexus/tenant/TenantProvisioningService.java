@@ -79,6 +79,28 @@ public class TenantProvisioningService {
         this.httpClient       = HttpClient.newHttpClient();
     }
 
+    // ── Schema catch-up (used at startup by TenantSchemaMigrator) ─────────────
+
+    /**
+     * Applies all pending Flyway migrations to an existing tenant schema.
+     *
+     * <p>Provisioning migrates a schema only up to the version current at
+     * creation time; migrations added later never reached existing tenants
+     * (the defect surfaced by V034 — the first migration to ALTER an existing
+     * per-tenant table). This method reuses the exact provisioning Flyway
+     * configuration so the per-schema {@code flyway_schema_history} stays
+     * consistent, and Flyway itself guarantees only pending versions run.
+     */
+    public void migrateSchemaToLatest(String schemaName) {
+        if (schemaName == null || !SAFE_SCHEMA.matcher(schemaName).matches()) {
+            throw new IllegalArgumentException("Unsafe schema name: " + schemaName);
+        }
+        flywayFor(schemaName)
+                .target(org.flywaydb.core.api.MigrationVersion.LATEST)
+                .load()
+                .migrate();
+    }
+
     // ── Provisioning ──────────────────────────────────────────────────────────
 
     /**

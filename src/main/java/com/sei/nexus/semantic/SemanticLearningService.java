@@ -117,6 +117,45 @@ public class SemanticLearningService {
         }
     }
 
+    // ── Signal 1b: validated literal binding (PRO-33 / PRO-32 D3) ────────────
+
+    /**
+     * Captures a literal binding the planner declared and the runtime validated
+     * against a persisted Value Domain on a successful run — e.g. "TX" →
+     * {@code state_province = 'Texas'}. The binding enters the existing
+     * governed lifecycle as an ordinary {@link LearnedMapping}: repeat use
+     * reinforces it (upsert: +0.05 confidence, +1 use), and only the nightly
+     * maintenance may promote it to company vocabulary at the established
+     * thresholds. <b>Never promotes directly.</b>
+     */
+    @Async
+    public void captureLiteralBinding(String runKey, String domainKey,
+                                      String surface, String column, String value) {
+        if (surface == null || surface.isBlank()
+                || column == null || column.isBlank()
+                || value == null || value.isBlank()) {
+            return;
+        }
+        try {
+            // Bare column name in the pattern — same shape the term extractor
+            // produces and the same predicate grammar vocabulary rows use.
+            String bareColumn = column.contains(".")
+                    ? column.substring(column.lastIndexOf('.') + 1) : column;
+            String sqlPattern = bareColumn + " = '" + value.replace("'", "''") + "'";
+            // Lowercased term for stable (domain_key, business_term) dedup;
+            // BLR matching is case-insensitive, so recall is unaffected.
+            LearnedMapping mapping = new LearnedMapping(
+                    null, domainKey, surface.toLowerCase(java.util.Locale.ROOT), sqlPattern,
+                    runKey, "LITERAL_RESOLUTION", 0.5, 1,
+                    Instant.now(), false, null, null);
+            LearnedMapping saved = mappingRepository.upsert(mapping);
+            log.debug("Literal binding captured: '{}' → '{}' (key: {})",
+                    surface, sqlPattern, saved.mappingKey());
+        } catch (Exception e) {
+            log.debug("Failed to capture literal binding '{}': {}", surface, e.getMessage());
+        }
+    }
+
     // ── Signal 2: user correction ─────────────────────────────────────────────
 
     private void detectAndSaveCorrection(String correctionRunKey, String currentQuestion,

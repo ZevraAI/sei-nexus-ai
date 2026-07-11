@@ -1,0 +1,363 @@
+package com.sei.nexus.onboarding;
+
+import com.sei.nexus.enterprise.EnterpriseMapService;
+import com.sei.nexus.semantic.BusinessEntity;
+import com.sei.nexus.semantic.EntityCandidateService;
+import com.sei.nexus.semantic.RelationshipDiscoveryService;
+import com.sei.nexus.semantic.SemanticService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The canonical Metadata Registration Pipeline (PRO-21).
+ *
+ * <p>Every onboarding mechanism — the first-run Onboarding Wizard, the Semantic
+ * Layer's "Discover from DB" modal, and any future API/bulk entry point — must
+ * execute this pipeline after user approval, so metadata registration is
+ * identical regardless of entry point. Per approved entity:
+ * <ol>
+ *   <li><b>Register physical:</b> data object (deterministic key, allow-list
+ *       validated), column scan with role inference, value-domain discovery
+ *       (PRO-10), scan status, version snapshot — all via
+ *       {@link EnterpriseMapService#createOrUpdateObject}.</li>
+ *   <li><b>Register semantic, linked:</b> business entity with
+ *       {@code primary_object_key}; vocabulary with {@code entity_key} and
+ *       entity-scoped term keys.</li>
+ * </ol>
+ * then, once per batch, relationship discovery over the completed
+ * table→entity index.
+ *
+ * <p>Failure semantics: per-entity, non-fatal — but when physical registration
+ * fails, semantic registration for that table is <b>skipped</b> rather than
+ * producing an unlinked entity (the NULL-binding defect class documented in
+ * CANONICAL_METADATA_ONBOARDING_PIPELINE.md §11).
+ *
+ * <p>Bootstrap operations (suggested questions, default agent, completion flag)
+ * are NOT part of this pipeline — they remain exclusive to the wizard
+ * ({@link OnboardingService#applySelections}).
+ */
+@Service
+public class MetadataRegistrationService {
+
+    private static final Logger log = LoggerFactory.getLogger(MetadataRegistrationService.class);
+
+    // Reuse decisions below this confidence are ignored — same gate family as the
+    // learning-promotion threshold (LearningContextBuilder, conf >= 0.55).
+    private static final double REUSE_CONFIDENCE_THRESHOLD = 0.55;
+
+    private final EnterpriseMapService         enterpriseMapService;
+    private final SemanticService              semanticService;
+    private final RelationshipDiscoveryService relationshipDiscovery;
+    private final EntityCandidateService       entityCandidates;
+
+    public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
+                                        SemanticService semanticService,
+                                        RelationshipDiscoveryService relationshipDiscovery,
+                                        EntityCandidateService entityCandidates) {
+        this.enterpriseMapService  = enterpriseMapService;
+        this.semanticService       = semanticService;
+        this.relationshipDiscovery = relationshipDiscovery;
+        this.entityCandidates      = entityCandidates;
+    }
+
+    /** Per-batch outcome record: counts plus per-step failure descriptions. */
+    public record RegistrationResult(int objectsCreated,
+                                     int entitiesCreated,
+                                     int vocabCreated,
+                                     int relationshipsDiscovered,
+                                     List<String> failures) {}
+
+    /**
+     * Executes the pipeline for a batch of approved entity drafts.
+     *
+     * <p>Request shape (identical for every entry point):
+     * {@code connectionKey, schemaName, domainKey, entities[]} where each entity
+     * carries {@code approved, tableName, entityKey, entityName, purpose,
+     * operationalMeaning, investigationHints, vocabulary[]} and optionally the
+     * AI-analyzed data-object fields ({@code businessName, identifierColumns,
+     * statusColumns, exceptionColumns, safeFilterColumns, usageGuidance,
+     * filterGuidance, avoidGuidance}) — all of which have existing consumers in
+     * {@link EnterpriseMapService#createOrUpdateObject}.
+     */
+    @SuppressWarnings("unchecked")
+    public RegistrationResult register(Map<String, Object> request, String userEmail) {
+        String connectionKey = (String) request.get("connectionKey");
+        String schemaName    = (String) request.get("schemaName");
+        String domainKey     = (String) request.get("domainKey");
+        List<Map<String, Object>> entities =
+                (List<Map<String, Object>>) request.getOrDefault("entities", List.of());
+
+        int objectsCreated  = 0;
+        int entitiesCreated = 0;
+        int vocabCreated    = 0;
+        List<String> failures = new ArrayList<>();
+
+        for (Map<String, Object> entity : entities) {
+            if (!Boolean.TRUE.equals(entity.get("approved"))) continue;
+
+            String tableName  = (String) entity.get("tableName");
+            String entityKey  = (String) entity.getOrDefault("entityKey", slugify(tableName));
+            String entityName = (String) entity.getOrDefault("entityName", toTitleCase(tableName));
+            String purpose    = (String) entity.getOrDefault("purpose", "");
+            String opMeaning  = (String) entity.getOrDefault("operationalMeaning", "");
+            String hints      = (String) entity.getOrDefault("investigationHints", "");
+
+            // 1. Register physical: data object + columns + value domains + version.
+            //    Failure here skips semantic registration for this table — an entity
+            //    without primary_object_key is invisible to planner schema, PRO-19
+            //    bindings, and graph table labels, so creating it silently would
+            //    reproduce the Discover-path defect.
+            String objectKey;
+            try {
+                Map<String, Object> objBody = new LinkedHashMap<>();
+                objBody.put("domainKey",     domainKey);
+                objBody.put("connectionKey", connectionKey);
+                objBody.put("schemaName",    schemaName);
+                objBody.put("tableName",     tableName);
+                objBody.put("entityName",    entityName);
+                objBody.put("businessName",  strOrDefault(entity.get("businessName"), entityName + "s"));
+                objBody.put("purpose",       purpose);
+                putCsvIfPresent(objBody, "identifierColumns", entity.get("identifierColumns"));
+                putCsvIfPresent(objBody, "statusColumns",     entity.get("statusColumns"));
+                putCsvIfPresent(objBody, "exceptionColumns",  entity.get("exceptionColumns"));
+                putCsvIfPresent(objBody, "safeFilterColumns", entity.get("safeFilterColumns"));
+                putStrIfPresent(objBody, "usageGuidance",     entity.get("usageGuidance"));
+                putStrIfPresent(objBody, "filterGuidance",    entity.get("filterGuidance"));
+                putStrIfPresent(objBody, "avoidGuidance",     entity.get("avoidGuidance"));
+
+                var dataObj = enterpriseMapService.createOrUpdateObject(objBody, userEmail);
+                objectKey = dataObj.objectKey();
+                objectsCreated++;
+            } catch (Exception e) {
+                log.warn("Failed to register data object for {}: {}", tableName, e.getMessage());
+                failures.add("data object " + tableName + ": " + e.getMessage());
+                continue;
+            }
+
+            // 2. Business Entity selection (PRO-22): tier 0 deterministic binding
+            //    lookup, then validation of the AI's constrained REUSE decision,
+            //    then CREATE with a collision guard. Integrity checks only — the
+            //    reuse-vs-create judgment was made by the AI over the offered set.
+            EntitySelection selection = selectEntity(domainKey, objectKey, tableName,
+                    entity, entityKey, failures);
+            String resolvedKey  = selection.entityKey();
+            // A reused entity keeps its curated name — a drifted AI name must not
+            // rename the existing concept; descriptions/meanings refresh as usual.
+            String resolvedName = selection.reused() ? selection.existingName() : entityName;
+
+            // 3. Register semantic, linked: entity bound to its table.
+            try {
+                Map<String, Object> entityBody = new LinkedHashMap<>();
+                entityBody.put("entityKey",          resolvedKey);
+                entityBody.put("entityName",         resolvedName);
+                entityBody.put("description",        purpose);
+                entityBody.put("operationalMeaning", opMeaning);
+                entityBody.put("investigationHints", hints);
+                entityBody.put("domainKey",          domainKey);
+                entityBody.put("status",             "ACTIVE");
+                entityBody.put("primaryObjectKey",   objectKey);
+                semanticService.createOrUpdateEntity(entityBody, userEmail);
+                entitiesCreated++;
+            } catch (Exception e) {
+                log.warn("Failed to register entity {}: {}", resolvedKey, e.getMessage());
+                failures.add("entity " + resolvedKey + ": " + e.getMessage());
+            }
+
+            // 4. Vocabulary bound to the resolved entity; term keys scoped per
+            //    entity so the same business word on two entities never collides.
+            List<Map<String, Object>> vocab =
+                    (List<Map<String, Object>>) entity.getOrDefault("vocabulary", List.of());
+            for (Map<String, Object> term : vocab) {
+                if (!Boolean.TRUE.equals(term.get("approved"))) continue;
+                try {
+                    Map<String, Object> termBody = new LinkedHashMap<>();
+                    termBody.put("termKey",       slugify((String) term.get("term")) + "-" + resolvedKey);
+                    termBody.put("term",          term.get("term"));
+                    termBody.put("definition",    term.get("definition"));
+                    termBody.put("sqlEquivalent", term.getOrDefault("sqlEquivalent", ""));
+                    termBody.put("domainKey",     domainKey);
+                    termBody.put("entityKey",     resolvedKey);
+                    termBody.put("status",        "ACTIVE");
+                    semanticService.createTerm(termBody);
+                    vocabCreated++;
+                } catch (Exception e) {
+                    log.warn("Failed to register vocab term: {}", e.getMessage());
+                    failures.add("term " + term.get("term") + ": " + e.getMessage());
+                }
+            }
+        }
+
+        // 4. Relationship discovery — once per batch, after all entities exist,
+        //    so the table→entity index it consumes is complete.
+        int relationships = 0;
+        if (connectionKey != null && !connectionKey.isBlank()) {
+            try {
+                String schema = schemaName != null && !schemaName.isBlank() ? schemaName : "public";
+                relationships = relationshipDiscovery.discoverAndPersist(connectionKey, schema, domainKey);
+                log.info("Auto-discovered {} relationships for domain '{}'", relationships, domainKey);
+            } catch (Exception e) {
+                log.warn("Relationship auto-discovery failed (non-fatal): {}", e.getMessage());
+                failures.add("relationship discovery: " + e.getMessage());
+            }
+        }
+
+        return new RegistrationResult(objectsCreated, entitiesCreated, vocabCreated,
+                relationships, List.copyOf(failures));
+    }
+
+    // ── Business Entity selection (PRO-22) ───────────────────────────────────
+
+    /** Outcome of entity selection: the identity to register under, and — when an
+     *  existing entity is reused — its curated name, which must be preserved. */
+    record EntitySelection(String entityKey, String existingName, boolean reused) {}
+
+    /**
+     * Selects the Business Entity identity for a freshly registered data object:
+     * <ol>
+     *   <li><b>Tier 0:</b> an ACTIVE entity already bound to this object key is
+     *       reused unconditionally — deterministic identity outranks any AI
+     *       decision.</li>
+     *   <li><b>Tier 2 validation:</b> an AI {@code entityResolution} REUSE decision
+     *       is honored only if the key was in the candidate set retrievable for this
+     *       table, the entity exists, is ACTIVE, is in this domain, its binding is
+     *       empty or already this object, and confidence clears the threshold.</li>
+     *   <li><b>CREATE (default):</b> the drafted key, suffixed deterministically if
+     *       it collides with an entity bound to a <em>different</em> table — a name
+     *       collision must never silently merge two distinct concepts.</li>
+     * </ol>
+     * Every rejected reuse degrades to CREATE and is recorded — selection never
+     * blocks registration.
+     */
+    private EntitySelection selectEntity(String domainKey, String objectKey, String tableName,
+            Map<String, Object> entity, String draftedKey, List<String> failures) {
+
+        // Tier 0 — deterministic binding lookup, before any AI opinion
+        var bound = entityCandidates.findBoundEntity(objectKey);
+        if (bound.isPresent()) {
+            return new EntitySelection(bound.get().entityKey(), bound.get().entityName(), true);
+        }
+
+        // Tier 2 — validate the AI's constrained decision, if one was made
+        Object resolution = entity.get("entityResolution");
+        if (resolution instanceof Map<?, ?> res
+                && "REUSE".equalsIgnoreCase(String.valueOf(res.get("decision")))) {
+            String selectedKey = res.get("entityKey") != null
+                    ? String.valueOf(res.get("entityKey")).trim() : null;
+            double confidence = parseConfidence(res.get("confidence"));
+
+            if (selectedKey == null || selectedKey.isBlank()) {
+                failures.add("entity reuse for " + tableName + " rejected: no entityKey returned");
+            } else if (confidence < REUSE_CONFIDENCE_THRESHOLD) {
+                failures.add("entity reuse for " + tableName + " rejected: confidence "
+                        + confidence + " below " + REUSE_CONFIDENCE_THRESHOLD);
+            } else {
+                String rejection = validateReuse(domainKey, objectKey, tableName, selectedKey);
+                if (rejection == null) {
+                    BusinessEntity existing = entityCandidates.findEntity(selectedKey).orElseThrow();
+                    return new EntitySelection(selectedKey, existing.entityName(), true);
+                }
+                failures.add("entity reuse for " + tableName + " rejected: " + rejection);
+            }
+        }
+
+        // CREATE — collision guard: never let a drifted name overwrite an entity
+        // that is bound to a different table (uniqueSlug pattern).
+        String key = draftedKey;
+        int suffix = 2;
+        while (true) {
+            var existing = entityCandidates.findEntity(key);
+            if (existing.isEmpty()) break;
+            String otherBinding = existing.get().primaryObjectKey();
+            if (otherBinding == null || otherBinding.isBlank() || otherBinding.equals(objectKey)) break;
+            key = draftedKey + "-" + suffix++;
+        }
+        if (!key.equals(draftedKey)) {
+            failures.add("entity key collision for " + tableName + ": '" + draftedKey
+                    + "' is bound to another table; created as '" + key + "'");
+        }
+        return new EntitySelection(key, null, false);
+    }
+
+    /** Integrity checks for an AI-selected reuse key; returns a rejection reason or null. */
+    private String validateReuse(String domainKey, String objectKey, String tableName, String selectedKey) {
+        boolean offered = entityCandidates.retrieve(domainKey, tableName).stream()
+                .anyMatch(c -> c.entityKey().equals(selectedKey));
+        if (!offered) return "'" + selectedKey + "' was not in the offered candidate set";
+
+        var existing = entityCandidates.findEntity(selectedKey);
+        if (existing.isEmpty()) return "'" + selectedKey + "' does not exist";
+        if ("ARCHIVED".equalsIgnoreCase(existing.get().status())) return "'" + selectedKey + "' is archived";
+        if (domainKey != null && !domainKey.equals(existing.get().domainKey())) {
+            return "'" + selectedKey + "' belongs to domain " + existing.get().domainKey();
+        }
+        String binding = existing.get().primaryObjectKey();
+        if (binding != null && !binding.isBlank() && !binding.equals(objectKey)) {
+            return "'" + selectedKey + "' is already bound to " + binding + " — refusing to rebind";
+        }
+        return null;
+    }
+
+    private static double parseConfidence(Object value) {
+        if (value == null) return 0.0;
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return 0.0;
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /** Accepts the AI's list form or an already-joined string; stores CSV, the
+     *  format {@code scanAndSaveColumns} splits on. */
+    private static void putCsvIfPresent(Map<String, Object> body, String key, Object value) {
+        if (value == null) return;
+        String csv;
+        if (value instanceof List<?> list) {
+            List<String> parts = new ArrayList<>();
+            for (Object o : list) if (o != null && !o.toString().isBlank()) parts.add(o.toString().trim());
+            csv = String.join(",", parts);
+        } else {
+            csv = value.toString().trim();
+        }
+        if (!csv.isBlank()) body.put(key, csv);
+    }
+
+    private static void putStrIfPresent(Map<String, Object> body, String key, Object value) {
+        if (value != null && !value.toString().isBlank()) body.put(key, value.toString());
+    }
+
+    private static String strOrDefault(Object value, String def) {
+        return value != null && !value.toString().isBlank() ? value.toString() : def;
+    }
+
+    /** Single Java slugify for entity/term identity (moved from OnboardingService;
+     *  length cap now measured on the transformed string, not the input). */
+    static String slugify(String input) {
+        if (input == null) return "entity";
+        String slug = input.toLowerCase()
+                           .replaceAll("[^a-z0-9]+", "-")
+                           .replaceAll("^-+|-+$", "");
+        return slug.substring(0, Math.min(slug.length(), 80));
+    }
+
+    static String toTitleCase(String input) {
+        if (input == null || input.isBlank()) return "Entity";
+        String[] words = input.replace('_', ' ').replace('-', ' ').split("\\s+");
+        StringBuilder sb = new StringBuilder();
+        for (String w : words) {
+            if (!w.isEmpty()) {
+                sb.append(Character.toUpperCase(w.charAt(0)));
+                if (w.length() > 1) sb.append(w.substring(1).toLowerCase());
+                sb.append(' ');
+            }
+        }
+        return sb.toString().trim();
+    }
+}

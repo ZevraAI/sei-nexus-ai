@@ -227,6 +227,55 @@ public class DynamicSqlService {
     }
 
     /**
+     * Samples the distinct non-null values of a single column — the probe behind
+     * OBSERVED value-domain discovery (PRO-24). The caller passes {@code limit} =
+     * cardinality cap + 1: receiving {@code limit} rows means the column is
+     * high-cardinality and gets no domain.
+     *
+     * <p>Same posture as {@link #listEnumDomains}: source-DB read, query timeout,
+     * failures return an empty list — a probe must never break a column scan.
+     * Identifiers come from {@code information_schema} (not user input) and are
+     * quoted per dialect (Oracle uses FETCH FIRST; LIMIT elsewhere).
+     */
+    public List<String> listDistinctValues(String connectionKey, String schemaName,
+                                            String tableName, String columnName, int limit) {
+        NexusConnection conn = requireConnection(connectionKey);
+        String secret = conn.encryptedSecret(); // PRODUCTION: decrypt via Vault here
+
+        String sql;
+        if ("ORACLE".equalsIgnoreCase(conn.connectionType())) {
+            sql = "SELECT DISTINCT " + columnName.toUpperCase()
+                    + " FROM " + schemaName.toUpperCase() + "." + tableName.toUpperCase()
+                    + " WHERE " + columnName.toUpperCase() + " IS NOT NULL"
+                    + " FETCH FIRST " + limit + " ROWS ONLY";
+        } else {
+            sql = "SELECT DISTINCT \"" + columnName + "\""
+                    + " FROM \"" + schemaName + "\".\"" + tableName + "\""
+                    + " WHERE \"" + columnName + "\" IS NOT NULL"
+                    + " LIMIT " + limit;
+        }
+
+        List<String> values = new ArrayList<>();
+        try (Connection jdbc = DriverManager.getConnection(
+                conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String v = rs.getString(1);
+                    if (v != null) values.add(v);
+                }
+            }
+        } catch (SQLException ex) {
+            log.warn("Observed-value probe failed for {}.{}.{}: {}",
+                    schemaName, tableName, columnName, ex.getMessage());
+            return List.of();
+        }
+        return values;
+    }
+
+    /**
      * Returns ALL tables in the schema with column counts and a compact comma-separated
      * list of their column names — in a SINGLE database round-trip.
      *

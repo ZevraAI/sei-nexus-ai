@@ -84,17 +84,26 @@ public class ReasoningEngine {
     /**
      * Result produced by a full reasoning session.
      *
-     * @param evidence        All step evidence accumulated.
-     * @param queryData       Rows from the most productive step (for frontend visualisation).
-     * @param resultSnapshot  JSON of the last sync result (for conversation memory).
-     * @param crossSource     True when data from more than one database was used.
+     * @param evidence          All step evidence accumulated.
+     * @param queryData         Rows from the most productive step (for frontend visualisation).
+     * @param resultSnapshot    JSON of the last sync result (for conversation memory).
+     * @param crossSource       True when data from more than one database was used.
+     * @param validatedBindings Literal bindings the planner declared that passed
+     *                          deterministic domain validation on a step that
+     *                          executed successfully (PRO-33) — the trace and
+     *                          learning-capture payload.
      */
     public record ReasoningResult(
             EvidenceStore          evidence,
             List<Map<String, Object>> queryData,
             String                 resultSnapshot,
-            boolean                crossSource
+            boolean                crossSource,
+            List<ValidatedBinding> validatedBindings
     ) {}
+
+    /** A planner-declared literal resolution confirmed against a persisted domain. */
+    public record ValidatedBinding(String surface, String column, String value,
+                                   boolean authoritative) {}
 
     /**
      * Run the iterative reasoning loop for a single user question.
@@ -103,17 +112,25 @@ public class ReasoningEngine {
      * @param enrichedQ   Enriched version that may include uploaded file content.
      * @param sessionKey  Reasoning session key (already created by the caller).
      * @param schemaCtx   Approved schema context string for the planner.
-     * @param runKey      Parent run key — used for governance audit events.
-     * @param userEmail   Authenticated user.
-     * @param forceAsync  If true, heavy steps are queued for async execution.
+     * @param runKey       Parent run key — used for governance audit events.
+     * @param userEmail    Authenticated user.
+     * @param forceAsync   If true, heavy steps are queued for async execution.
+     * @param literalScope Domain-bearing columns in scope for deterministic
+     *                     literal validation (PRO-33); null/empty disables the
+     *                     gate and reproduces pre-DLR behavior exactly.
      */
     public ReasoningResult reason(String question, String enrichedQ, String sessionKey,
                                   String schemaCtx, String runKey, String userEmail,
-                                  boolean forceAsync) {
+                                  boolean forceAsync,
+                                  Map<String, LiteralValidator.DomainInfo> literalScope) {
 
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
         int           stepNo         = 1;
+        // PRO-33 retry memory: (column, literal) pairs already rejected once —
+        // the "re-prompted once" bound of PRO-32 §5.
+        Set<String>            literalRejections = new HashSet<>();
+        List<ValidatedBinding> validatedBindings = new ArrayList<>();
 
         while (stepNo <= MAX_STEPS) {
             // ── 1. Plan the next step ─────────────────────────────────────────
@@ -127,6 +144,45 @@ public class ReasoningEngine {
             eventBus.publish(runKey, "step_started", Map.of(
                     "stepNo",      stepNo,
                     "description", plan.description()));
+
+            // ── 1b. Deterministic literal validation (PRO-33 / PRO-32 §5) ────
+            // Rejects-never-rewrites: an invalid literal on a domain-bearing
+            // column sends the exact legal list back through this same loop as
+            // evidence (one re-prompt); a repeat violation hard-blocks only on
+            // authoritative (complete) domains. Fail-open on validator errors.
+            if (literalScope != null && !literalScope.isEmpty()) {
+                try {
+                    LiteralValidator.Result lit = LiteralValidator.validate(
+                            plan.sql(), plan.literalBindings(), literalScope, enrichedQ);
+                    if (!lit.valid()) {
+                        var decision = LiteralValidator.decide(lit.violations(), literalRejections);
+                        if (decision.hardBlock()) {
+                            evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                                    List.of(), plan.rationale(), "LITERAL_BLOCKED", decision.message(), 0L);
+                            saveStep(sessionKey, stepNo, plan, "LITERAL_BLOCKED", decision.message(),
+                                    evidence, List.of(), null);
+                            eventBus.publish(runKey, "step_blocked",
+                                    Map.of("stepNo", stepNo, "reason", decision.message()));
+                            break;
+                        }
+                        if (decision.reject()) {
+                            log.info("Step {} literal-rejected for run '{}': {}",
+                                    stepNo, runKey, decision.message());
+                            evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                                    List.of(), plan.rationale(), "LITERAL_REJECTED", decision.message(), 0L);
+                            saveStep(sessionKey, stepNo, plan, "LITERAL_REJECTED", decision.message(),
+                                    evidence, List.of(), null);
+                            eventBus.publish(runKey, "step_error",
+                                    Map.of("stepNo", stepNo, "reason", decision.message()));
+                            stepNo++;
+                            continue;   // planner sees the legal list and retries
+                        }
+                        // all violations advisory-exhausted: execute honestly
+                    }
+                } catch (Exception ve) {
+                    log.warn("Literal validation failed open for step {}: {}", stepNo, ve.getMessage());
+                }
+            }
 
             // ── 2. Validate the connection ────────────────────────────────────
             if (connectionRepository.findByKeyOrName(plan.connectionKey()).isEmpty()) {
@@ -197,6 +253,20 @@ public class ReasoningEngine {
                 auditCtx.rowCount(rows.size()).executionMs((int) elapsed);
                 auditService.record(auditCtx, false);
 
+                // ── PRO-33: declared bindings confirmed against a persisted
+                // domain on a step that actually executed — trace + learning.
+                if (literalScope != null && plan.literalBindings() != null) {
+                    for (ReasoningPlanner.LiteralBinding b : plan.literalBindings()) {
+                        LiteralValidator.DomainInfo d =
+                                LiteralValidator.lookup(literalScope, b.column());
+                        if (d != null && d.values().contains(b.value())) {
+                            ValidatedBinding vb = new ValidatedBinding(
+                                    b.surface(), d.qualifiedColumn(), b.value(), d.authoritative());
+                            if (!validatedBindings.contains(vb)) validatedBindings.add(vb);
+                        }
+                    }
+                }
+
                 // ── 6. Evaluate ───────────────────────────────────────────────
                 ReasoningEvaluator.EvaluationResult eval = evaluator.evaluate(question, buildTempEvidence(evidence, stepNo, plan, rows, elapsed));
                 evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
@@ -237,7 +307,8 @@ public class ReasoningEngine {
         boolean crossSource = evidence.connectionKeys().size() > 1;
         reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED", null, 0.8, Instant.now());
 
-        return new ReasoningResult(evidence, queryData, resultSnapshot, crossSource);
+        return new ReasoningResult(evidence, queryData, resultSnapshot, crossSource,
+                List.copyOf(validatedBindings));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

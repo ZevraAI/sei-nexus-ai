@@ -36,7 +36,9 @@ import com.sei.nexus.agentrunner.AgentRunner;
 import com.sei.nexus.agentrunner.ZevraAgent;
 import com.sei.nexus.agentrunner.ZevraAgentRouter;
 import com.sei.nexus.agentrunner.ZevraSession;
+import com.sei.nexus.semantic.BusinessLanguageResolver;
 import com.sei.nexus.semantic.LearningContextBuilder;
+import com.sei.nexus.semantic.ResolvedQuestion;
 import com.sei.nexus.semantic.SemanticLearningService;
 import com.sei.nexus.semantic.SemanticService;
 import com.sei.nexus.sql.DynamicSqlService;
@@ -89,6 +91,8 @@ public class ChatService {
     // ── Zevra Agentic AI routing ──────────────────────────────────────────────
     private final ZevraAgentRouter         zevraAgentRouter;
     private final AgentRunner              agentRunner;
+    // ── Business Language Resolution (PRO-31) ────────────────────────────────
+    private final BusinessLanguageResolver businessLanguageResolver;
 
     // Max characters for entity schema context per LLM call.
     // Configurable via nexus.context.max-entity-chars — keeps prompts lean
@@ -122,7 +126,8 @@ public class ChatService {
                        SemanticLearningService semanticLearningService,
                        LearningContextBuilder learningContextBuilder,
                        ZevraAgentRouter zevraAgentRouter,
-                       AgentRunner agentRunner) {
+                       AgentRunner agentRunner,
+                       BusinessLanguageResolver businessLanguageResolver) {
         this.runRepository            = runRepository;
         this.documentMemoryService    = documentMemoryService;
         this.enterpriseMapService     = enterpriseMapService;
@@ -150,6 +155,7 @@ public class ChatService {
         this.learningContextBuilder   = learningContextBuilder;
         this.zevraAgentRouter         = zevraAgentRouter;
         this.agentRunner              = agentRunner;
+        this.businessLanguageResolver = businessLanguageResolver;
     }
 
     // =========================================================================
@@ -266,12 +272,24 @@ public class ChatService {
             List<String> domainKeys = toDomainKeyList(agent);
             List<String> connKeys = toConnKeyList(agent);
 
+            // STEP 5b: Business Language Resolution (PRO-31) — deterministic,
+            // domain-scoped, annotate-never-substitute. Runs once, after agent
+            // routing (needs the domain scope), before every keyword-dependent
+            // stage. `raw` is never modified; resolutions annotate it. On any
+            // failure or zero matches this is empty and the whole pipeline
+            // behaves byte-identically to the pre-BLR behavior.
+            ResolvedQuestion resolved = businessLanguageResolver.resolve(raw, domainKeys);
+
             // STEP 6: Memory retrieval — semantic search on the user's intent, not the file
             List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(raw, domainKeys);
 
-            // STEP 7: Enterprise + Semantic + Anomaly + Findings context
+            // STEP 7: Enterprise + Semantic + Anomaly + Findings context.
+            // The semantic context also carries entity/vocabulary → table bindings,
+            // the primary relevance signal for planner context assembly (PRO-19).
             Map<String, Object> entCtx = enterpriseMapService.operationalContext(domainKeys, connKeys, raw);
-            String semCtx = semanticService.buildSemanticContext(domainKeys, raw);
+            SemanticService.SemanticContext semantic =
+                    semanticService.semanticContextWithBindings(domainKeys, raw);
+            String semCtx = semantic.contextText();
             List<OperationalFinding> findings = reasoningRepository.findRecentFindings(domainKeys, 5);
             String anomalyCtx = baselineService.getAnomalyContext(domainKeys);
 
@@ -291,8 +309,8 @@ public class ChatService {
             // STEP 10: LLM decision — routes on user intent (raw), not file content.
             // This is the key: the router sees "do these orders exist in the system?" and
             // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
-            Map<String, Object> decision = getLlmDecision(raw, memChunks, entCtx, semCtx,
-                    findings, anomalyCtx, history, priorSnapshot.isPresent(), agent);
+            Map<String, Object> decision = getLlmDecision(raw, memChunks, entCtx, semantic,
+                    findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
@@ -301,6 +319,22 @@ public class ChatService {
             List<Map<String, Object>> reasoningSteps   = new ArrayList<>();
             List<String>              learningsApplied  = new ArrayList<>();
             String resultSnapshot = null;
+
+            // ── PRO-31 explainability: every successful resolution joins the
+            // reasoning trace, regardless of decision type, so users can see
+            // exactly how their business language was interpreted and from
+            // which tier the mapping came.
+            for (ResolvedQuestion.Resolution r : resolved.resolutions()) {
+                reasoningSteps.add(Map.of(
+                        "stepNo",      0,
+                        "type",        "resolution",
+                        "description", "\"" + r.surface() + "\" → " + r.target(),
+                        "surface",     r.surface(),
+                        "kind",        r.kind().label(),
+                        "target",      r.target(),
+                        "tier",        r.tier(),
+                        "source",      r.sourceLabel()));
+            }
 
             switch (decisionType) {
                 case "ANSWER_FROM_PRIOR_RESULTS" -> {
@@ -349,8 +383,8 @@ public class ChatService {
                         List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
                         if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
                     }
-                    String schemaCtx = buildContextSummary(raw, memChunks, entCtx, semCtx, findings,
-                            anomalyCtx, false, history, agent);
+                    String schemaCtx = buildContextSummary(raw, memChunks, entCtx, semantic, findings,
+                            anomalyCtx, false, history, agent, resolved);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
                     // ── Phase 3: inject learned business vocabulary into the planner context ──
@@ -367,7 +401,8 @@ public class ChatService {
                     // governance chain, evaluates whether the evidence is sufficient, and
                     // continues until the evaluator says SUFFICIENT, DEAD_END, or MAX_STEPS.
                     ReasoningEngine.ReasoningResult reasonResult = reasoningEngine.reason(
-                            raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync);
+                            raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync,
+                            buildLiteralScope(resolved));
 
                     resultSnapshot = reasonResult.resultSnapshot();
                     queryData      = reasonResult.queryData();
@@ -394,6 +429,32 @@ public class ChatService {
                                 runKey, raw, bestSql, agentDomainKey, conversationId);
                     }
 
+                    // ── PRO-33: successful validated literal bindings enter the
+                    // existing governed learning lifecycle (LearnedMapping upsert
+                    // → nightly thresholds → review) — never auto-promoted here.
+                    for (ReasoningEngine.ValidatedBinding vb : reasonResult.validatedBindings()) {
+                        semanticLearningService.captureLiteralBinding(
+                                runKey, agentDomainKey, vb.surface(), vb.column(), vb.value());
+                    }
+
+                    // ── PRO-33 explainability: validated literal bindings join the
+                    // trace beside BLR's resolution entries — "TX" → Texas, chosen
+                    // by the AI from offered values and validated against the domain.
+                    for (ReasoningEngine.ValidatedBinding vb : reasonResult.validatedBindings()) {
+                        reasoningSteps.add(Map.of(
+                                "stepNo",      0,
+                                "type",        "literal",
+                                "description", "\"" + vb.surface() + "\" → " + vb.column()
+                                                + " = '" + vb.value() + "'",
+                                "surface",     vb.surface(),
+                                "column",      vb.column(),
+                                "value",       vb.value(),
+                                "outcome",     "validated",
+                                "source",      vb.authoritative()
+                                        ? "AI choice (validated: legal values)"
+                                        : "AI choice (validated: observed values)"));
+                    }
+
                     // Collect step summaries for the frontend reasoning trace
                     for (EvidenceStore.StepEvidence s : reasonResult.evidence().getSteps()) {
                         reasoningSteps.add(Map.of(
@@ -416,7 +477,12 @@ public class ChatService {
             runRepository.saveEvidence(Keys.uniqueKey("ev"), runKey, "ROUTING",
                     toJson(Map.of("decision_type", decisionType,
                             "agent", agent != null ? agent.agentKey() : "none",
-                            "memory_chunks", memChunks.size())));
+                            "memory_chunks", memChunks.size(),
+                            // PRO-31: resolution provenance joins the audit trail
+                            "resolutions", resolved.resolutions().stream()
+                                    .map(r -> "\"" + r.surface() + "\" = " + r.kind().label()
+                                            + ": " + r.target() + " [" + r.tier() + "]")
+                                    .toList())));
 
             List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, raw);
             return buildResponse(conversationId, runKey, answer, decisionType,
@@ -473,43 +539,67 @@ public class ChatService {
     // LLM decision
     // =========================================================================
 
-    private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
-            Map<String, Object> entCtx, String semCtx, List<OperationalFinding> findings,
-            String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent) {
-        try {
-            String ctx = buildContextSummary(question, memChunks, entCtx, semCtx, findings, anomalyCtx, hasPrior, history, agent);
-            String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
-            String sys = """
-                    You are the SEI Nexus orchestration engine. Decide the best answer mode.
-                    Return JSON only:
-                    {
-                      "type": "ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP|ANSWER_FROM_PRIOR_RESULTS",
-                      "intentType": "OPERATIONAL_INVESTIGATION|ANALYTICAL|INFORMATIONAL|FOLLOW_UP",
-                      "requiresExecution": true,
-                      "requiresMemory": true,
-                      "requiresClarification": false,
-                      "clarification_question": ""
-                    }
+    /**
+     * Decision-router system prompt. Package-private constant so tests can pin
+     * the routing contract.
+     *
+     * <p>Rule 7 is the PRO-34 fix: the LITERAL CANDIDATES section (PRO-32/33)
+     * renders into this router's context too, and its text — "matched no known
+     * term" plus the planner-directed clarification instruction — read, to a
+     * router with no rule about it, like grounds for ASK_CLARIFICATION. That
+     * pre-empted the approved flow: the SQL planner (which owns the
+     * constrained literal choice) never ran. Rule 7 makes the section's
+     * meaning explicit at the routing layer: candidates present ⇒ the term is
+     * resolvable downstream ⇒ route to live data.
+     */
+    static final String DECISION_SYSTEM_PROMPT = """
+            You are the SEI Nexus orchestration engine. Decide the best answer mode.
+            Return JSON only:
+            {
+              "type": "ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP|ANSWER_FROM_PRIOR_RESULTS",
+              "intentType": "OPERATIONAL_INVESTIGATION|ANALYTICAL|INFORMATIONAL|FOLLOW_UP",
+              "requiresExecution": true,
+              "requiresMemory": true,
+              "requiresClarification": false,
+              "clarification_question": ""
+            }
 
-                    Routing rules (in priority order):
-                    1. Use ANSWER_FROM_PRIOR_RESULTS ONLY when the question is specifically asking about
-                       the previous answer itself — not new data. Examples: "explain that", "show me the SQL
-                       you used", "how did you get that number", "why that result", "are you sure",
-                       "what query ran", "break down that specific number".
-                       DO NOT use this for any question that asks for new data, a different metric,
-                       a different filter, or a different entity — even if it is in the same conversation.
-                    2. Use QUERY_LIVE_DATA if the question needs fresh data from the database — including
-                       follow-up questions that ask for different metrics, different filters, or different
-                       entities than what was previously returned.
-                    3. Use ANSWER_FROM_MEMORY if document memory can answer without live data.
-                    4. Use HYBRID_DOC_AND_DATA for complex questions needing both memory and live data.
-                    5. Use KNOWLEDGE_GAP if no knowledge or data sources are available at all.
-                    6. Use ASK_CLARIFICATION ONLY if the question is completely ambiguous AND there is no prior conversation context.
-                    Key rule: when in doubt between ANSWER_FROM_PRIOR_RESULTS and QUERY_LIVE_DATA,
-                    always choose QUERY_LIVE_DATA. It is always better to query fresh data than to
-                    give a wrong answer from stale results.
-                    """;
-            String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), sys);
+            Routing rules (in priority order):
+            1. Use ANSWER_FROM_PRIOR_RESULTS ONLY when the question is specifically asking about
+               the previous answer itself — not new data. Examples: "explain that", "show me the SQL
+               you used", "how did you get that number", "why that result", "are you sure",
+               "what query ran", "break down that specific number".
+               DO NOT use this for any question that asks for new data, a different metric,
+               a different filter, or a different entity — even if it is in the same conversation.
+            2. Use QUERY_LIVE_DATA if the question needs fresh data from the database — including
+               follow-up questions that ask for different metrics, different filters, or different
+               entities than what was previously returned.
+            3. Use ANSWER_FROM_MEMORY if document memory can answer without live data.
+            4. Use HYBRID_DOC_AND_DATA for complex questions needing both memory and live data.
+            5. Use KNOWLEDGE_GAP if no knowledge or data sources are available at all.
+            6. Use ASK_CLARIFICATION ONLY if the question is completely ambiguous AND there is no prior conversation context.
+            7. A LITERAL CANDIDATES section means an unfamiliar term in the question already has
+               stored candidate values — the SQL planner will choose the exact value and the runtime
+               will validate it. Such a question is NOT ambiguous: use QUERY_LIVE_DATA. Do NOT use
+               ASK_CLARIFICATION for a term that has literal candidates; clarification for those
+               terms belongs to the SQL planner only when none of the offered values fits.
+            Key rule: when in doubt between ANSWER_FROM_PRIOR_RESULTS and QUERY_LIVE_DATA,
+            always choose QUERY_LIVE_DATA. It is always better to query fresh data than to
+            give a wrong answer from stale results.
+            RESOLUTIONS map the user's terms to this tenant's canonical names and values.
+            Prefer them over your own interpretation of those terms.
+            Literals filtered on columns with listed legal values MUST be copied exactly
+            from those lists or from the user's question — never invented.
+            """;
+
+    private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
+            Map<String, Object> entCtx, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent,
+            ResolvedQuestion resolved) {
+        try {
+            String ctx = buildContextSummary(question, memChunks, entCtx, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved);
+            String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
+            String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), DECISION_SYSTEM_PROMPT);
             return objectMapper.readValue(extractJson(resp),
                     new TypeReference<Map<String, Object>>() {});
         } catch (Exception e) {
@@ -526,7 +616,10 @@ public class ChatService {
             String semCtx, List<DocumentChunk> memChunks, List<OperationalFinding> findings,
             String anomalyCtx, String playbookCtx, List<NexusRun> history, NexusAgent agent) {
         try {
-            String ctx = buildContextSummary(question, memChunks, entCtx, semCtx, findings, anomalyCtx, false, history, agent);
+            String ctx = buildContextSummary(question, memChunks, entCtx,
+                    new SemanticService.SemanticContext(semCtx, List.of(), Map.of()),
+                    findings, anomalyCtx, false, history, agent,
+                    ResolvedQuestion.empty(question));
             log.info("Investigation plan context:\n{}", ctx);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx +
                     (playbookCtx.isBlank() ? "" : "\n\nPlaybook:\n" + playbookCtx);
@@ -759,38 +852,69 @@ public class ChatService {
     // =========================================================================
 
     private String buildContextSummary(String question, List<DocumentChunk> memChunks,
-            Map<String, Object> entCtx, String semCtx, List<OperationalFinding> findings,
-            String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent) {
+            Map<String, Object> entCtx, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
+            ResolvedQuestion resolved) {
         StringBuilder sb = new StringBuilder();
+        String semCtx = semantic != null ? semantic.contextText() : "";
+        java.util.Set<String> expandedTokens = resolved != null
+                ? resolved.expandedTokens() : java.util.Set.of();
 
         if (agent != null) {
             sb.append("Agent: ").append(agent.name())
               .append(" | Domain: ").append(agent.domainKeys()).append("\n\n");
         }
 
+        // ── RESOLUTIONS block (PRO-31, contract PRO-30 §6) — rendered only when
+        // at least one resolution exists, so resolution-free questions produce
+        // byte-identical context (the zero-cost guarantee). The original question
+        // is never rewritten; these lines annotate it.
+        if (resolved != null && !resolved.isEmpty()) {
+            sb.append(resolved.renderPromptBlock()).append("\n");
+        }
+
+        // ── LITERAL CANDIDATES block (PRO-33, contract PRO-32 §3) — the
+        // constrained-choice task for unresolved literal-shaped terms.
+        // Empty (the common case) ⇒ byte-identical context.
+        if (resolved != null) {
+            String literalBlock = resolved.renderLiteralCandidatesBlock();
+            if (!literalBlock.isEmpty()) sb.append(literalBlock).append("\n");
+        }
+
         // ── Knowledge graph context — filtered to entities relevant to the question ──
         // Sending the full graph (50+ entities) on every call wastes thousands of tokens.
         // We extract keywords from the question and only include matching entities.
+        // Resolved canonical tokens (PRO-31) join the keywords so the graph is
+        // selected as if the user had spoken canonically.
         List<String> domainKeys = toDomainKeyList(agent);
+        String filteredGraph = "";
         if (!domainKeys.isEmpty()) {
             String graphCtx = knowledgeGraphService.buildGraphContext(domainKeys);
             if (!graphCtx.isBlank()) {
-                String filteredGraph = filterGraphContext(graphCtx, question);
+                filteredGraph = filterGraphContext(graphCtx, question, expandedTokens);
                 if (!filteredGraph.isBlank()) sb.append(filteredGraph).append("\n");
             }
         }
 
-        // ── Enterprise map entity context — truncated to configurable limit ───────
+        // ── Enterprise map entity context — relevance-ranked, then truncated ──────
         // Full table schema can be 2000-3000 tokens. We truncate to maxEntityContextChars
         // (default 1500 chars ≈ 375 tokens) to cap the cost on every reasoning call.
-        // This is a per-deployment setting, not a hardcoded value.
+        // Before truncating, per-table blocks are reordered by business relevance
+        // (entity/vocabulary bindings first, keyword match as fallback) so the budget
+        // is spent on question-relevant tables instead of alphabetically-first ones.
         boolean hasMemory = memChunks != null && !memChunks.isEmpty();
         String ec = entCtx.containsKey("entityContext") ? (String) entCtx.get("entityContext") : null;
         if (ec != null && !ec.isBlank()) {
-            String truncated = ec.length() > maxEntityContextChars
-                    ? ec.substring(0, maxEntityContextChars) + "\n[schema truncated — use describe_schema for more detail]"
-                    : ec;
-            sb.append("=== TABLE SCHEMA ===\n").append(truncated).append("\n");
+            @SuppressWarnings("unchecked")
+            Map<String, String> blocks = entCtx.get("entityBlocks") instanceof Map<?, ?>
+                    ? (Map<String, String>) entCtx.get("entityBlocks") : Map.of();
+            String assembled = assembleEntityContext(question, ec, blocks,
+                    semantic != null ? semantic.bindings() : List.of(),
+                    filteredGraph,
+                    semantic != null ? semantic.termLinesByObjectKey() : Map.of(),
+                    expandedTokens,
+                    maxEntityContextChars);
+            sb.append("=== TABLE SCHEMA ===\n").append(assembled).append("\n");
         } else {
             sb.append("=== TABLE SCHEMA ===\n");
             sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
@@ -827,6 +951,264 @@ public class ChatService {
         }
 
         return sb.toString();
+    }
+
+    // =========================================================================
+    // Planner entity-context assembly (PRO-19)
+    //
+    // The assembler (this class) owns "which metadata does the planner see":
+    // it holds the question, every context block, and the token budget. The
+    // renderer (EnterpriseMapService) stays question-agnostic and only supplies
+    // pre-rendered per-table blocks. Static + package-private for testability.
+    // =========================================================================
+
+    /** Matches the "Table: schema.table " header the renderer emits per block. */
+    private static final java.util.regex.Pattern TABLE_HEADER =
+            java.util.regex.Pattern.compile("(?m)^Table: \\S+?\\.(\\S+) ");
+
+    /** Captures the table referenced after a JOIN keyword in graph join guidance. */
+    private static final java.util.regex.Pattern JOIN_TABLE =
+            java.util.regex.Pattern.compile("(?i)\\bJOIN\\s+([a-z0-9_.\"]+)");
+
+    /** Compatibility form without Business Terms (equivalent to an empty terms map). */
+    static String assembleEntityContext(String question, String renderedContext,
+            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
+            String graphContext, int maxChars) {
+        return assembleEntityContext(question, renderedContext, blocks, bindings,
+                graphContext, Map.of(), java.util.Set.of(), maxChars);
+    }
+
+    /** Compatibility form without retrieval expansion (equivalent to no resolutions). */
+    static String assembleEntityContext(String question, String renderedContext,
+            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
+            String graphContext, Map<String, List<String>> termLinesByObjectKey,
+            int maxChars) {
+        return assembleEntityContext(question, renderedContext, blocks, bindings,
+                graphContext, termLinesByObjectKey, java.util.Set.of(), maxChars);
+    }
+
+    /**
+     * Orders the renderer's per-table blocks by relevance to the question,
+     * attaches each block's Business Terms companion line (PRO-24 — structural
+     * accompaniment: companions ride with their block in every ordering path,
+     * including the renderer-order fallback), then applies the existing
+     * character budget. The budget is unchanged — relevance only decides WHICH
+     * tables consume it. With no terms, output is byte-identical to before.
+     *
+     * <p>{@code expandedTokens} (PRO-31) are the canonical tokens implied by the
+     * question's business-language resolutions; they join the question keywords
+     * so ranking selects metadata as if the user had spoken canonically. Empty
+     * set ⇒ byte-identical to the pre-BLR ordering.
+     */
+    static String assembleEntityContext(String question, String renderedContext,
+            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
+            String graphContext, Map<String, List<String>> termLinesByObjectKey,
+            java.util.Set<String> expandedTokens, int maxChars) {
+        String ordered;
+        if (blocks == null || blocks.isEmpty()) {
+            ordered = renderedContext;
+        } else {
+            List<String> orderedKeys = rankEntityBlockKeys(question, blocks, bindings,
+                    graphContext, expandedTokens);
+            StringBuilder sb = new StringBuilder();
+            for (String key : orderedKeys) {
+                String block = blocks.get(key);
+                List<String> terms = termLinesByObjectKey != null
+                        ? termLinesByObjectKey.get(key) : null;
+                if (terms == null || terms.isEmpty()) {
+                    sb.append(block);
+                    continue;
+                }
+                // Attach directly under the block: renderer blocks end with a
+                // blank line — the terms line slots in before it.
+                String termsLine = "Business terms: " + String.join("; ", terms) + "\n";
+                if (block.endsWith("\n\n")) {
+                    sb.append(block, 0, block.length() - 1).append(termsLine).append("\n");
+                } else {
+                    sb.append(block).append(termsLine);
+                }
+            }
+            ordered = sb.toString();
+        }
+        return truncateEntityContext(ordered, maxChars);
+    }
+
+    /** Ranked block texts — thin wrapper over {@link #rankEntityBlockKeys}. */
+    static List<String> rankEntityBlocks(String question, Map<String, String> blocks,
+            List<SemanticService.EntityBinding> bindings, String graphContext) {
+        List<String> ordered = new ArrayList<>(blocks.size());
+        for (String key : rankEntityBlockKeys(question, blocks, bindings, graphContext,
+                java.util.Set.of())) {
+            ordered.add(blocks.get(key));
+        }
+        return ordered;
+    }
+
+    /** Compatibility form without retrieval expansion (equivalent to no resolutions). */
+    static List<String> rankEntityBlockKeys(String question, Map<String, String> blocks,
+            List<SemanticService.EntityBinding> bindings, String graphContext) {
+        return rankEntityBlockKeys(question, blocks, bindings, graphContext, java.util.Set.of());
+    }
+
+    /**
+     * Relevance tiers, in order:
+     *   1. Business Entity / Operational Vocabulary bindings — question terms
+     *      matched against curated business names, resolved to tables via
+     *      primary_object_key (primary signal);
+     *      plus join-neighbors of tier-1 tables taken from the surviving graph
+     *      context, so the planner can complete the JOINs it is told to use;
+     *   2. keyword-vs-block-text match (fallback signal);
+     *   3. renderer order (today's behavior) when nothing matches at all.
+     *
+     * PRO-31: {@code expandedTokens} — canonical tokens from business-language
+     * resolutions — join the extracted keywords before matching, closing the
+     * TX-class blindness (a resolved token selects blocks even when the surface
+     * form never became a keyword). Empty set ⇒ pre-BLR behavior exactly.
+     */
+    static List<String> rankEntityBlockKeys(String question, Map<String, String> blocks,
+            List<SemanticService.EntityBinding> bindings, String graphContext,
+            java.util.Set<String> expandedTokens) {
+
+        List<String> rendererOrder = new ArrayList<>(blocks.keySet());
+        java.util.Set<String> keywords = new java.util.HashSet<>(
+                com.sei.nexus.common.QuestionKeywords.extract(question));
+        if (expandedTokens != null) keywords.addAll(expandedTokens);
+        if (keywords.isEmpty()) return rendererOrder;
+
+        // Tier 1 — entity/vocabulary resolution
+        java.util.LinkedHashSet<String> tier1 = new java.util.LinkedHashSet<>();
+        if (bindings != null) {
+            for (SemanticService.EntityBinding b : bindings) {
+                if (b.primaryObjectKey() == null || !blocks.containsKey(b.primaryObjectKey())) continue;
+                if (matchesBindingText(b.matchText(), keywords)) tier1.add(b.primaryObjectKey());
+            }
+        }
+
+        // Tier 2 — keyword match against block text (table name, business name,
+        // purpose, guidance, column names are all in the block already)
+        Map<String, Integer> tier2 = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, String> e : blocks.entrySet()) {
+            if (tier1.contains(e.getKey())) continue;
+            int score = scoreBlock(e.getValue(), keywords);
+            if (score > 0) tier2.put(e.getKey(), score);
+        }
+
+        if (tier1.isEmpty() && tier2.isEmpty()) return rendererOrder;   // Tier 3 fallback
+
+        // Join-neighbor expansion — tables named after JOIN in the surviving
+        // (already question-filtered) graph context ride along with the match.
+        java.util.LinkedHashSet<String> neighbors = new java.util.LinkedHashSet<>();
+        java.util.Set<String> joinTables = joinTableNames(graphContext);
+        if (!joinTables.isEmpty()) {
+            for (Map.Entry<String, String> e : blocks.entrySet()) {
+                if (tier1.contains(e.getKey()) || tier2.containsKey(e.getKey())) continue;
+                String tbl = blockTableName(e.getValue());
+                if (tbl != null && joinTables.contains(tbl)) neighbors.add(e.getKey());
+            }
+        }
+
+        // Order: tier-1, its join partners, tier-2 by score (stable on renderer
+        // order for ties), then join partners of a tier-2-only match, then the rest.
+        List<String> orderedKeys = new ArrayList<>(tier1);
+        if (!tier1.isEmpty()) orderedKeys.addAll(neighbors);
+        tier2.entrySet().stream()
+                .sorted((a, b) -> b.getValue() - a.getValue())
+                .forEach(en -> orderedKeys.add(en.getKey()));
+        if (tier1.isEmpty()) orderedKeys.addAll(neighbors);
+        for (String k : blocks.keySet()) {
+            if (!orderedKeys.contains(k)) orderedKeys.add(k);
+        }
+        return orderedKeys;
+    }
+
+    /**
+     * Applies the existing character budget. The marker names the omitted tables
+     * (compactly, capped) instead of pointing the tool-less planner at
+     * describe_schema, which only exists on the agent path.
+     */
+    static String truncateEntityContext(String context, int maxChars) {
+        if (context.length() <= maxChars) return context;
+
+        List<String> omitted = new ArrayList<>();
+        java.util.regex.Matcher m = TABLE_HEADER.matcher(context);
+        while (m.find()) {
+            if (m.start() >= maxChars) omitted.add(m.group(1));
+        }
+
+        StringBuilder marker = new StringBuilder("\n[schema truncated");
+        if (!omitted.isEmpty()) {
+            marker.append(" — omitted tables: ");
+            int shown = 0;
+            for (String t : omitted) {
+                String piece = (shown > 0 ? ", " : "") + t;
+                if (marker.length() + piece.length() > 180) {
+                    marker.append(", +").append(omitted.size() - shown).append(" more");
+                    break;
+                }
+                marker.append(piece);
+                shown++;
+            }
+        }
+        marker.append("]");
+        return context.substring(0, maxChars) + marker;
+    }
+
+    /** Token-level match between a curated business term and the question keywords,
+     *  tolerant of simple singular/plural differences ("vendors" ↔ "Vendor"). */
+    private static boolean matchesBindingText(String text, java.util.Set<String> keywords) {
+        if (text == null || text.isBlank()) return false;
+        for (String token : text.toLowerCase().split("[^a-z0-9]+")) {
+            if (token.length() < 3) continue;
+            for (String kw : keywords) {
+                if (token.equals(kw) || singular(kw).equals(token) || singular(token).equals(kw)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Scores question keywords present in the block text. An exact keyword hit
+     *  outweighs a singular-form hit so "warehouses" ranks the warehouses table
+     *  above a table that merely has a warehouse_id column. */
+    private static int scoreBlock(String block, java.util.Set<String> keywords) {
+        String lower = block.toLowerCase();
+        int score = 0;
+        for (String kw : keywords) {
+            String sing = singular(kw);
+            if (lower.contains(kw)) score += 2;
+            else if (!sing.equals(kw) && lower.contains(sing)) score += 1;
+        }
+        return score;
+    }
+
+    /** Naive English singularisation — single shared implementation in QuestionKeywords. */
+    private static String singular(String w) {
+        return com.sei.nexus.common.QuestionKeywords.singular(w);
+    }
+
+    /** Table names referenced after a JOIN keyword in the graph context's join guidance. */
+    private static java.util.Set<String> joinTableNames(String graphContext) {
+        if (graphContext == null || graphContext.isBlank()) return java.util.Set.of();
+        java.util.Set<String> tables = new java.util.HashSet<>();
+        java.util.regex.Matcher m = JOIN_TABLE.matcher(graphContext);
+        while (m.find()) {
+            String t = m.group(1).toLowerCase().replace("\"", "");
+            int dot = t.lastIndexOf('.');
+            tables.add(dot >= 0 ? t.substring(dot + 1) : t);
+        }
+        return tables;
+    }
+
+    /** Physical table name from a block's "Table: schema.table (Business Name)" header. */
+    private static String blockTableName(String block) {
+        if (block == null || !block.startsWith("Table: ")) return null;
+        int nl = block.indexOf('\n');
+        String header = nl > 0 ? block.substring(7, nl) : block.substring(7);
+        int paren = header.indexOf(" (");
+        String qualified = (paren > 0 ? header.substring(0, paren) : header).trim();
+        int dot = qualified.lastIndexOf('.');
+        return (dot >= 0 ? qualified.substring(dot + 1) : qualified).toLowerCase();
     }
 
     // =========================================================================
@@ -960,6 +1342,33 @@ public class ChatService {
         return result;
     }
 
+    /**
+     * PRO-33: the literal validator's scope — every domain-bearing column the
+     * resolver found on the entity-bound tables, keyed by qualified
+     * {@code table.column} and, when unambiguous, by bare column name (SQL
+     * aliases hide the real table, so the bare key is the alias fallback).
+     * Empty map ⇒ validation is a no-op (zero-cost).
+     */
+    static Map<String, com.sei.nexus.reasoning.LiteralValidator.DomainInfo>
+            buildLiteralScope(ResolvedQuestion resolved) {
+        if (resolved == null || resolved.literalCandidates().isEmpty()) return Map.of();
+        Map<String, com.sei.nexus.reasoning.LiteralValidator.DomainInfo> scope =
+                new java.util.HashMap<>();
+        java.util.Set<String> ambiguousBare = new java.util.HashSet<>();
+        for (ResolvedQuestion.LiteralCandidate c : resolved.literalCandidates()) {
+            var info = new com.sei.nexus.reasoning.LiteralValidator.DomainInfo(
+                    c.table(), c.column(), c.authoritative(), c.values());
+            scope.put(c.qualifiedColumn().toLowerCase(java.util.Locale.ROOT), info);
+            String bare = c.column().toLowerCase(java.util.Locale.ROOT);
+            var prior = scope.putIfAbsent(bare, info);
+            if (prior != null && !prior.qualifiedColumn().equals(info.qualifiedColumn())) {
+                ambiguousBare.add(bare);
+            }
+        }
+        scope.keySet().removeAll(ambiguousBare);
+        return scope;
+    }
+
     private List<String> toDomainKeyList(NexusAgent agent) {
         if (agent == null || agent.domainKeys() == null || agent.domainKeys().isBlank()) return List.of();
         return List.of(agent.domainKeys().split(",\\s*"));
@@ -972,17 +1381,20 @@ public class ChatService {
      *
      * Falls back to the full context if filtering produces nothing (safety net).
      */
-    private String filterGraphContext(String fullGraph, String question) {
+    /**
+     * PRO-31 form: resolved canonical tokens join the question keywords so the
+     * graph filter keeps lines the user referenced through business language
+     * (e.g. "TX" keeps the line mentioning "texas"/"state_province"). An empty
+     * token set reproduces the pre-BLR behavior exactly.
+     */
+    private String filterGraphContext(String fullGraph, String question,
+            java.util.Set<String> expandedTokens) {
         if (question == null || question.isBlank()) return fullGraph;
 
-        // Extract meaningful keywords (3+ chars, skip stop words)
-        java.util.Set<String> stops = java.util.Set.of(
-                "show", "me", "all", "get", "find", "list", "the", "a", "an",
-                "what", "which", "how", "many", "give", "tell", "and", "or", "for");
-        java.util.Set<String> keywords = java.util.Arrays.stream(
-                        question.toLowerCase().split("[\\s,?!.;:]+"))
-                .filter(w -> w.length() >= 3 && !stops.contains(w))
-                .collect(java.util.stream.Collectors.toSet());
+        // Shared keyword helper — same extraction the entity-block ranking uses.
+        java.util.Set<String> keywords = new java.util.HashSet<>(
+                com.sei.nexus.common.QuestionKeywords.extract(question));
+        if (expandedTokens != null) keywords.addAll(expandedTokens);
 
         if (keywords.isEmpty()) return fullGraph;
 
