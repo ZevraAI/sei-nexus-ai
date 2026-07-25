@@ -1,6 +1,6 @@
 package com.sei.nexus.reasoning;
 
-import com.sei.nexus.reasoning.LiteralValidator.DomainInfo;
+import com.sei.nexus.semanticmodel.ColumnValueDomain;
 import com.sei.nexus.reasoning.LiteralValidator.RejectionDecision;
 import com.sei.nexus.reasoning.LiteralValidator.Result;
 import com.sei.nexus.reasoning.LiteralValidator.Violation;
@@ -23,13 +23,13 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class LiteralValidatorTest {
 
-    private static Map<String, DomainInfo> scope() {
-        Map<String, DomainInfo> scope = new HashMap<>();
-        DomainInfo state = new DomainInfo("stores", "state_province", false,
+    private static Map<String, ColumnValueDomain> scope() {
+        Map<String, ColumnValueDomain> scope = new HashMap<>();
+        ColumnValueDomain state = new ColumnValueDomain("stores", "state_province", false,
                 List.of("California", "Texas"));
-        DomainInfo status = new DomainInfo("stores", "status", true,
+        ColumnValueDomain status = new ColumnValueDomain("stores", "status", true,
                 List.of("open", "closed"));
-        DomainInfo country = new DomainInfo("stores", "country", false,
+        ColumnValueDomain country = new ColumnValueDomain("stores", "country", false,
                 List.of("United States", "Canada"));
         scope.put("stores.state_province", state);
         scope.put("state_province", state);
@@ -94,8 +94,8 @@ class LiteralValidatorTest {
 
     @Test
     void escapedQuotesUnescapeBeforeMembershipCheck() {
-        Map<String, DomainInfo> s = new HashMap<>();
-        s.put("owner_name", new DomainInfo("stores", "owner_name", false, List.of("O'Brien")));
+        Map<String, ColumnValueDomain> s = new HashMap<>();
+        s.put("owner_name", new ColumnValueDomain("stores", "owner_name", false, List.of("O'Brien")));
 
         assertTrue(LiteralValidator.validate(
                 "SELECT * FROM stores WHERE owner_name = 'O''Brien'",

@@ -77,7 +77,7 @@ public class ZevraAgentController {
         String message = str(body, "message");
         if (message == null || message.isBlank())
             return ResponseEntity.badRequest().build();
-        return ResponseEntity.ok(service.chat(id, tenantSchema(), message));
+        return ResponseEntity.ok(service.chat(id, tenantSchema(), message, currentUser().email()));
     }
 
     @GetMapping("/{id}/sessions")

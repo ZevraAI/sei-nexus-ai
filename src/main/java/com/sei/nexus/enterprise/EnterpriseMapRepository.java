@@ -97,6 +97,42 @@ public class EnterpriseMapRepository {
                 """, dataObjectMapper(), agentKey);
     }
 
+    /**
+     * Returns the approved (non-ARCHIVED) data objects whose connection_key is in the
+     * supplied list — the authoritative business-object surface for a ZevraAgent's
+     * connections (ADR-0003 A9). Unlike findDataObjectsByAgentConnections(agentKey),
+     * which resolves nexus_agent, this takes the connection keys directly, so it fits the
+     * ZevraAgent model (nexus_zevra_agent.connection_keys). Consumed only by AgentBrain.
+     */
+    /**
+     * Returns all non-archived data objects belonging to any of the given business domains.
+     * The batch form of {@link #findDataObjectsByDomain(String)} — one query instead of one
+     * per domain. An object carries a single {@code domain_key}, so the union cannot duplicate.
+     */
+    public List<DataObject> findDataObjectsByDomainKeys(List<String> domainKeys) {
+        if (domainKeys == null || domainKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < domainKeys.size(); i++) {
+            placeholders.append(i == 0 ? "?" : ", ?");
+        }
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
+                        + "AND domain_key IN (" + placeholders + ") ORDER BY entity_name",
+                dataObjectMapper(), domainKeys.toArray());
+    }
+
+    public List<DataObject> findDataObjectsByConnectionKeys(List<String> connectionKeys) {
+        if (connectionKeys == null || connectionKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < connectionKeys.size(); i++) {
+            placeholders.append(i == 0 ? "?" : ", ?");
+        }
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
+                        + "AND connection_key IN (" + placeholders + ") ORDER BY entity_name",
+                dataObjectMapper(), connectionKeys.toArray());
+    }
+
     public void archiveDataObject(String objectKey) {
         jdbc.update("""
                 UPDATE nexus_data_object

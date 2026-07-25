@@ -20,7 +20,6 @@ import com.sei.nexus.governance.UserAttributesRepository;
 import com.sei.nexus.reasoning.EvidenceStore;
 import com.sei.nexus.reasoning.ReasoningEngine;
 import com.sei.nexus.reasoning.ReasoningEventBus;
-import com.sei.nexus.enterprise.EnterpriseMapService;
 import com.sei.nexus.knowledge.KnowledgeGap;
 import com.sei.nexus.knowledge.KnowledgeGapRepository;
 import com.sei.nexus.memory.DocumentChunk;
@@ -32,11 +31,19 @@ import com.sei.nexus.reasoning.ReasoningRepository;
 import com.sei.nexus.reasoning.ReasoningSession;
 import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
+import com.sei.nexus.agentbrain.AgentBrain;
+import com.sei.nexus.agentbrain.ExecutionContract;
+import com.sei.nexus.agentbrain.ExecutionContractBuilder;
+import com.sei.nexus.agentbrain.PromptAssembler;
+import com.sei.nexus.response.ExecutionOutcomeInterpreter;
+import com.sei.nexus.response.NaturalLanguageComposer;
+import com.sei.nexus.agentbrain.PromptContext;
+import com.sei.nexus.agentbrain.PromptContextBuilder;
+import com.sei.nexus.agentbrain.ResolvedBusinessModel;
 import com.sei.nexus.agentrunner.AgentRunner;
 import com.sei.nexus.agentrunner.ZevraAgent;
 import com.sei.nexus.agentrunner.ZevraAgentRouter;
 import com.sei.nexus.agentrunner.ZevraSession;
-import com.sei.nexus.semantic.BusinessLanguageResolver;
 import com.sei.nexus.semantic.LearningContextBuilder;
 import com.sei.nexus.semantic.ResolvedQuestion;
 import com.sei.nexus.semantic.SemanticLearningService;
@@ -62,7 +69,6 @@ public class ChatService {
 
     private final RunRepository runRepository;
     private final DocumentMemoryService documentMemoryService;
-    private final EnterpriseMapService enterpriseMapService;
     private final SemanticService semanticService;
     private final AgentRepository agentRepository;
     private final ConnectionRepository connectionRepository;
@@ -91,8 +97,14 @@ public class ChatService {
     // ── Zevra Agentic AI routing ──────────────────────────────────────────────
     private final ZevraAgentRouter         zevraAgentRouter;
     private final AgentRunner              agentRunner;
-    // ── Business Language Resolution (PRO-31) ────────────────────────────────
-    private final BusinessLanguageResolver businessLanguageResolver;
+    // ── Business reasoning (Unified Answer Engine) ───────────────────────────
+    private final AgentBrain               agentBrain;
+    private final ExecutionContractBuilder executionContractBuilder;
+    private final PromptContextBuilder     promptContextBuilder;
+    private final PromptAssembler          promptAssembler;
+    // ── Response composition (Unified Answer Engine, Phase 4) ────────────────
+    private final ExecutionOutcomeInterpreter outcomeInterpreter;
+    private final NaturalLanguageComposer     nlComposer;
 
     // Max characters for entity schema context per LLM call.
     // Configurable via nexus.context.max-entity-chars — keeps prompts lean
@@ -100,9 +112,16 @@ public class ChatService {
     @org.springframework.beans.factory.annotation.Value("${nexus.context.max-entity-chars:1500}")
     private int maxEntityContextChars;
 
+    // Unified Answer Engine, Phase 3 Step 2 — business-object gate migration mode:
+    //   off     : the compiled contract is not passed to the runtime (gate inert)
+    //   shadow  : the gate is evaluated and its would-be rejections recorded, but not enforced
+    //   enforce : an unapproved table becomes a re-plannable observation, as on the agent path
+    // Defaults to `shadow` so production behaviour is unchanged until the migration is measured.
+    @org.springframework.beans.factory.annotation.Value("${nexus.chat.contract-gate:shadow}")
+    private String contractGateMode;
+
     public ChatService(RunRepository runRepository,
                        DocumentMemoryService documentMemoryService,
-                       EnterpriseMapService enterpriseMapService,
                        SemanticService semanticService,
                        AgentRepository agentRepository,
                        ConnectionRepository connectionRepository,
@@ -127,10 +146,14 @@ public class ChatService {
                        LearningContextBuilder learningContextBuilder,
                        ZevraAgentRouter zevraAgentRouter,
                        AgentRunner agentRunner,
-                       BusinessLanguageResolver businessLanguageResolver) {
+                       AgentBrain agentBrain,
+                       ExecutionContractBuilder executionContractBuilder,
+                       PromptContextBuilder promptContextBuilder,
+                       PromptAssembler promptAssembler,
+                       ExecutionOutcomeInterpreter outcomeInterpreter,
+                       NaturalLanguageComposer nlComposer) {
         this.runRepository            = runRepository;
         this.documentMemoryService    = documentMemoryService;
-        this.enterpriseMapService     = enterpriseMapService;
         this.semanticService          = semanticService;
         this.agentRepository          = agentRepository;
         this.connectionRepository     = connectionRepository;
@@ -155,7 +178,12 @@ public class ChatService {
         this.learningContextBuilder   = learningContextBuilder;
         this.zevraAgentRouter         = zevraAgentRouter;
         this.agentRunner              = agentRunner;
-        this.businessLanguageResolver = businessLanguageResolver;
+        this.agentBrain               = agentBrain;
+        this.executionContractBuilder = executionContractBuilder;
+        this.promptContextBuilder     = promptContextBuilder;
+        this.promptAssembler          = promptAssembler;
+        this.outcomeInterpreter       = outcomeInterpreter;
+        this.nlComposer               = nlComposer;
     }
 
     // =========================================================================
@@ -184,18 +212,23 @@ public class ChatService {
         String tenantSchemaForRouting = com.sei.nexus.tenant.TenantContext.getSchema();
         java.util.Optional<ZevraAgent> routedZevraAgent =
                 zevraAgentRouter.route(raw, tenantSchemaForRouting);
+        // One NexusRun per conversation request: derive the identities once and persist
+        // exactly one run, shared by the routed-agent branch and the normal pipeline. This
+        // prevents a routed fall-through from re-inserting the same run_key (ADR-0003 A2
+        // lifecycle fix), and the routed agent reuses this run rather than creating a second.
+        String conversationId = (request.conversationId() != null && !request.conversationId().isBlank())
+                ? request.conversationId() : Keys.conversationKey();
+        String runKey = (request.clientRunKey() != null && !request.clientRunKey().isBlank())
+                ? request.clientRunKey() : Keys.runKey();
+        boolean runPersisted = false;
+
         if (routedZevraAgent.isPresent()) {
             ZevraAgent za = routedZevraAgent.get();
-            String convId  = (request.conversationId() != null && !request.conversationId().isBlank())
-                    ? request.conversationId() : Keys.conversationKey();
-            String runKey  = (request.clientRunKey() != null && !request.clientRunKey().isBlank())
-                    ? request.clientRunKey() : Keys.runKey();
-
-            NexusRun run = new NexusRun(runKey, convId, za.slug(), null,
-                    userEmail, raw, null, null, "RUNNING", null, null, null);
-            runRepository.save(run);
+            runRepository.save(new NexusRun(runKey, conversationId, za.slug(), null,
+                    userEmail, raw, null, null, "RUNNING", null, null, null));
+            runPersisted = true;
             try {
-                ZevraSession session = agentRunner.run(za, raw);
+                ZevraSession session = agentRunner.run(za, raw, userEmail, runKey);
                 String answer = session.finalOutput() != null && !session.finalOutput().isBlank()
                         ? session.finalOutput()
                         : "The agent completed but produced no response.";
@@ -204,7 +237,7 @@ public class ChatService {
                 OrchestratorDecision decision = new OrchestratorDecision(
                         "ZEVRA_AGENT", "OPERATIONAL_INVESTIGATION", "LIVE_DATA",
                         true, false, false);
-                return new ChatResponse(convId, runKey, answer, List.of(), decision,
+                return new ChatResponse(conversationId, runKey, answer, List.of(), decision,
                         za.slug(), za.name(), null, 0.9, false, "",
                         List.of(), List.of(), List.of(), List.of(), List.of(),
                         session.id());
@@ -248,9 +281,7 @@ public class ChatService {
                 + "=== END OF ATTACHMENT ===\n\n"
                 + "User question: " + raw;
 
-        // STEP 2: Conversation
-        String conversationId = (request.conversationId() != null && !request.conversationId().isBlank())
-                ? request.conversationId() : Keys.conversationKey();
+        // STEP 2: Conversation — conversationId already derived above (one run per request).
 
         // STEP 3: Recent history
         List<NexusRun> history = runRepository.findConversationRuns(conversationId, 8);
@@ -259,34 +290,50 @@ public class ChatService {
         NexusAgent agent = resolveAgent(request.agentKey(), raw, history);
         double routingConfidence = agent != null ? 0.9 : 0.5;
 
-        // STEP 5: Save run — use client-provided key when present (enables SSE pre-subscription)
-        String runKey = (request.clientRunKey() != null && !request.clientRunKey().isBlank())
-                ? request.clientRunKey() : Keys.runKey();
-        NexusRun run = new NexusRun(runKey, conversationId,
-                agent != null ? agent.agentKey() : null,
-                agent != null ? agent.domainKeys() : null,
-                userEmail, raw, null, null, "RUNNING", null, null, null);
-        runRepository.save(run);
+        // STEP 5: Persist the run — reuse the single run for this request. On a routed
+        // fall-through the run already exists (created above), so it is never re-inserted;
+        // runKey was derived above (client-provided key preserved for SSE pre-subscription).
+        if (!runPersisted) {
+            runRepository.save(new NexusRun(runKey, conversationId,
+                    agent != null ? agent.agentKey() : null,
+                    agent != null ? agent.domainKeys() : null,
+                    userEmail, raw, null, null, "RUNNING", null, null, null));
+            runPersisted = true;
+        }
 
         try {
             List<String> domainKeys = toDomainKeyList(agent);
             List<String> connKeys = toConnKeyList(agent);
 
-            // STEP 5b: Business Language Resolution (PRO-31) — deterministic,
-            // domain-scoped, annotate-never-substitute. Runs once, after agent
-            // routing (needs the domain scope), before every keyword-dependent
-            // stage. `raw` is never modified; resolutions annotate it. On any
-            // failure or zero matches this is empty and the whole pipeline
-            // behaves byte-identically to the pre-BLR behavior.
-            ResolvedQuestion resolved = businessLanguageResolver.resolve(raw, domainKeys);
+            // STEP 5b: Business reasoning (Unified Answer Engine, Phase 3 Step 1).
+            // AgentBrain is the sole reasoning owner: it performs Business Language
+            // Resolution (PRO-31) for this scope — deterministic, domain-scoped,
+            // annotate-never-substitute — and returns the resolved business model.
+            // `raw` is never modified; resolutions annotate it. On any failure or
+            // zero matches the resolution is empty and the whole pipeline behaves
+            // byte-identically to the pre-BLR behavior.
+            //
+            // The compiled ExecutionContract is the approved execution surface for
+            // this request. It is recorded on the audit trail now and is not yet
+            // consumed by grounding or enforcement — the runtime gate arrives in
+            // Step 2 and the grounding swap in Step 4, so prompts and execution are
+            // unchanged by this step.
+            ResolvedBusinessModel businessModel = agentBrain.resolve(
+                    agent != null ? agent.agentKey() : null, connKeys, domainKeys, raw);
+            ResolvedQuestion resolved = businessModel.resolution();
+            ExecutionContract executionContract = executionContractBuilder.compile(businessModel);
+
+            // The TABLE SCHEMA grounding is now rendered by the shared PromptAssembler from the
+            // contract's PromptContext — the same pipeline the autonomous-agent path uses. The
+            // conversational policy renders the full grounding (schema-qualified, with connection
+            // key, data types, and value domains) within the entity-context budget.
+            PromptContext promptContext = promptContextBuilder.build(executionContract);
 
             // STEP 6: Memory retrieval — semantic search on the user's intent, not the file
             List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(raw, domainKeys);
 
-            // STEP 7: Enterprise + Semantic + Anomaly + Findings context.
-            // The semantic context also carries entity/vocabulary → table bindings,
-            // the primary relevance signal for planner context assembly (PRO-19).
-            Map<String, Object> entCtx = enterpriseMapService.operationalContext(domainKeys, connKeys, raw);
+            // STEP 7: Semantic + Anomaly + Findings context.
+            // The semantic context also carries entity/vocabulary → table bindings.
             SemanticService.SemanticContext semantic =
                     semanticService.semanticContextWithBindings(domainKeys, raw);
             String semCtx = semantic.contextText();
@@ -309,7 +356,7 @@ public class ChatService {
             // STEP 10: LLM decision — routes on user intent (raw), not file content.
             // This is the key: the router sees "do these orders exist in the system?" and
             // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
-            Map<String, Object> decision = getLlmDecision(raw, memChunks, entCtx, semantic,
+            Map<String, Object> decision = getLlmDecision(raw, memChunks, promptContext, semantic,
                     findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
@@ -342,13 +389,13 @@ public class ChatService {
                         answer = answerFromPriorResults(raw, priorSnapshot.get(), memChunks, history, agent);
                     } else {
                         // enrichedQuestion so the file content is available if the question was about the file
-                        answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, entCtx, agent);
+                        answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, agent);
                     }
                 }
                 case "ANSWER_FROM_MEMORY" -> {
                     // enrichedQuestion: if the user uploaded a file and asked about it, this path
                     // has the file content available so the AI can summarise / translate / explain it.
-                    answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, entCtx, agent);
+                    answer = answerFromMemory(enrichedQuestion, memChunks, semCtx, agent);
                 }
                 case "ASK_CLARIFICATION" -> {
                     answer = (String) decision.getOrDefault("clarification_question",
@@ -383,7 +430,7 @@ public class ChatService {
                         List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
                         if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
                     }
-                    String schemaCtx = buildContextSummary(raw, memChunks, entCtx, semantic, findings,
+                    String schemaCtx = buildContextSummary(raw, memChunks, promptContext, semantic, findings,
                             anomalyCtx, false, history, agent, resolved);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
@@ -400,9 +447,12 @@ public class ChatService {
                     // The engine generates one SQL step at a time, executes it through the
                     // governance chain, evaluates whether the evidence is sufficient, and
                     // continues until the evaluator says SUFFICIENT, DEAD_END, or MAX_STEPS.
+                    boolean gateOff     = "off".equalsIgnoreCase(contractGateMode);
+                    boolean gateEnforced = "enforce".equalsIgnoreCase(contractGateMode);
                     ReasoningEngine.ReasoningResult reasonResult = reasoningEngine.reason(
                             raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync,
-                            buildLiteralScope(resolved));
+                            buildLiteralScope(resolved),
+                            gateOff ? null : executionContract, gateEnforced);
 
                     resultSnapshot = reasonResult.resultSnapshot();
                     queryData      = reasonResult.queryData();
@@ -412,6 +462,16 @@ public class ChatService {
 
                     answer = composeAnswer(raw, attachmentSummary, execResults, memChunks, semCtx,
                             findings, anomalyCtx, agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
+
+                    // Phase 3 Step 2: record what the business-object gate would have rejected,
+                    // so the migration can be measured before enforcement is switched on.
+                    if (!reasonResult.shadowGateFindings().isEmpty()) {
+                        log.warn("Contract gate (shadow) findings for run {}: {}",
+                                runKey, reasonResult.shadowGateFindings());
+                        runRepository.saveEvidence(Keys.uniqueKey("ev"), runKey, "CONTRACT_GATE_SHADOW",
+                                toJson(Map.of("contract_id", executionContract.contractId(),
+                                        "findings", reasonResult.shadowGateFindings())));
+                    }
 
                     // Notify SSE clients the answer is ready, then close the stream
                     reasoningEventBus.publish(runKey, "answer_ready", Map.of("answer", answer));
@@ -478,6 +538,10 @@ public class ChatService {
                     toJson(Map.of("decision_type", decisionType,
                             "agent", agent != null ? agent.agentKey() : "none",
                             "memory_chunks", memChunks.size(),
+                            // Phase 3 Step 1: the approved execution surface compiled for
+                            // this request, traceable for audit, replay, and lineage.
+                            "contract_id", executionContract.contractId(),
+                            "contract_objects", executionContract.semanticView().businessObjects().size(),
                             // PRO-31: resolution provenance joins the audit trail
                             "resolutions", resolved.resolutions().stream()
                                     .map(r -> "\"" + r.surface() + "\" = " + r.kind().label()
@@ -593,11 +657,11 @@ public class ChatService {
             """;
 
     private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
-            Map<String, Object> entCtx, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent,
             ResolvedQuestion resolved) {
         try {
-            String ctx = buildContextSummary(question, memChunks, entCtx, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved);
+            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
             String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), DECISION_SYSTEM_PROMPT);
             return objectMapper.readValue(extractJson(resp),
@@ -609,100 +673,22 @@ public class ChatService {
     }
 
     // =========================================================================
-    // Investigation plan generation
-    // =========================================================================
-
-    private String generateInvestigationPlan(String question, Map<String, Object> entCtx,
-            String semCtx, List<DocumentChunk> memChunks, List<OperationalFinding> findings,
-            String anomalyCtx, String playbookCtx, List<NexusRun> history, NexusAgent agent) {
-        try {
-            String ctx = buildContextSummary(question, memChunks, entCtx,
-                    new SemanticService.SemanticContext(semCtx, List.of(), Map.of()),
-                    findings, anomalyCtx, false, history, agent,
-                    ResolvedQuestion.empty(question));
-            log.info("Investigation plan context:\n{}", ctx);
-            String prompt = "Question: " + question + "\n\nContext:\n" + ctx +
-                    (playbookCtx.isBlank() ? "" : "\n\nPlaybook:\n" + playbookCtx);
-            String sys = """
-                    You are a SQL investigation planner for SEI Nexus.
-                    The context contains approved data sources with their tables and columns.
-                    ALWAYS generate SQL steps when approved tables are available — never return an empty array if tables are listed.
-                    Generate 1–3 SQL steps that directly answer the question using those tables.
-                    Rules:
-                    - Use only the tables listed under "Approved data sources"
-                    - Use the connection_key shown for each table
-                    - Use exact column names from the schema
-                    - Joins, aggregations, GROUP BY, ORDER BY are all valid
-                    - Do not use SELECT *; always name columns explicitly
-
-                    ATTACHED FILE RULE:
-                    If the question contains "=== ATTACHED FILE ===" markers, the content between those
-                    markers is reference data uploaded by the user. You MUST:
-                    1. Extract the relevant identifiers from the file (IDs, codes, reference numbers,
-                       names — whatever column in the file matches an identifier column in the database).
-                    2. Embed those values directly as literals in a SQL WHERE ... IN (...) clause or
-                       equivalent filter. Example: WHERE id IN ('REF-001','REF-002','REF-003')
-                    3. SELECT the database columns that let the user verify existence and compare status
-                       (e.g. id, name, status, date — not SELECT *).
-                    This is a cross-reference query: the file provides the lookup keys, the database
-                    provides the ground truth. Never skip the WHERE filter; without it the query returns
-                    unrelated rows.
-
-                    Return a JSON array only (no extra text):
-                    [{"step":1,"description":"...","sql":"SELECT ...","connection_key":"...","object_keys":"..."}]
-                    """;
-            return aiClient.chat(List.of(ChatMessage.user(prompt)), sys);
-        } catch (Exception e) {
-            log.warn("Investigation plan generation failed: {}", e.getMessage());
-            return "[]";
-        }
-    }
-
-    private List<Map<String, Object>> parsePlan(String json) {
-        log.info("Investigation plan raw response: {}", json);
-        try {
-            String extracted = extractJson(json);
-            List<Map<String, Object>> steps = objectMapper.readValue(extracted,
-                    new TypeReference<List<Map<String, Object>>>() {});
-            log.info("Parsed {} investigation steps", steps.size());
-            return steps;
-        } catch (Exception e) {
-            log.warn("Failed to parse investigation plan: {}", e.getMessage());
-            return List.of();
-        }
-    }
-
-    private String generateHypothesisText(String question, NexusAgent agent) {
-        try {
-            String prompt = "Based on this question, state the most likely initial hypothesis in one sentence: " + question;
-            return aiClient.chat(List.of(ChatMessage.user(prompt)),
-                    "You generate concise investigative hypotheses.");
-        } catch (Exception e) {
-            return "Investigating: " + question;
-        }
-    }
-
-    // =========================================================================
     // Answer composition
     // =========================================================================
 
     private String answerFromMemory(String question, List<DocumentChunk> memChunks,
-            String semCtx, Map<String, Object> entCtx, NexusAgent agent) {
-        try {
-            StringBuilder ctx = new StringBuilder();
-            memChunks.forEach(c -> ctx.append(c.chunkText()).append("\n\n"));
-            if (!semCtx.isBlank()) ctx.append("Entity Context:\n").append(semCtx).append("\n\n");
-            String prompt = "Question: " + question + "\n\nKnowledge:\n" + ctx;
-            return aiClient.chat(List.of(ChatMessage.user(prompt)),
-                    "You are SEI Nexus. Answer using only the provided knowledge. Be concise and business-focused.");
-        } catch (Exception e) {
-            return "Unable to retrieve answer from memory at this time.";
-        }
+            String semCtx, NexusAgent agent) {
+        StringBuilder ctx = new StringBuilder();
+        memChunks.forEach(c -> ctx.append(c.chunkText()).append("\n\n"));
+        if (!semCtx.isBlank()) ctx.append("Entity Context:\n").append(semCtx).append("\n\n");
+        String prompt = "Question: " + question + "\n\nKnowledge:\n" + ctx;
+        return nlComposer.compose(NaturalLanguageComposer.CompositionRequest.text(prompt,
+                "You are SEI Nexus. Answer using only the provided knowledge. Be concise and business-focused.",
+                "Unable to retrieve answer from memory at this time."));
     }
 
     private String answerFromPriorResults(String question, String snapshot,
             List<DocumentChunk> memChunks, List<NexusRun> history, NexusAgent agent) {
-        try {
             StringBuilder prompt = new StringBuilder();
 
             // Include conversation history so the AI understands what was discussed
@@ -727,22 +713,21 @@ public class ChatService {
 
             prompt.append("Follow-up question: ").append(question);
 
-            return aiClient.chat(List.of(ChatMessage.user(prompt.toString())), """
+            // The fallback is a lazy memory-answer — evaluated (and its own model call made) only
+            // if this composition fails, exactly as before.
+            return nlComposer.compose(NaturalLanguageComposer.CompositionRequest.text(prompt.toString(), """
                     You are SEI Nexus, an enterprise investigation AI.
                     Answer the follow-up question using the conversation history and prior results above.
                     If asked how you arrived at an answer, explain the data source, the query logic, and
                     the key data points that led to the conclusion. Be concise and precise.
-                    """);
-        } catch (Exception e) {
-            return answerFromMemory(question, memChunks, "", Map.of(), agent);
-        }
+                    """,
+                    () -> answerFromMemory(question, memChunks, "", agent)));
     }
 
     private String composeAnswer(String question, String attachmentSummary,
             List<Map<String, Object>> execResults,
             List<DocumentChunk> memChunks, String semCtx, List<OperationalFinding> findings,
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
-        try {
             StringBuilder ctx = new StringBuilder();
 
             boolean anyRows = false;
@@ -751,7 +736,7 @@ public class ChatService {
                 if (r.containsKey("rows")) {
                     @SuppressWarnings("unchecked")
                     List<Map<String, Object>> rows = (List<Map<String, Object>>) r.get("rows");
-                    ctx.append(buildRowSummary(rows));
+                    ctx.append(outcomeInterpreter.summarizeRows(rows));
                     if (!rows.isEmpty()) anyRows = true;
                 } else if (r.containsKey("error")) {
                     ctx.append("Query error: ").append(r.get("error")).append("\n");
@@ -800,59 +785,22 @@ public class ChatService {
                     Keep the response to 2-3 sentences.
                     """;
 
-            return aiClient.chat(List.of(ChatMessage.user(prompt)), systemPrompt);
-        } catch (Exception e) {
-            return "Investigation completed. " +
-                    (execResults.stream().anyMatch(r -> r.containsKey("rows")) ? "Results are shown in the table below." : "No data returned.");
-        }
+            // Presentation policy (system prompt) and evidence context are chat's; only the
+            // model call + failure handling are delegated to the shared composer.
+            String fallback = "Investigation completed. " +
+                    (execResults.stream().anyMatch(r -> r.containsKey("rows"))
+                            ? "Results are shown in the table below." : "No data returned.");
+            return nlComposer.compose(
+                    NaturalLanguageComposer.CompositionRequest.text(prompt, systemPrompt, fallback));
     }
 
-    /**
-     * Builds a compact statistical summary of query rows for the AI context.
-     * Sends distributions and totals, never individual row values — the frontend
-     * table handles row-level display.
-     */
-    private String buildRowSummary(List<Map<String, Object>> rows) {
-        if (rows.isEmpty()) return "Query returned 0 rows.\n";
-        StringBuilder sb = new StringBuilder();
-        sb.append("Total rows: ").append(rows.size()).append("\n");
-
-        java.util.Set<String> cols = rows.get(0).keySet();
-        sb.append("Columns: ").append(String.join(", ", cols)).append("\n");
-
-        for (String col : cols) {
-            // Distribution for low-cardinality string columns (likely categorical)
-            java.util.List<String> strVals = rows.stream()
-                    .map(r -> String.valueOf(r.getOrDefault(col, "")))
-                    .filter(v -> !v.isBlank() && !v.equals("null"))
-                    .collect(java.util.stream.Collectors.toList());
-            java.util.Map<String, Long> dist = strVals.stream()
-                    .collect(java.util.stream.Collectors.groupingBy(v -> v, java.util.stream.Collectors.counting()));
-            boolean isLowCardinality = dist.size() >= 2 && dist.size() <= 8 && dist.size() < rows.size();
-            boolean looksNumeric = strVals.stream().allMatch(v -> { try { Double.parseDouble(v); return true; } catch (Exception e) { return false; } });
-            boolean isId = col.toLowerCase().endsWith("_id") || col.equalsIgnoreCase("id");
-
-            if (isLowCardinality && !looksNumeric) {
-                sb.append("  ").append(col).append(" distribution: ").append(dist).append("\n");
-            } else if (looksNumeric && !isId) {
-                // Sum and average for numeric non-ID columns
-                try {
-                    double sum = strVals.stream().mapToDouble(Double::parseDouble).sum();
-                    double avg = sum / strVals.size();
-                    sb.append("  ").append(col).append(": sum=").append(String.format("%.2f", sum))
-                      .append(", avg=").append(String.format("%.2f", avg)).append("\n");
-                } catch (Exception ignored) {}
-            }
-        }
-        return sb.toString();
-    }
 
     // =========================================================================
     // Context building
     // =========================================================================
 
     private String buildContextSummary(String question, List<DocumentChunk> memChunks,
-            Map<String, Object> entCtx, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
             ResolvedQuestion resolved) {
         StringBuilder sb = new StringBuilder();
@@ -896,25 +844,18 @@ public class ChatService {
             }
         }
 
-        // ── Enterprise map entity context — relevance-ranked, then truncated ──────
-        // Full table schema can be 2000-3000 tokens. We truncate to maxEntityContextChars
-        // (default 1500 chars ≈ 375 tokens) to cap the cost on every reasoning call.
-        // Before truncating, per-table blocks are reordered by business relevance
-        // (entity/vocabulary bindings first, keyword match as fallback) so the budget
-        // is spent on question-relevant tables instead of alphabetically-first ones.
+        // ── TABLE SCHEMA grounding — rendered by the shared PromptAssembler ───────
+        // The approved surface (relevance-ranked by AgentBrain) is rendered by the shared
+        // pipeline under the conversational policy: schema-qualified, with the connection key,
+        // data types, and value domains, bounded by the entity-context budget. The budget caps
+        // the render only; the ExecutionContract keeps the full approved surface. The empty-
+        // schema branch is conversation routing policy (which decision mode to steer toward)
+        // and stays here.
         boolean hasMemory = memChunks != null && !memChunks.isEmpty();
-        String ec = entCtx.containsKey("entityContext") ? (String) entCtx.get("entityContext") : null;
-        if (ec != null && !ec.isBlank()) {
-            @SuppressWarnings("unchecked")
-            Map<String, String> blocks = entCtx.get("entityBlocks") instanceof Map<?, ?>
-                    ? (Map<String, String>) entCtx.get("entityBlocks") : Map.of();
-            String assembled = assembleEntityContext(question, ec, blocks,
-                    semantic != null ? semantic.bindings() : List.of(),
-                    filteredGraph,
-                    semantic != null ? semantic.termLinesByObjectKey() : Map.of(),
-                    expandedTokens,
-                    maxEntityContextChars);
-            sb.append("=== TABLE SCHEMA ===\n").append(assembled).append("\n");
+        if (!promptContext.isEmpty()) {
+            sb.append(promptAssembler.assemble(promptContext,
+                    new PromptAssembler.RenderOptions(true, true, true, true, maxEntityContextChars)))
+              .append('\n');
         } else {
             sb.append("=== TABLE SCHEMA ===\n");
             sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
@@ -951,264 +892,6 @@ public class ChatService {
         }
 
         return sb.toString();
-    }
-
-    // =========================================================================
-    // Planner entity-context assembly (PRO-19)
-    //
-    // The assembler (this class) owns "which metadata does the planner see":
-    // it holds the question, every context block, and the token budget. The
-    // renderer (EnterpriseMapService) stays question-agnostic and only supplies
-    // pre-rendered per-table blocks. Static + package-private for testability.
-    // =========================================================================
-
-    /** Matches the "Table: schema.table " header the renderer emits per block. */
-    private static final java.util.regex.Pattern TABLE_HEADER =
-            java.util.regex.Pattern.compile("(?m)^Table: \\S+?\\.(\\S+) ");
-
-    /** Captures the table referenced after a JOIN keyword in graph join guidance. */
-    private static final java.util.regex.Pattern JOIN_TABLE =
-            java.util.regex.Pattern.compile("(?i)\\bJOIN\\s+([a-z0-9_.\"]+)");
-
-    /** Compatibility form without Business Terms (equivalent to an empty terms map). */
-    static String assembleEntityContext(String question, String renderedContext,
-            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
-            String graphContext, int maxChars) {
-        return assembleEntityContext(question, renderedContext, blocks, bindings,
-                graphContext, Map.of(), java.util.Set.of(), maxChars);
-    }
-
-    /** Compatibility form without retrieval expansion (equivalent to no resolutions). */
-    static String assembleEntityContext(String question, String renderedContext,
-            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
-            String graphContext, Map<String, List<String>> termLinesByObjectKey,
-            int maxChars) {
-        return assembleEntityContext(question, renderedContext, blocks, bindings,
-                graphContext, termLinesByObjectKey, java.util.Set.of(), maxChars);
-    }
-
-    /**
-     * Orders the renderer's per-table blocks by relevance to the question,
-     * attaches each block's Business Terms companion line (PRO-24 — structural
-     * accompaniment: companions ride with their block in every ordering path,
-     * including the renderer-order fallback), then applies the existing
-     * character budget. The budget is unchanged — relevance only decides WHICH
-     * tables consume it. With no terms, output is byte-identical to before.
-     *
-     * <p>{@code expandedTokens} (PRO-31) are the canonical tokens implied by the
-     * question's business-language resolutions; they join the question keywords
-     * so ranking selects metadata as if the user had spoken canonically. Empty
-     * set ⇒ byte-identical to the pre-BLR ordering.
-     */
-    static String assembleEntityContext(String question, String renderedContext,
-            Map<String, String> blocks, List<SemanticService.EntityBinding> bindings,
-            String graphContext, Map<String, List<String>> termLinesByObjectKey,
-            java.util.Set<String> expandedTokens, int maxChars) {
-        String ordered;
-        if (blocks == null || blocks.isEmpty()) {
-            ordered = renderedContext;
-        } else {
-            List<String> orderedKeys = rankEntityBlockKeys(question, blocks, bindings,
-                    graphContext, expandedTokens);
-            StringBuilder sb = new StringBuilder();
-            for (String key : orderedKeys) {
-                String block = blocks.get(key);
-                List<String> terms = termLinesByObjectKey != null
-                        ? termLinesByObjectKey.get(key) : null;
-                if (terms == null || terms.isEmpty()) {
-                    sb.append(block);
-                    continue;
-                }
-                // Attach directly under the block: renderer blocks end with a
-                // blank line — the terms line slots in before it.
-                String termsLine = "Business terms: " + String.join("; ", terms) + "\n";
-                if (block.endsWith("\n\n")) {
-                    sb.append(block, 0, block.length() - 1).append(termsLine).append("\n");
-                } else {
-                    sb.append(block).append(termsLine);
-                }
-            }
-            ordered = sb.toString();
-        }
-        return truncateEntityContext(ordered, maxChars);
-    }
-
-    /** Ranked block texts — thin wrapper over {@link #rankEntityBlockKeys}. */
-    static List<String> rankEntityBlocks(String question, Map<String, String> blocks,
-            List<SemanticService.EntityBinding> bindings, String graphContext) {
-        List<String> ordered = new ArrayList<>(blocks.size());
-        for (String key : rankEntityBlockKeys(question, blocks, bindings, graphContext,
-                java.util.Set.of())) {
-            ordered.add(blocks.get(key));
-        }
-        return ordered;
-    }
-
-    /** Compatibility form without retrieval expansion (equivalent to no resolutions). */
-    static List<String> rankEntityBlockKeys(String question, Map<String, String> blocks,
-            List<SemanticService.EntityBinding> bindings, String graphContext) {
-        return rankEntityBlockKeys(question, blocks, bindings, graphContext, java.util.Set.of());
-    }
-
-    /**
-     * Relevance tiers, in order:
-     *   1. Business Entity / Operational Vocabulary bindings — question terms
-     *      matched against curated business names, resolved to tables via
-     *      primary_object_key (primary signal);
-     *      plus join-neighbors of tier-1 tables taken from the surviving graph
-     *      context, so the planner can complete the JOINs it is told to use;
-     *   2. keyword-vs-block-text match (fallback signal);
-     *   3. renderer order (today's behavior) when nothing matches at all.
-     *
-     * PRO-31: {@code expandedTokens} — canonical tokens from business-language
-     * resolutions — join the extracted keywords before matching, closing the
-     * TX-class blindness (a resolved token selects blocks even when the surface
-     * form never became a keyword). Empty set ⇒ pre-BLR behavior exactly.
-     */
-    static List<String> rankEntityBlockKeys(String question, Map<String, String> blocks,
-            List<SemanticService.EntityBinding> bindings, String graphContext,
-            java.util.Set<String> expandedTokens) {
-
-        List<String> rendererOrder = new ArrayList<>(blocks.keySet());
-        java.util.Set<String> keywords = new java.util.HashSet<>(
-                com.sei.nexus.common.QuestionKeywords.extract(question));
-        if (expandedTokens != null) keywords.addAll(expandedTokens);
-        if (keywords.isEmpty()) return rendererOrder;
-
-        // Tier 1 — entity/vocabulary resolution
-        java.util.LinkedHashSet<String> tier1 = new java.util.LinkedHashSet<>();
-        if (bindings != null) {
-            for (SemanticService.EntityBinding b : bindings) {
-                if (b.primaryObjectKey() == null || !blocks.containsKey(b.primaryObjectKey())) continue;
-                if (matchesBindingText(b.matchText(), keywords)) tier1.add(b.primaryObjectKey());
-            }
-        }
-
-        // Tier 2 — keyword match against block text (table name, business name,
-        // purpose, guidance, column names are all in the block already)
-        Map<String, Integer> tier2 = new java.util.LinkedHashMap<>();
-        for (Map.Entry<String, String> e : blocks.entrySet()) {
-            if (tier1.contains(e.getKey())) continue;
-            int score = scoreBlock(e.getValue(), keywords);
-            if (score > 0) tier2.put(e.getKey(), score);
-        }
-
-        if (tier1.isEmpty() && tier2.isEmpty()) return rendererOrder;   // Tier 3 fallback
-
-        // Join-neighbor expansion — tables named after JOIN in the surviving
-        // (already question-filtered) graph context ride along with the match.
-        java.util.LinkedHashSet<String> neighbors = new java.util.LinkedHashSet<>();
-        java.util.Set<String> joinTables = joinTableNames(graphContext);
-        if (!joinTables.isEmpty()) {
-            for (Map.Entry<String, String> e : blocks.entrySet()) {
-                if (tier1.contains(e.getKey()) || tier2.containsKey(e.getKey())) continue;
-                String tbl = blockTableName(e.getValue());
-                if (tbl != null && joinTables.contains(tbl)) neighbors.add(e.getKey());
-            }
-        }
-
-        // Order: tier-1, its join partners, tier-2 by score (stable on renderer
-        // order for ties), then join partners of a tier-2-only match, then the rest.
-        List<String> orderedKeys = new ArrayList<>(tier1);
-        if (!tier1.isEmpty()) orderedKeys.addAll(neighbors);
-        tier2.entrySet().stream()
-                .sorted((a, b) -> b.getValue() - a.getValue())
-                .forEach(en -> orderedKeys.add(en.getKey()));
-        if (tier1.isEmpty()) orderedKeys.addAll(neighbors);
-        for (String k : blocks.keySet()) {
-            if (!orderedKeys.contains(k)) orderedKeys.add(k);
-        }
-        return orderedKeys;
-    }
-
-    /**
-     * Applies the existing character budget. The marker names the omitted tables
-     * (compactly, capped) instead of pointing the tool-less planner at
-     * describe_schema, which only exists on the agent path.
-     */
-    static String truncateEntityContext(String context, int maxChars) {
-        if (context.length() <= maxChars) return context;
-
-        List<String> omitted = new ArrayList<>();
-        java.util.regex.Matcher m = TABLE_HEADER.matcher(context);
-        while (m.find()) {
-            if (m.start() >= maxChars) omitted.add(m.group(1));
-        }
-
-        StringBuilder marker = new StringBuilder("\n[schema truncated");
-        if (!omitted.isEmpty()) {
-            marker.append(" — omitted tables: ");
-            int shown = 0;
-            for (String t : omitted) {
-                String piece = (shown > 0 ? ", " : "") + t;
-                if (marker.length() + piece.length() > 180) {
-                    marker.append(", +").append(omitted.size() - shown).append(" more");
-                    break;
-                }
-                marker.append(piece);
-                shown++;
-            }
-        }
-        marker.append("]");
-        return context.substring(0, maxChars) + marker;
-    }
-
-    /** Token-level match between a curated business term and the question keywords,
-     *  tolerant of simple singular/plural differences ("vendors" ↔ "Vendor"). */
-    private static boolean matchesBindingText(String text, java.util.Set<String> keywords) {
-        if (text == null || text.isBlank()) return false;
-        for (String token : text.toLowerCase().split("[^a-z0-9]+")) {
-            if (token.length() < 3) continue;
-            for (String kw : keywords) {
-                if (token.equals(kw) || singular(kw).equals(token) || singular(token).equals(kw)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /** Scores question keywords present in the block text. An exact keyword hit
-     *  outweighs a singular-form hit so "warehouses" ranks the warehouses table
-     *  above a table that merely has a warehouse_id column. */
-    private static int scoreBlock(String block, java.util.Set<String> keywords) {
-        String lower = block.toLowerCase();
-        int score = 0;
-        for (String kw : keywords) {
-            String sing = singular(kw);
-            if (lower.contains(kw)) score += 2;
-            else if (!sing.equals(kw) && lower.contains(sing)) score += 1;
-        }
-        return score;
-    }
-
-    /** Naive English singularisation — single shared implementation in QuestionKeywords. */
-    private static String singular(String w) {
-        return com.sei.nexus.common.QuestionKeywords.singular(w);
-    }
-
-    /** Table names referenced after a JOIN keyword in the graph context's join guidance. */
-    private static java.util.Set<String> joinTableNames(String graphContext) {
-        if (graphContext == null || graphContext.isBlank()) return java.util.Set.of();
-        java.util.Set<String> tables = new java.util.HashSet<>();
-        java.util.regex.Matcher m = JOIN_TABLE.matcher(graphContext);
-        while (m.find()) {
-            String t = m.group(1).toLowerCase().replace("\"", "");
-            int dot = t.lastIndexOf('.');
-            tables.add(dot >= 0 ? t.substring(dot + 1) : t);
-        }
-        return tables;
-    }
-
-    /** Physical table name from a block's "Table: schema.table (Business Name)" header. */
-    private static String blockTableName(String block) {
-        if (block == null || !block.startsWith("Table: ")) return null;
-        int nl = block.indexOf('\n');
-        String header = nl > 0 ? block.substring(7, nl) : block.substring(7);
-        int paren = header.indexOf(" (");
-        String qualified = (paren > 0 ? header.substring(0, paren) : header).trim();
-        int dot = qualified.lastIndexOf('.');
-        return (dot >= 0 ? qualified.substring(dot + 1) : qualified).toLowerCase();
     }
 
     // =========================================================================
@@ -1329,44 +1012,18 @@ public class ChatService {
     // =========================================================================
 
     /**
-     * Parses a comma-separated string of object keys from an investigation plan step
-     * into a List for use by the governance chain.
-     */
-    private List<String> parseObjectKeys(String objKeys) {
-        if (objKeys == null || objKeys.isBlank()) return List.of();
-        List<String> result = new java.util.ArrayList<>();
-        for (String key : objKeys.split(",")) {
-            String trimmed = key.trim();
-            if (!trimmed.isEmpty()) result.add(trimmed);
-        }
-        return result;
-    }
-
-    /**
      * PRO-33: the literal validator's scope — every domain-bearing column the
      * resolver found on the entity-bound tables, keyed by qualified
      * {@code table.column} and, when unambiguous, by bare column name (SQL
      * aliases hide the real table, so the bare key is the alias fallback).
      * Empty map ⇒ validation is a no-op (zero-cost).
      */
-    static Map<String, com.sei.nexus.reasoning.LiteralValidator.DomainInfo>
+    static Map<String, com.sei.nexus.semanticmodel.ColumnValueDomain>
             buildLiteralScope(ResolvedQuestion resolved) {
-        if (resolved == null || resolved.literalCandidates().isEmpty()) return Map.of();
-        Map<String, com.sei.nexus.reasoning.LiteralValidator.DomainInfo> scope =
-                new java.util.HashMap<>();
-        java.util.Set<String> ambiguousBare = new java.util.HashSet<>();
-        for (ResolvedQuestion.LiteralCandidate c : resolved.literalCandidates()) {
-            var info = new com.sei.nexus.reasoning.LiteralValidator.DomainInfo(
-                    c.table(), c.column(), c.authoritative(), c.values());
-            scope.put(c.qualifiedColumn().toLowerCase(java.util.Locale.ROOT), info);
-            String bare = c.column().toLowerCase(java.util.Locale.ROOT);
-            var prior = scope.putIfAbsent(bare, info);
-            if (prior != null && !prior.qualifiedColumn().equals(info.qualifiedColumn())) {
-                ambiguousBare.add(bare);
-            }
-        }
-        scope.keySet().removeAll(ambiguousBare);
-        return scope;
+        // Unified Answer Engine, Phase 2: AgentBrain owns this derivation. Chat still resolves
+        // its own question (the grounding swap is Phase 3), but it no longer keeps a second copy
+        // of the rule — behaviour is identical.
+        return com.sei.nexus.agentbrain.AgentBrain.literalScopeOf(resolved);
     }
 
     private List<String> toDomainKeyList(NexusAgent agent) {

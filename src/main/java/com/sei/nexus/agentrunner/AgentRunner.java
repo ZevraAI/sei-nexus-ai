@@ -1,23 +1,28 @@
 package com.sei.nexus.agentrunner;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sei.nexus.agentbrain.AgentBrain;
+import com.sei.nexus.agentbrain.ExecutionContract;
+import com.sei.nexus.agentbrain.ExecutionContractBuilder;
+import com.sei.nexus.agentbrain.PromptAssembler;
+import com.sei.nexus.agentbrain.PromptContext;
+import com.sei.nexus.agentbrain.PromptContextBuilder;
+import com.sei.nexus.agentbrain.ResolvedBusinessModel;
+import com.sei.nexus.semanticmodel.BusinessObject;
 import com.sei.nexus.ai.AgentMessage;
 import com.sei.nexus.ai.AgentToolResponse;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
-import com.sei.nexus.graph.KnowledgeGraphService;
-import com.sei.nexus.semantic.SemanticService;
-import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.run.NexusRun;
+import com.sei.nexus.run.RunRepository;
 import org.springframework.http.HttpStatus;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * The ReAct loop: given an agent and a user message, the LLM iteratively
@@ -27,38 +32,42 @@ import java.util.Set;
 @Service
 public class AgentRunner {
 
-    private final AzureOpenAiClient    openAi;
-    private final AgentToolRegistry    toolRegistry;
-    private final ZevraAgentRepository repository;
-    private final DynamicSqlService    dynamicSql;
-    private final ObjectMapper         mapper;
-    private final SemanticService      semanticService;
-    private final KnowledgeGraphService graphService;
-    private final JdbcTemplate         jdbc;
+    private final AzureOpenAiClient        openAi;
+    private final AgentToolRegistry        toolRegistry;
+    private final ZevraAgentRepository     repository;
+    private final ObjectMapper             mapper;
+    private final RunRepository            runRepository;
+    private final AgentBrain               agentBrain;
+    private final ExecutionContractBuilder contractBuilder;
+    private final PromptContextBuilder     promptContextBuilder;
+    private final PromptAssembler          promptAssembler;
 
     public AgentRunner(AzureOpenAiClient openAi,
                        AgentToolRegistry toolRegistry,
                        ZevraAgentRepository repository,
-                       DynamicSqlService dynamicSql,
                        ObjectMapper mapper,
-                       SemanticService semanticService,
-                       KnowledgeGraphService graphService,
-                       JdbcTemplate jdbc) {
-        this.openAi          = openAi;
-        this.toolRegistry    = toolRegistry;
-        this.repository      = repository;
-        this.dynamicSql      = dynamicSql;
-        this.mapper          = mapper;
-        this.semanticService = semanticService;
-        this.graphService    = graphService;
-        this.jdbc            = jdbc;
+                       RunRepository runRepository,
+                       AgentBrain agentBrain,
+                       ExecutionContractBuilder contractBuilder,
+                       PromptContextBuilder promptContextBuilder,
+                       PromptAssembler promptAssembler) {
+        this.openAi               = openAi;
+        this.toolRegistry         = toolRegistry;
+        this.repository           = repository;
+        this.mapper               = mapper;
+        this.runRepository        = runRepository;
+        this.agentBrain           = agentBrain;
+        this.contractBuilder      = contractBuilder;
+        this.promptContextBuilder = promptContextBuilder;
+        this.promptAssembler      = promptAssembler;
     }
 
     /**
      * Runs the agent for one user message.
      * Creates a session record, executes the ReAct loop, persists the result.
      */
-    public ZevraSession run(ZevraAgent agent, String inputMessage) {
+    public ZevraSession run(ZevraAgent agent, String inputMessage, String userEmail,
+                            String existingRunKey) {
         String sessionId = Keys.uniqueKey("ses");
         ZevraSession session = new ZevraSession(
                 sessionId, agent.id(), agent.tenantSchema(),
@@ -66,31 +75,45 @@ public class AgentRunner {
                 null, null, 0, null, null);
         repository.insertSession(session);
 
+        // Governance run (ADR-0003 A2): the parent nexus_run for this session's governed
+        // query executions and audit events. For AUTONOMOUS execution (direct agent chat,
+        // Executive Brief) the runtime creates its own run. When invoked from the
+        // conversational path (routed chat), the caller already created the request's run
+        // and passes its key — reuse it so routed chat produces exactly one nexus_run and
+        // never a duplicate insert.
+        String governanceRunKey;
+        if (existingRunKey != null && !existingRunKey.isBlank()) {
+            governanceRunKey = existingRunKey;
+        } else {
+            governanceRunKey = Keys.runKey();
+            runRepository.save(new NexusRun(governanceRunKey, sessionId, agent.slug(), null,
+                    userEmail, inputMessage, null, null, "RUNNING", null, null, null));
+        }
+
         List<Map<String, Object>> steps = new ArrayList<>();
 
         try {
-            // 1. Build context — semantic vocabulary first, raw schema as compact fallback.
-            //    CRITICAL: We filter both to keywords from the question so we never dump
-            //    the full graph (50+ entities) or full schema into every iteration.
-            long schemaStart = System.currentTimeMillis();
-            List<String> domainKeys  = loadActiveDomainKeys();
-            Set<String>  keywords    = extractKeywords(inputMessage);
+            // 1. Business-object resolution + grounding (ADR-0003 A11/A12). Agent Brain
+            //    resolves the request against the Enterprise Map and produces a
+            //    ResolvedBusinessModel; the deterministic builder compiles the immutable
+            //    ExecutionContract; the prompt pipeline grounds the model in approved
+            //    business objects only (no information_schema). The contract is the agent's
+            //    execution surface for the whole run and drives runtime enforcement below.
+            long resolveStart = System.currentTimeMillis();
+            ResolvedBusinessModel businessModel = agentBrain.resolve(agent, inputMessage);
+            ExecutionContract contract = contractBuilder.compile(businessModel);
+            PromptContext promptContext = promptContextBuilder.build(contract);
+            String grounding = promptAssembler.assemble(promptContext);
 
-            // Semantic vocabulary: only terms matching the question keywords.
-            // Graph entity descriptions are included for business meaning but
-            // table name references are stripped — the Schema section is authoritative
-            // for actual table names and prevents mismatches with knowledge graph data.
-            String semanticCtx = buildFilteredVocabulary(domainKeys, keywords);
+            steps.add(step("CONTEXT_RESOLVE", Map.of(
+                    "contractId",      contract.contractId(),
+                    "connections",     agent.connectionKeys(),
+                    "businessObjects", contract.semanticView().businessObjects().stream()
+                            .map(BusinessObject::businessName).toList()),
+                    null, System.currentTimeMillis() - resolveStart));
 
-            // Raw schema: only business tables, filtered to relevant ones, used as
-            // fallback for tables not covered by vocabulary
-            String schemaContext = buildSchemaContext(agent.connectionKeys(), inputMessage);
-
-            steps.add(step("SCHEMA_LOAD", Map.of("connections", agent.connectionKeys()),
-                    null, System.currentTimeMillis() - schemaStart));
-
-            // 2. Build system prompt
-            String systemPrompt = buildSystemPrompt(agent, semanticCtx, schemaContext);
+            // 2. Build system prompt (grounded only in approved business objects).
+            String systemPrompt = buildSystemPrompt(agent, grounding);
 
             // 3. Build tool definitions
             List<Map<String, Object>> tools =
@@ -108,7 +131,7 @@ public class AgentRunner {
             Map<String, String> toolResultCache = new LinkedHashMap<>();
 
             // 5. ReAct loop — set usage context so every LLM call is attributed
-            com.sei.nexus.usage.UsageContext.set("agent", null, agent.name());
+            com.sei.nexus.usage.UsageContext.set("agent", userEmail, agent.name());
             int iterations = 0;
             while (iterations < agent.maxIterations()) {
                 iterations++;
@@ -150,7 +173,7 @@ public class AgentRunner {
                             "to progress toward final_answer.\n" + cached;
                 } else {
                     toolResult = toolRegistry.execute(toolName, args,
-                            agent.connectionKeys());
+                            agent.connectionKeys(), userEmail, governanceRunKey, iterations, contract);
                     toolResultCache.put(cacheKey, toolResult);
                 }
 
@@ -247,90 +270,11 @@ public class AgentRunner {
         }
     }
 
-    // Column names that typically hold a small set of string values —
-    // we fetch DISTINCT values for these so the LLM uses the exact strings stored.
-    private static final java.util.Set<String> STATUS_COLUMNS = java.util.Set.of(
-            "status", "state", "severity", "type", "category", "priority",
-            "stage", "condition", "level", "kind");
-
-    // Max tables to include per connection in the schema context.
-    // Sending every table bloats the prompt — we only include the most relevant ones.
-    private static final int MAX_SCHEMA_TABLES = 8;
-
     // Tool-call/result pairs kept in the LLM's context window. Must comfortably
     // exceed the number of distinct queries a typical task needs at once —
     // a window smaller than the task's working set makes the model re-run
     // queries whose results were pruned, looping until max iterations.
     private static final int HISTORY_KEEP_PAIRS = 6;
-
-    private String buildSchemaContext(List<String> connectionKeys, String question) {
-        Set<String> keywords = extractKeywords(question);
-        StringBuilder sb = new StringBuilder();
-
-        for (String connKey : connectionKeys) {
-            sb.append("Connection: ").append(connKey).append("\n");
-            try {
-                List<Map<String, Object>> allTables =
-                        dynamicSql.listTablesWithColumnCounts(connKey, "public");
-
-                // Strip Zevra platform tables — agents should only see business data.
-                // Without this filter the context includes 40+ nexus_* system tables
-                // which bloats every prompt by thousands of tokens.
-                List<Map<String, Object>> businessTables = allTables.stream()
-                        .filter(row -> {
-                            String n = String.valueOf(row.get("table_name"));
-                            return !n.startsWith("nexus_") && !n.startsWith("flyway_");
-                        })
-                        .toList();
-
-                // Score each remaining table by relevance to the question — include top N.
-                // A table scores +3 if its name contains a keyword, +1 per column match.
-                List<Map<String, Object>> ranked = businessTables.stream()
-                        .sorted((a, b) -> {
-                            int sa = tableRelevance(a, keywords);
-                            int sb2 = tableRelevance(b, keywords);
-                            if (sb2 != sa) return sb2 - sa; // higher score first
-                            // tie-break: prefer tables whose names appear in the question
-                            return String.valueOf(a.get("table_name"))
-                                         .compareTo(String.valueOf(b.get("table_name")));
-                        })
-                        .limit(MAX_SCHEMA_TABLES)
-                        .toList();
-
-                for (Map<String, Object> row : ranked) {
-                    String tableName = String.valueOf(row.get("table_name"));
-                    sb.append("  - ").append(tableName)
-                      .append(" (").append(row.get("column_names")).append(")\n");
-
-                    // Append distinct values for status/category columns so the LLM
-                    // uses exact stored values and never guesses wrong case or spelling.
-                    String colNames = String.valueOf(row.getOrDefault("column_names", ""));
-                    for (String col : colNames.split(",")) {
-                        String colName = col.trim().replaceAll("\\s*\\(.*?\\)", "").trim();
-                        if (STATUS_COLUMNS.contains(colName.toLowerCase())) {
-                            try {
-                                List<Map<String, Object>> vals = dynamicSql.executeQuery(
-                                        connKey,
-                                        "SELECT DISTINCT " + colName + " FROM " + tableName +
-                                        " WHERE " + colName + " IS NOT NULL ORDER BY " + colName + " LIMIT 15",
-                                        15);
-                                if (!vals.isEmpty()) {
-                                    String sample = vals.stream()
-                                            .map(v -> "'" + v.get(colName) + "'")
-                                            .collect(java.util.stream.Collectors.joining(", "));
-                                    sb.append("      ").append(colName)
-                                      .append(" values: ").append(sample).append("\n");
-                                }
-                            } catch (Exception ignored) {}
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                sb.append("  (schema unavailable)\n");
-            }
-        }
-        return sb.toString();
-    }
 
     /**
      * Keeps the original user message plus the last {@code keepPairs} tool-call/result
@@ -358,110 +302,20 @@ public class AgentRunner {
         return pruned;
     }
 
-    /** Scores a table row by how many question keywords appear in its name or columns. */
-    private int tableRelevance(Map<String, Object> row, Set<String> keywords) {
-        if (keywords.isEmpty()) return 0;
-        String name = String.valueOf(row.get("table_name")).toLowerCase();
-        String cols = String.valueOf(row.getOrDefault("column_names", "")).toLowerCase();
-        int score = 0;
-        for (String kw : keywords) {
-            if (name.contains(kw))  score += 3;
-            if (cols.contains(kw))  score += 1;
-        }
-        return score;
-    }
-
-    /** Extracts meaningful keywords from the user question (strips stop words + short tokens). */
-    private Set<String> extractKeywords(String question) {
-        if (question == null || question.isBlank()) return Set.of();
-        Set<String> stops = Set.of(
-                "show", "me", "all", "the", "a", "an", "is", "are", "was", "were",
-                "what", "which", "how", "many", "list", "get", "find", "give", "tell",
-                "and", "or", "of", "in", "on", "at", "to", "for", "with", "from");
-        return java.util.Arrays.stream(question.toLowerCase().split("[\\s,?!.;:]+"))
-                .filter(w -> w.length() >= 3 && !stops.contains(w))
-                .collect(java.util.stream.Collectors.toSet());
-    }
-
-    /** Fetches active domain keys for the current tenant (TenantContext already set). */
-    private List<String> loadActiveDomainKeys() {
-        try {
-            return jdbc.queryForList(
-                    "SELECT domain_key FROM nexus_domain WHERE status = 'ACTIVE' LIMIT 20",
-                    String.class);
-        } catch (Exception e) {
-            return List.of();
-        }
-    }
-
     /**
-     * Returns only vocabulary terms whose term or SQL matches the question keywords.
-     * Sending the full vocabulary (100+ terms) wastes tokens on every iteration.
-     * A question about "open orders" needs only the "open orders" entry, not all terms.
+     * Builds the system prompt from persona/goal and the Agent-Brain-approved grounding.
+     * The grounding is authored by the prompt pipeline from the ExecutionContract's
+     * SemanticView; the runtime performs no business grounding of its own and never reads
+     * information_schema (ADR-0003 A12).
      */
-    private String buildFilteredVocabulary(List<String> domainKeys, Set<String> keywords) {
-        if (domainKeys.isEmpty() || keywords.isEmpty()) return "";
-        try {
-            String[] arr = domainKeys.toArray(new String[0]);
-            List<Map<String, Object>> rows = jdbc.query(
-                    "SELECT term, sql_equivalent FROM nexus_operational_vocabulary " +
-                    "WHERE domain_key = ANY(?::text[]) AND status = 'ACTIVE' LIMIT 100",
-                    ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", arr)),
-                    (rs, i) -> Map.<String, Object>of(
-                            "term", rs.getString("term"),
-                            "sql",  rs.getString("sql_equivalent") != null
-                                        ? rs.getString("sql_equivalent") : ""));
-
-            // Keep only terms where at least one keyword appears in the term text.
-            // From the SQL pattern we extract only the WHERE/filter logic — not the
-            // full SELECT with a table name that may be stale or from a different schema.
-            // Table names come from the Schema section (authoritative); vocabulary
-            // provides the filter condition to apply to those tables.
-            StringBuilder sb = new StringBuilder();
-            for (Map<String, Object> row : rows) {
-                String term = String.valueOf(row.get("term")).toLowerCase();
-                boolean relevant = keywords.stream().anyMatch(term::contains);
-                if (relevant) {
-                    sb.append("  ").append(row.get("term"));
-                    String sql = String.valueOf(row.get("sql"));
-                    if (!sql.isBlank()) {
-                        // Extract only the WHERE clause — drop the SELECT/FROM with table name
-                        String upperSql = sql.toUpperCase();
-                        int whereIdx = upperSql.indexOf("WHERE");
-                        String filter = whereIdx >= 0 ? sql.substring(whereIdx) : sql;
-                        sb.append(" → ").append(filter);
-                    }
-                    sb.append("\n");
-                }
-            }
-            return sb.length() > 0 ? "Business vocabulary:\n" + sb : "";
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    private String buildSystemPrompt(ZevraAgent agent,
-                                     String semanticCtx,
-                                     String schemaContext) {
-        // Concise — sent on every ReAct iteration, every extra token multiplies cost.
+    static String buildSystemPrompt(ZevraAgent agent, String grounding) {
         StringBuilder sb = new StringBuilder();
-        sb.append(agent.persona()).append(" ").append(agent.goal()).append("\n\n");
-
-        // Vocabulary comes first — if the term has a known SQL pattern,
-        // the agent uses it directly without extra schema queries.
-        if (semanticCtx != null && !semanticCtx.isBlank()) {
-            sb.append(semanticCtx).append("\n");
-        }
-
-        // Compact schema fallback for tables not covered by vocabulary.
-        if (schemaContext != null && !schemaContext.isBlank()) {
-            sb.append("Schema:\n").append(schemaContext).append("\n");
-        }
-
-        sb.append("CRITICAL: The Schema section lists the ACTUAL table names in the database. " +
-                  "Always use those exact table names when writing SQL. " +
-                  "Vocabulary patterns show SQL logic — adapt them to use the Schema table names. " +
-                  "SELECT only. Query data, call final_answer with findings. Be factual.");
+        sb.append(agent.persona()).append(' ').append(agent.goal()).append("\n\n");
+        sb.append(grounding).append('\n');
+        sb.append("CRITICAL: You may ONLY query the business objects listed above, using their exact "
+                + "physical table names. Do NOT invent tables or business objects. If the data the user "
+                + "asks about is not among these business objects, say so plainly via final_answer instead "
+                + "of guessing. SELECT only. Query data, then call final_answer with findings. Be factual.");
         return sb.toString();
     }
 

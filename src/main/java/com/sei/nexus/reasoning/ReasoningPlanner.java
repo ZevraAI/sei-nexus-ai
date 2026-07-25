@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.prompt.SqlIdentifierGuidance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -32,7 +33,8 @@ public class ReasoningPlanner {
 
     private static final Logger log = LoggerFactory.getLogger(ReasoningPlanner.class);
 
-    private static final String SYSTEM_PROMPT = """
+    private static final String SYSTEM_PROMPT =
+            SqlIdentifierGuidance.SCHEMA_AUTHORITY + "\n\n" + """
             You are a SQL investigation planner building a case step by step.
             The user's question and all evidence gathered so far are provided.
             Your job: generate the SINGLE next SQL query that will most advance the investigation.
@@ -58,7 +60,8 @@ public class ReasoningPlanner {
 
             OR if no further queries are needed:
             {"done":true}
-            """;
+            """
+            + "\n" + SqlIdentifierGuidance.IDENTIFIER_RULES;
 
     private final AzureOpenAiClient aiClient;
     private final ObjectMapper      objectMapper;

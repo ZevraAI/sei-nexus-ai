@@ -70,12 +70,14 @@ public class ZevraAgentService {
 
     // ── Execution ─────────────────────────────────────────────────────────────
 
-    public ZevraSession chat(String agentId, String tenantSchema, String message) {
+    public ZevraSession chat(String agentId, String tenantSchema, String message, String userEmail) {
         ZevraAgent agent = getAgent(agentId, tenantSchema);
         if (agent.connectionKeys().isEmpty())
             throw new NexusException(HttpStatus.BAD_REQUEST,
                     "Agent has no connections configured — add at least one connection before chatting.");
-        return runner.run(agent, message);
+        // Direct agent chat is autonomous execution — no conversational run exists, so the
+        // runtime creates its own governance run (existingRunKey = null).
+        return runner.run(agent, message, userEmail, null);
     }
 
     public List<ZevraSession> listSessions(String agentId, String tenantSchema) {

@@ -1,4 +1,5 @@
 package com.sei.nexus.reasoning;
+import com.sei.nexus.semanticmodel.ColumnValueDomain;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -32,14 +33,6 @@ import java.util.regex.Pattern;
  * answers less available than today.
  */
 public final class LiteralValidator {
-
-    /** A domain-bearing column in scope: its persisted legal/observed values. */
-    public record DomainInfo(String table, String column, boolean authoritative,
-                             List<String> values) {
-        public String qualifiedColumn() {
-            return table + "." + column;
-        }
-    }
 
     /** One invalid literal: what was used, where, and what would be legal. */
     public record Violation(String column, String literal, boolean authoritative,
@@ -75,7 +68,7 @@ public final class LiteralValidator {
      */
     public static Result validate(String sql,
                                   List<ReasoningPlanner.LiteralBinding> bindings,
-                                  Map<String, DomainInfo> scope,
+                                  Map<String, ColumnValueDomain> scope,
                                   String questionText) {
         if (scope == null || scope.isEmpty()) return new Result(List.of());
         String exemptionText = questionText != null
@@ -113,10 +106,10 @@ public final class LiteralValidator {
      * the scope: full form, then table.column, then bare column — bare only
      * when the scope registered it unambiguously.
      */
-    public static DomainInfo lookup(Map<String, DomainInfo> scope, String columnRef) {
+    public static ColumnValueDomain lookup(Map<String, ColumnValueDomain> scope, String columnRef) {
         if (columnRef == null || columnRef.isBlank()) return null;
         String ref = columnRef.toLowerCase(Locale.ROOT);
-        DomainInfo d = scope.get(ref);
+        ColumnValueDomain d = scope.get(ref);
         if (d != null) return d;
         String[] parts = ref.split("\\.");
         if (parts.length >= 2) {
@@ -127,10 +120,10 @@ public final class LiteralValidator {
     }
 
     private static void check(String columnRef, String literal,
-                              Map<String, DomainInfo> scope, String exemptionText,
+                              Map<String, ColumnValueDomain> scope, String exemptionText,
                               Set<String> dedupe, List<Violation> violations) {
         if (literal == null || literal.isBlank()) return;
-        DomainInfo domain = lookup(scope, columnRef);
+        ColumnValueDomain domain = lookup(scope, columnRef);
         if (domain == null) return;                                  // no domain ⇒ no gate
         if (domain.values().contains(literal)) return;               // exists ⇒ valid
         // Verbatim exemption: user-supplied ground truth is never vetoed.

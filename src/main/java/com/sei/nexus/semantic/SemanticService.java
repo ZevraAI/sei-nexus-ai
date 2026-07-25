@@ -40,7 +40,7 @@ public class SemanticService {
      * A business term (an entity name or a vocabulary term) bound to the physical
      * table it resolves to via nexus_business_entity.primary_object_key. The
      * primaryObjectKey equals nexus_data_object.object_key, i.e. the key of the
-     * rendered entity block in EnterpriseMapService.operationalContext.
+     * business object the term resolves to.
      */
     public record EntityBinding(String matchText, String primaryObjectKey) {}
 

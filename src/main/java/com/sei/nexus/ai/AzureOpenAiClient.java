@@ -264,6 +264,32 @@ public class AzureOpenAiClient {
         }
     }
 
+    /**
+     * Opt-in diagnostic: dumps the exact transmitted request body to a file when
+     * {@code -Dnexus.capture.payload.dir} is set. Used to verify precisely what text reaches
+     * Azure OpenAI. When {@code -Dnexus.capture.abortBeforeSend=true} it throws right after
+     * writing, so a capture harness never actually transmits the payload over the network.
+     * Both flags are unset in production, so this is a pure no-op there.
+     */
+    private void capturePayload(String url, String jsonBody) {
+        String dir = System.getProperty("nexus.capture.payload.dir");
+        if (dir == null || dir.isBlank()) return;
+        try {
+            java.nio.file.Path out = java.nio.file.Path.of(dir,
+                    "openai-request-" + System.nanoTime() + ".json");
+            java.nio.file.Files.createDirectories(out.getParent());
+            java.nio.file.Files.writeString(out, jsonBody);
+            System.out.println("[capturePayload] url=" + url + " bytes=" + jsonBody.length()
+                    + " -> " + out);
+        } catch (Exception e) {
+            System.out.println("[capturePayload] failed: " + e.getMessage());
+        }
+        if (Boolean.getBoolean("nexus.capture.abortBeforeSend")) {
+            throw new NexusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "capture: payload written, send aborted by nexus.capture.abortBeforeSend");
+        }
+    }
+
     /** Extracts token counts from an OpenAI response and records them for billing. */
     private void recordUsage(JsonNode root, String model) {
         try {
@@ -286,6 +312,12 @@ public class AzureOpenAiClient {
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Failed to serialize OpenAI request: " + e.getMessage());
         }
+
+        // Diagnostic capture (opt-in): when -Dnexus.capture.payload.dir is set, write the exact
+        // serialized request body — byte-for-byte what BodyPublishers.ofString(jsonBody) transmits
+        // below — to a file, immediately before the HTTP send. The body carries no credentials
+        // (the API key is an Authorization header, never in the payload). No-op in normal runs.
+        capturePayload(url, jsonBody);
 
         long backoffMs = INITIAL_BACKOFF_MS;
         Exception lastException = null;
