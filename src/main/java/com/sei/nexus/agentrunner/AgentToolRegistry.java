@@ -110,10 +110,12 @@ public class AgentToolRegistry {
     public String execute(String toolName, Map<String, Object> args,
                            List<String> allowedConnections,
                            String userEmail, String runKey, int stepNo,
-                           ExecutionContract contract) {
+                           ExecutionContract contract,
+                           String conversationId, String parentExecutionId) {
         try {
             return switch (toolName) {
-                case "query_database"  -> execQueryDatabase(args, allowedConnections, userEmail, runKey, stepNo, contract);
+                case "query_database"  -> execQueryDatabase(args, allowedConnections, userEmail, runKey, stepNo,
+                        contract, conversationId, parentExecutionId);
                 case "describe_schema" -> execDescribeSchema(args, allowedConnections, contract);
                 case "analyze_image"   -> execAnalyzeImage(args);
                 case "final_answer"    -> String.valueOf(args.get("answer"));
@@ -130,7 +132,8 @@ public class AgentToolRegistry {
     private String execQueryDatabase(Map<String, Object> args,
                                       List<String> allowedConnections,
                                       String userEmail, String runKey, int stepNo,
-                                      ExecutionContract contract) throws Exception {
+                                      ExecutionContract contract,
+                                      String conversationId, String parentExecutionId) throws Exception {
         String connKey = getString(args, "connection_key");
         String sql     = getString(args, "sql");
 
@@ -145,7 +148,8 @@ public class AgentToolRegistry {
         // verdict becomes a physical tool observation the ReAct loop can re-plan against;
         // the business explanation is the model's final_answer, not the runtime's.
         GovernedSqlRuntime.Outcome outcome = runtime.execute(
-                GovernedSqlRuntime.Request.forAgent(runKey, stepNo, connKey, sql, userEmail, contract));
+                GovernedSqlRuntime.Request.forAgent(runKey, stepNo, connKey, sql, userEmail, contract,
+                        conversationId, parentExecutionId));
 
         return switch (outcome.status()) {
             case UNAPPROVED_OBJECTS -> mapper.writeValueAsString(Map.of(

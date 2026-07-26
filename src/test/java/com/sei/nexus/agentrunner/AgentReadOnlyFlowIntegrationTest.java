@@ -192,9 +192,13 @@ class AgentReadOnlyFlowIntegrationTest {
         govPipeline = new FakeGovPipeline();
         SqlTableReferenceExtractor extractor = new SqlTableReferenceExtractor();
         // Phase 1: the agent path executes through the shared deterministic runtime.
+        com.sei.nexus.runtime.ExecutionReferenceRepository refRepo =
+                new com.sei.nexus.runtime.ExecutionReferenceRepository(null, mapper) {
+                    @Override public void save(com.sei.nexus.runtime.ExecutionReference r) { /* no-op */ }
+                };
         com.sei.nexus.runtime.GovernedSqlRuntime runtime =
                 new com.sei.nexus.runtime.GovernedSqlRuntime(govPipeline, dynamicSql,
-                        new NoopAudit(), extractor, null, null, mapper);
+                        new NoopAudit(), extractor, null, null, refRepo, mapper);
         AgentToolRegistry registry = new AgentToolRegistry(openAi, mapper, runtime);
         return new AgentRunner(openAi, registry, repository, mapper, runRepo,
                 new FakeAgentBrain(), new ExecutionContractBuilder(extractor),

@@ -3,6 +3,7 @@ package com.sei.nexus.runtime;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.agentbrain.ExecutionBindings;
 import com.sei.nexus.agentbrain.ExecutionContract;
+import com.sei.nexus.common.Keys;
 import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.governance.GovernanceAuditService;
 import com.sei.nexus.governance.GovernanceOutcome;
@@ -19,6 +20,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -66,6 +68,7 @@ public class GovernedSqlRuntime {
     private final SqlTableReferenceExtractor tableExtractor;
     private final QueryExecutionRepository executionRepository;
     private final ConnectionRepository     connectionRepository;
+    private final ExecutionReferenceRepository executionReferenceRepository;
     private final ObjectMapper             objectMapper;
 
     public GovernedSqlRuntime(SqlGovernancePipeline pipeline,
@@ -74,6 +77,7 @@ public class GovernedSqlRuntime {
                               SqlTableReferenceExtractor tableExtractor,
                               QueryExecutionRepository executionRepository,
                               ConnectionRepository connectionRepository,
+                              ExecutionReferenceRepository executionReferenceRepository,
                               ObjectMapper objectMapper) {
         this.pipeline             = pipeline;
         this.dynamicSql           = dynamicSql;
@@ -81,6 +85,7 @@ public class GovernedSqlRuntime {
         this.tableExtractor       = tableExtractor;
         this.executionRepository  = executionRepository;
         this.connectionRepository = connectionRepository;
+        this.executionReferenceRepository = executionReferenceRepository;
         this.objectMapper         = objectMapper;
     }
 
@@ -126,7 +131,11 @@ public class GovernedSqlRuntime {
             Map<String, ColumnValueDomain> literalScope,
             List<ReasoningPlanner.LiteralBinding> literalBindings,
             String questionText,
-            Set<String> literalRejections) {
+            Set<String> literalRejections,
+            // Execution Continuity: carried through so the ExecutionReference records them; both
+            // nullable. Runtime records parentExecutionId verbatim — it never decides lineage.
+            String conversationId,
+            String parentExecutionId) {
 
         /**
          * Autonomous-agent policy: contract gate on, literal validation off (no domain scope
@@ -134,9 +143,11 @@ public class GovernedSqlRuntime {
          * pre-checked against the agent's allow-list by the caller, so no existence check here.
          */
         public static Request forAgent(String runKey, int stepNo, String connectionKey, String sql,
-                                       String userEmail, ExecutionContract contract) {
+                                       String userEmail, ExecutionContract contract,
+                                       String conversationId, String parentExecutionId) {
             return new Request(runKey, stepNo, connectionKey, "", sql, userEmail,
-                    false, true, false, false, contract, true, null, null, null, null);
+                    false, true, false, false, contract, true, null, null, null, null,
+                    conversationId, parentExecutionId);
         }
 
         /**
@@ -157,10 +168,12 @@ public class GovernedSqlRuntime {
                                          String questionText,
                                          Set<String> literalRejections,
                                          ExecutionContract contract,
-                                         boolean enforceContractGate) {
+                                         boolean enforceContractGate,
+                                         String conversationId, String parentExecutionId) {
             return new Request(runKey, stepNo, connectionKey, objectKeys, sql, userEmail,
                     forceAsync, false, true, true, contract, enforceContractGate,
-                    literalScope, literalBindings, questionText, literalRejections);
+                    literalScope, literalBindings, questionText, literalRejections,
+                    conversationId, parentExecutionId);
         }
     }
 
@@ -177,7 +190,10 @@ public class GovernedSqlRuntime {
             long executionMs,
             List<String> unapprovedTables,
             String approvedTables,
-            Exception failure) {
+            Exception failure,
+            // Execution Continuity: the immutable record of what executed — present only on
+            // EXECUTED, null for every non-executed outcome. Returned alongside the Outcome.
+            ExecutionReference executionReference) {
 
         public boolean isExecuted() { return status == Status.EXECUTED; }
     }
@@ -280,8 +296,20 @@ public class GovernedSqlRuntime {
             long elapsed = System.currentTimeMillis() - startMs;
             auditService.recordOutcome(gov, r.userEmail(), r.runKey(), r.connectionKey(),
                     objKeys, rows.size(), (int) elapsed, false);
+            // Execution Continuity: record the immutable ExecutionReference — the semantic snapshot
+            // is COPIED verbatim from the contract; the rest are facts Runtime observed. Persisted
+            // independently of the trackExecution lifecycle so both policies emit it. Best-effort:
+            // a persistence hiccup must never fail an otherwise-successful execution.
+            ExecutionReference reference =
+                    buildExecutionReference(r, gov, rows, rowsJson, Instant.ofEpochMilli(startMs), elapsed);
+            try {
+                executionReferenceRepository.save(reference);
+            } catch (Exception persistEx) {
+                log.warn("ExecutionReference persist failed for run {} (execution still returned): {}",
+                        r.runKey(), persistEx.getMessage());
+            }
             return new Outcome(Status.EXECUTED, null, gov, rows, rowsJson, elapsed,
-                    shadowUnapproved, shadowApproved, null);
+                    shadowUnapproved, shadowApproved, null, reference);
         } catch (Exception ex) {
             if (r.trackExecution()) {
                 executionRepository.updateStatus(gov.executionKey(), "FAILED", null,
@@ -290,7 +318,7 @@ public class GovernedSqlRuntime {
             auditService.recordOutcome(gov, r.userEmail(), r.runKey(), r.connectionKey(),
                     objKeys, null, null, false);
             return new Outcome(Status.FAILED, ex.getMessage(), gov, List.of(), null, 0L,
-                    shadowUnapproved, shadowApproved, ex);
+                    shadowUnapproved, shadowApproved, ex, null);
         }
     }
 
@@ -298,7 +326,56 @@ public class GovernedSqlRuntime {
 
     private static Outcome decision(Status status, String message, GovernanceOutcome gov,
                                     List<String> unapproved, String approved) {
-        return new Outcome(status, message, gov, List.of(), null, 0L, unapproved, approved, null);
+        return new Outcome(status, message, gov, List.of(), null, 0L, unapproved, approved, null, null);
+    }
+
+    /**
+     * Assembles the immutable {@link ExecutionReference} for a successful execution. The semantic
+     * snapshot is <b>copied verbatim</b> from the contract (never derived); the remaining fields are
+     * facts Runtime observed. No comparison to any prior execution occurs here.
+     */
+    private static ExecutionReference buildExecutionReference(Request r, GovernanceOutcome gov,
+            List<Map<String, Object>> rows, String rowsJson, Instant startedAt, long elapsed) {
+        List<String> columns = rows.isEmpty() ? List.of() : new ArrayList<>(rows.get(0).keySet());
+
+        // ── Semantic snapshot: copied from the ExecutionContract, unchanged ──
+        String contractId = null, semanticHash = null;
+        List<String> retrievalTargets = List.of();
+        Map<String, String> objectBindings = Map.of();
+        Map<String, String> attributeBindings = Map.of();
+        List<String> approvedAssets = List.of();
+        if (r.contract() != null) {
+            contractId   = r.contract().contractId();
+            semanticHash = r.contract().semanticHash();
+            ExecutionBindings b = r.contract().executionBindings();
+            objectBindings = new LinkedHashMap<>();
+            for (Map.Entry<String, ExecutionBindings.ExecutionTarget> e : b.objectBindings().entrySet()) {
+                objectBindings.put(e.getKey(), qualifiedTable(e.getValue()));
+            }
+            retrievalTargets = objectBindings.values().stream().distinct().collect(Collectors.toList());
+            attributeBindings = new LinkedHashMap<>();
+            for (Map.Entry<String, ExecutionBindings.ExecutionTarget> e : b.attributeBindings().entrySet()) {
+                ExecutionBindings.ExecutionTarget t = e.getValue();
+                attributeBindings.put(e.getKey(), qualifiedTable(t)
+                        + (t.column() != null ? "." + t.column() : ""));
+            }
+            approvedAssets = b.approvedAssets().stream()
+                    .map(a -> a.connectionKey() + ":" + a.canonicalIdentifier())
+                    .sorted().collect(Collectors.toList());
+        }
+
+        return new ExecutionReference(
+                Keys.uniqueKey("exec"), r.parentExecutionId(), r.conversationId(), r.runKey(),
+                r.connectionKey(), startedAt, Instant.now(), elapsed,
+                gov != null ? gov.route() : null, rows.size(), columns, rowsJson,
+                gov != null ? gov.governedSql() : null,
+                contractId, semanticHash, retrievalTargets, objectBindings, attributeBindings, approvedAssets);
+    }
+
+    /** schema.table for a target (schema omitted when blank). Verbatim projection of approved bindings. */
+    private static String qualifiedTable(ExecutionBindings.ExecutionTarget t) {
+        String schema = t.schema();
+        return (schema != null && !schema.isBlank()) ? schema + "." + t.table() : t.table();
     }
 
     /** Comma-separated object keys → list; blank yields an empty list (agent passes ""). */

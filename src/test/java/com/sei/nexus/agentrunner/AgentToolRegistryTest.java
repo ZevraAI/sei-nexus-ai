@@ -104,7 +104,10 @@ class AgentToolRegistryTest {
         // connectionRepository is null: the agent policy never requests an existence check
         // (its allow-list check happens in AgentToolRegistry), so it must never be touched.
         GovernedSqlRuntime runtime = new GovernedSqlRuntime(pipeline, dynamicSql, audit,
-                EXTRACTOR, new ForbiddenExecutionRepo(), null, new ObjectMapper());
+                EXTRACTOR, new ForbiddenExecutionRepo(),
+                null, new com.sei.nexus.runtime.ExecutionReferenceRepository(null, new ObjectMapper()) {
+                    @Override public void save(com.sei.nexus.runtime.ExecutionReference r) { /* no-op */ }
+                }, new ObjectMapper());
         registry = new AgentToolRegistry(/* openAi */ null, new ObjectMapper(), runtime);
     }
 
@@ -124,7 +127,8 @@ class AgentToolRegistryTest {
 
     private String runQuery(String sql, ExecutionContract contract) {
         return registry.execute("query_database",
-                Map.of("connection_key", CONN, "sql", sql), ALLOWED, "u@x.com", "run-1", 3, contract);
+                Map.of("connection_key", CONN, "sql", sql), ALLOWED, "u@x.com", "run-1", 3, contract,
+                "conv-1", null);
     }
 
     private static GovernanceOutcome execOutcome(String governedSql, int rowLimit) {
@@ -190,7 +194,7 @@ class AgentToolRegistryTest {
         NexusException ex = assertThrows(NexusException.class, () -> registry.execute(
                 "query_database",
                 Map.of("connection_key", "conn-other", "sql", "SELECT id FROM orders"),
-                ALLOWED, "u@x.com", "run-1", 1, contractApproving("orders")));
+                ALLOWED, "u@x.com", "run-1", 1, contractApproving("orders"), "conv-1", null));
 
         assertTrue(ex.getMessage().contains("conn-other"));
         assertFalse(pipeline.invoked);
@@ -203,7 +207,7 @@ class AgentToolRegistryTest {
     void describeSchemaReturnsOnlyApprovedObjects() throws Exception {
         String result = registry.execute("describe_schema",
                 Map.of("connection_key", CONN), ALLOWED, "u@x.com", "run-1", 1,
-                contractApproving("orders", "shipments"));
+                contractApproving("orders", "shipments"), "conv-1", null);
 
         assertTrue(result.contains("orders"));
         assertTrue(result.contains("shipments"));

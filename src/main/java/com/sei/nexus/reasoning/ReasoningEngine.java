@@ -98,7 +98,8 @@ public class ReasoningEngine {
                                   boolean forceAsync,
                                   Map<String, ColumnValueDomain> literalScope,
                                   com.sei.nexus.agentbrain.ExecutionContract contract,
-                                  boolean enforceContractGate) {
+                                  boolean enforceContractGate,
+                                  String conversationId, String parentExecutionId) {
 
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
@@ -135,7 +136,7 @@ public class ReasoningEngine {
                     GovernedSqlRuntime.Request.forPlanner(runKey, stepNo, plan.connectionKey(),
                             plan.objectKeys(), plan.sql(), userEmail, forceAsync,
                             literalScope, plan.literalBindings(), enrichedQ, literalRejections,
-                            contract, enforceContractGate));
+                            contract, enforceContractGate, conversationId, parentExecutionId));
 
             // Connection named by the planner does not exist — skip the step.
             if (ro.status() == GovernedSqlRuntime.Status.CONNECTION_NOT_FOUND) {

@@ -63,11 +63,28 @@ public class AgentRunner {
     }
 
     /**
-     * Runs the agent for one user message.
-     * Creates a session record, executes the ReAct loop, persists the result.
+     * Runs the agent for one user message with no prior conversation context (autonomous path —
+     * Executive Brief, direct agent chat).
      */
     public ZevraSession run(ZevraAgent agent, String inputMessage, String userEmail,
                             String existingRunKey) {
+        return run(agent, inputMessage, userEmail, existingRunKey, null, null, null);
+    }
+
+    /**
+     * Runs the agent for one user message.
+     * Creates a session record, executes the ReAct loop, persists the result.
+     *
+     * @param conversationContext prior-execution grounding (facts from the previous
+     *        {@code ExecutionReference}) so follow-ups continue the same execution; blank for a
+     *        fresh conversation.
+     * @param conversationId     carried so each execution's {@code ExecutionReference} records it.
+     * @param parentExecutionId  the previous execution this turn continues from (AgentBrain's
+     *        lineage decision); recorded verbatim by Runtime. Nullable.
+     */
+    public ZevraSession run(ZevraAgent agent, String inputMessage, String userEmail,
+                            String existingRunKey, String conversationContext,
+                            String conversationId, String parentExecutionId) {
         String sessionId = Keys.uniqueKey("ses");
         ZevraSession session = new ZevraSession(
                 sessionId, agent.id(), agent.tenantSchema(),
@@ -119,9 +136,12 @@ public class AgentRunner {
             List<Map<String, Object>> tools =
                     toolRegistry.getToolDefinitions(agent.connectionKeys());
 
-            // 4. Initialize conversation
+            // 4. Initialize conversation. A follow-up prepends recent turns to the first user
+            //    message so the model can resolve referents introduced in an earlier answer
+            //    (e.g. "that region"). Kept in messages[0] so pruneHistory (which always keeps
+            //    messages[0]) never drops the question or its context mid-loop.
             List<AgentMessage> messages = new ArrayList<>();
-            messages.add(AgentMessage.user(inputMessage));
+            messages.add(AgentMessage.user(composeFirstMessage(conversationContext, inputMessage)));
 
             // Cache of tool results for this session, keyed by tool + args.
             // If the LLM repeats an identical call (typically because pruning
@@ -173,7 +193,8 @@ public class AgentRunner {
                             "to progress toward final_answer.\n" + cached;
                 } else {
                     toolResult = toolRegistry.execute(toolName, args,
-                            agent.connectionKeys(), userEmail, governanceRunKey, iterations, contract);
+                            agent.connectionKeys(), userEmail, governanceRunKey, iterations, contract,
+                            conversationId, parentExecutionId);
                     toolResultCache.put(cacheKey, toolResult);
                 }
 
@@ -284,6 +305,17 @@ public class AgentRunner {
      * <p>OpenAI requires every assistant tool_call message to be immediately followed
      * by its tool_result — so pairs are never split.
      */
+    /**
+     * Composes the agent's first user message. On a follow-up, recent conversation turns are
+     * prepended so the model can resolve referents introduced in an earlier answer (e.g. "that
+     * region"). Kept in a single message so {@code pruneHistory} (which always keeps messages[0])
+     * never drops the question or its context mid-loop.
+     */
+    static String composeFirstMessage(String conversationContext, String inputMessage) {
+        if (conversationContext == null || conversationContext.isBlank()) return inputMessage;
+        return conversationContext + "\n\nCurrent question: " + inputMessage;
+    }
+
     private List<AgentMessage> pruneHistory(List<AgentMessage> messages, int keepPairs) {
         if (messages.size() <= 1) return messages;
 

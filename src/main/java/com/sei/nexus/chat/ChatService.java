@@ -105,6 +105,8 @@ public class ChatService {
     // ── Response composition (Unified Answer Engine, Phase 4) ────────────────
     private final ExecutionOutcomeInterpreter outcomeInterpreter;
     private final NaturalLanguageComposer     nlComposer;
+    // ── Execution Continuity ─────────────────────────────────────────────────
+    private final com.sei.nexus.runtime.ExecutionReferenceRepository executionReferenceRepository;
 
     // Max characters for entity schema context per LLM call.
     // Configurable via nexus.context.max-entity-chars — keeps prompts lean
@@ -117,7 +119,15 @@ public class ChatService {
     //   shadow  : the gate is evaluated and its would-be rejections recorded, but not enforced
     //   enforce : an unapproved table becomes a re-plannable observation, as on the agent path
     // Defaults to `shadow` so production behaviour is unchanged until the migration is measured.
-    @org.springframework.beans.factory.annotation.Value("${nexus.chat.contract-gate:shadow}")
+    /** Fixed user-facing message for any orchestration failure. Raw exception detail is logged and
+     *  audited privately, never returned to the user (no SQL, table names, or driver text leaks). */
+    static final String GENERIC_INVESTIGATION_ERROR =
+            "I couldn't complete this investigation. Please try again or rephrase your question.";
+
+    // Approved-surface enforcement. Default 'enforce': an out-of-contract table reference is a
+    // deterministic re-plan signal (ReasoningEngine treats UNAPPROVED_OBJECTS like a literal
+    // rejection and re-plans). 'shadow' observes only; 'off' disables the gate. Overridable per env.
+    @org.springframework.beans.factory.annotation.Value("${nexus.chat.contract-gate:enforce}")
     private String contractGateMode;
 
     public ChatService(RunRepository runRepository,
@@ -151,7 +161,8 @@ public class ChatService {
                        PromptContextBuilder promptContextBuilder,
                        PromptAssembler promptAssembler,
                        ExecutionOutcomeInterpreter outcomeInterpreter,
-                       NaturalLanguageComposer nlComposer) {
+                       NaturalLanguageComposer nlComposer,
+                       com.sei.nexus.runtime.ExecutionReferenceRepository executionReferenceRepository) {
         this.runRepository            = runRepository;
         this.documentMemoryService    = documentMemoryService;
         this.semanticService          = semanticService;
@@ -184,6 +195,7 @@ public class ChatService {
         this.promptAssembler          = promptAssembler;
         this.outcomeInterpreter       = outcomeInterpreter;
         this.nlComposer               = nlComposer;
+        this.executionReferenceRepository = executionReferenceRepository;
     }
 
     // =========================================================================
@@ -191,6 +203,12 @@ public class ChatService {
     // =========================================================================
 
     public ChatResponse ask(ChatRequest request, String userEmail) {
+        // Fail closed: conversational data access is tenant-scoped. If no tenant context was
+        // established for this request, refuse rather than silently reading the public schema.
+        if (!com.sei.nexus.tenant.TenantContext.isSet()) {
+            throw new NexusException(HttpStatus.UNAUTHORIZED,
+                    "No tenant context established for this request");
+        }
         String raw = request.question() != null ? request.question().trim() : "";
         boolean forceAsync = false;
         com.sei.nexus.usage.UsageContext.set("chat", userEmail);
@@ -209,7 +227,7 @@ public class ChatService {
         // STEP 1b: Zevra Agent routing — semantic dispatch, no keywords.
         // Check active agents before loading attachment or running the full pipeline.
         // Falls through silently if no agent matches or routing fails.
-        String tenantSchemaForRouting = com.sei.nexus.tenant.TenantContext.getSchema();
+        String tenantSchemaForRouting = com.sei.nexus.tenant.TenantContext.getSchemaStrict();
         java.util.Optional<ZevraAgent> routedZevraAgent =
                 zevraAgentRouter.route(raw, tenantSchemaForRouting);
         // One NexusRun per conversation request: derive the identities once and persist
@@ -222,13 +240,26 @@ public class ChatService {
                 ? request.clientRunKey() : Keys.runKey();
         boolean runPersisted = false;
 
+        // Execution Continuity: follow-ups ground on the PREVIOUS execution's facts
+        // (ExecutionReference) — retrieval target, bindings, result shape — never on truncated
+        // answer prose. parentExecutionId links this turn to that execution (AgentBrain's lineage
+        // decision, recorded verbatim by Runtime). Both the routed-agent branch and the
+        // conversational path below use this grounding.
+        List<NexusRun> convHistory = runRepository.findConversationRuns(conversationId, 8);
+        java.util.Optional<com.sei.nexus.runtime.ExecutionReference> prevExecution =
+                executionReferenceRepository.findLatestByConversation(conversationId);
+        String parentExecutionId = prevExecution
+                .map(com.sei.nexus.runtime.ExecutionReference::executionId).orElse(null);
+        String conversationContext = buildExecutionGrounding(prevExecution.orElse(null));
+
         if (routedZevraAgent.isPresent()) {
             ZevraAgent za = routedZevraAgent.get();
             runRepository.save(new NexusRun(runKey, conversationId, za.slug(), null,
                     userEmail, raw, null, null, "RUNNING", null, null, null));
             runPersisted = true;
             try {
-                ZevraSession session = agentRunner.run(za, raw, userEmail, runKey);
+                ZevraSession session = agentRunner.run(za, raw, userEmail, runKey, conversationContext,
+                        conversationId, parentExecutionId);
                 String answer = session.finalOutput() != null && !session.finalOutput().isBlank()
                         ? session.finalOutput()
                         : "The agent completed but produced no response.";
@@ -283,8 +314,8 @@ public class ChatService {
 
         // STEP 2: Conversation — conversationId already derived above (one run per request).
 
-        // STEP 3: Recent history
-        List<NexusRun> history = runRepository.findConversationRuns(conversationId, 8);
+        // STEP 3: Recent history (already loaded above as convHistory — reuse it)
+        List<NexusRun> history = convHistory;
 
         // STEP 4: Route agent — use raw question only (not file content)
         NexusAgent agent = resolveAgent(request.agentKey(), raw, history);
@@ -357,7 +388,7 @@ public class ChatService {
             // This is the key: the router sees "do these orders exist in the system?" and
             // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
             Map<String, Object> decision = getLlmDecision(raw, memChunks, promptContext, semantic,
-                    findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved);
+                    findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved, conversationContext);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
@@ -431,7 +462,7 @@ public class ChatService {
                         if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
                     }
                     String schemaCtx = buildContextSummary(raw, memChunks, promptContext, semantic, findings,
-                            anomalyCtx, false, history, agent, resolved);
+                            anomalyCtx, false, history, agent, resolved, conversationContext);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
                     // ── Phase 3: inject learned business vocabulary into the planner context ──
@@ -452,7 +483,8 @@ public class ChatService {
                     ReasoningEngine.ReasoningResult reasonResult = reasoningEngine.reason(
                             raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync,
                             buildLiteralScope(resolved),
-                            gateOff ? null : executionContract, gateEnforced);
+                            gateOff ? null : executionContract, gateEnforced,
+                            conversationId, parentExecutionId);
 
                     resultSnapshot = reasonResult.resultSnapshot();
                     queryData      = reasonResult.queryData();
@@ -554,9 +586,15 @@ public class ChatService {
                     quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied);
 
         } catch (Exception e) {
+            // The raw exception (SQL, table names, driver detail) is kept for operators only —
+            // never surfaced to the user. The user sees a fixed, generic message.
             log.error("Chat orchestration failed for run {}: {}", runKey, e.getMessage(), e);
-            runRepository.update(runKey, "Investigation encountered an error: " + e.getMessage(), "ERROR", "FAILED", null);
-            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Investigation failed: " + e.getMessage());
+            runRepository.update(runKey, GENERIC_INVESTIGATION_ERROR, "ERROR", "FAILED", null);
+            try {
+                runRepository.saveEvidence(Keys.uniqueKey("ev"), runKey, "ERROR_DETAIL",
+                        toJson(Map.of("error", String.valueOf(e.getMessage()))));
+            } catch (Exception ignored) { /* audit is best-effort; never mask the original failure */ }
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, GENERIC_INVESTIGATION_ERROR);
         }
     }
 
@@ -659,9 +697,9 @@ public class ChatService {
     private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
             PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent,
-            ResolvedQuestion resolved) {
+            ResolvedQuestion resolved, String executionGrounding) {
         try {
-            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved);
+            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved, executionGrounding);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
             String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), DECISION_SYSTEM_PROMPT);
             return objectMapper.readValue(extractJson(resp),
@@ -774,16 +812,7 @@ public class ChatService {
                     3. One actionable recommendation only if clearly warranted
                     Use plain prose. Bold key numbers. No markdown headings or bullet lists unless there are multiple distinct anomalies.
                     """
-                    : """
-                    You are Zevra, an enterprise operational intelligence AI.
-                    The database query returned zero matching rows.
-                    If the user uploaded a file, those values were used as lookup parameters — zero rows means
-                    those records do NOT exist in the connected database.
-                    State this clearly and concisely: what was searched for, what was found (nothing), and
-                    what the user should check next (e.g. wrong table, different ID format, data not yet loaded).
-                    Do NOT summarise or analyse the uploaded file content itself — it was input, not output.
-                    Keep the response to 2-3 sentences.
-                    """;
+                    : zeroRowSystemPrompt(attachmentSummary != null && !attachmentSummary.isBlank());
 
             // Presentation policy (system prompt) and evidence context are chat's; only the
             // model call + failure handling are delegated to the shared composer.
@@ -799,14 +828,79 @@ public class ChatService {
     // Context building
     // =========================================================================
 
+    /**
+     * Execution Continuity grounding. Renders the <b>facts</b> of the previous execution (from its
+     * {@link com.sei.nexus.runtime.ExecutionReference}) so a follow-up continues the same execution
+     * rather than reconstructing scope from truncated answer prose: the retrieval target, the row
+     * scope actually returned, and the business attributes available to extend it. Returns
+     * {@code ""} when there is no prior execution (first data turn), so single-turn questions are
+     * unaffected.
+     *
+     * <p>This grounds AgentBrain's reasoning; it never instructs execution. The prior result set is
+     * the base a projection-style follow-up ("I need product name as well") must retain.
+     */
+    static String buildExecutionGrounding(com.sei.nexus.runtime.ExecutionReference ref) {
+        if (ref == null) return "";
+        StringBuilder sb = new StringBuilder(
+                "=== PREVIOUS EXECUTION (continue THIS result set; ground follow-up references against it, not prose) ===\n");
+        if (!ref.retrievalTargets().isEmpty()) {
+            sb.append("Retrieved from: ").append(String.join(", ", ref.retrievalTargets())).append("\n");
+        }
+        sb.append("Rows returned: ").append(ref.rowCount()).append("\n");
+        if (!ref.resultColumns().isEmpty()) {
+            sb.append("Result columns: ").append(String.join(", ", ref.resultColumns())).append("\n");
+        }
+        if (!ref.businessAttributeBindings().isEmpty()) {
+            sb.append("Business attributes available on this base (attribute → column):\n");
+            ref.businessAttributeBindings().forEach((k, v) -> sb.append("  - ").append(k).append(" → ").append(v).append("\n"));
+        }
+        sb.append("A follow-up that adds an attribute (enrichment) must keep this same retrieval base and the same ")
+          .append(ref.rowCount()).append(" row(s) — extend the projection; do not re-scope or filter unless the user explicitly asks.\n");
+        return sb.toString();
+    }
+
+    /**
+     * The system prompt for a zero-row result. A legitimately empty analytical result ("no active
+     * promotions") must not be framed as a system or metadata fault. Only the file-lookup case —
+     * where the user supplied specific values as parameters — states those records "do not exist".
+     */
+    static String zeroRowSystemPrompt(boolean hasAttachment) {
+        return hasAttachment
+                ? """
+                You are Zevra, an enterprise operational intelligence AI.
+                The database query returned zero matching rows.
+                The user uploaded a file whose values were used as lookup parameters — zero rows means
+                those specific records do NOT exist in the connected database.
+                State this clearly and concisely: what was searched for, what was found (nothing), and
+                what the user should check next (e.g. different ID format, data not yet loaded).
+                Do NOT summarise or analyse the uploaded file content itself — it was input, not output.
+                Keep the response to 2-3 sentences.
+                """
+                : """
+                You are Zevra, an enterprise operational intelligence AI.
+                The query executed successfully and returned no matching records.
+                State plainly and concisely that no records currently match the requested criteria.
+                Do NOT suggest the table is wrong, the metadata is misconfigured, the data is missing,
+                or that the system failed — the query was valid and simply had no matches.
+                Offer one natural next step only if helpful (e.g. broadening the criteria or a different filter).
+                Keep the response to 1-2 sentences.
+                """;
+    }
+
     private String buildContextSummary(String question, List<DocumentChunk> memChunks,
             PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
-            ResolvedQuestion resolved) {
+            ResolvedQuestion resolved, String executionGrounding) {
         StringBuilder sb = new StringBuilder();
         String semCtx = semantic != null ? semantic.contextText() : "";
         java.util.Set<String> expandedTokens = resolved != null
                 ? resolved.expandedTokens() : java.util.Set.of();
+
+        // Execution Continuity: the previous execution's facts first, so the decision/planner
+        // continue the same result set on a follow-up. Empty for single-turn questions.
+        if (executionGrounding != null && !executionGrounding.isBlank()) {
+            sb.append(executionGrounding).append('\n');
+        }
 
         if (agent != null) {
             sb.append("Agent: ").append(agent.name())
@@ -875,20 +969,23 @@ public class ChatService {
         if (!anomalyCtx.isBlank()) sb.append(anomalyCtx).append("\n");
         if (hasPrior) sb.append("Prior query result: available\n");
 
-        // ── Conversation history (last 4 turns) ───────────────────────────────
+        // ── Conversation thread (prior user questions only) ───────────────────
+        // The user's own earlier questions give lightweight conversational framing.
+        // Execution continuity is NOT derived here — it comes exclusively from the
+        // ExecutionReference grounding rendered above. Zevra's prior ANSWER PROSE is
+        // deliberately excluded: per the approved architecture, answer prose is never
+        // the execution-continuity substrate.
         if (history != null && !history.isEmpty()) {
-            sb.append("\nConversation so far:\n");
             int start = Math.max(0, history.size() - 4);
+            StringBuilder priorQuestions = new StringBuilder();
             for (int i = start; i < history.size(); i++) {
-                NexusRun r = history.get(i);
-                sb.append("User: ").append(r.question()).append("\n");
-                if (r.answer() != null && !r.answer().isBlank()) {
-                    String ans = r.answer().length() > 600
-                            ? r.answer().substring(0, 600) + "…" : r.answer();
-                    sb.append("Nexus: ").append(ans).append("\n");
-                }
+                String q = history.get(i).question();
+                if (q != null && !q.isBlank()) priorQuestions.append("- ").append(q.trim()).append("\n");
             }
-            sb.append("\n");
+            if (priorQuestions.length() > 0) {
+                sb.append("\nEarlier in this conversation the user asked:\n")
+                  .append(priorQuestions).append("\n");
+            }
         }
 
         return sb.toString();

@@ -98,6 +98,13 @@ class GovernedSqlRuntimeTest {
         }
     }
 
+    /** Captures persisted ExecutionReferences without a database. */
+    static class FakeExecutionReferenceRepo extends ExecutionReferenceRepository {
+        final List<ExecutionReference> saved = new ArrayList<>();
+        FakeExecutionReferenceRepo() { super(null, new ObjectMapper()); }
+        @Override public void save(ExecutionReference r) { saved.add(r); }
+    }
+
     /** Connections exist unless explicitly declared missing. */
     static class FakeConnectionRepo extends ConnectionRepository {
         boolean exists = true;
@@ -115,6 +122,7 @@ class GovernedSqlRuntimeTest {
     private FakeDynamicSql     dynamicSql;
     private FakeExecutionRepo  execRepo;
     private FakeConnectionRepo connectionRepo;
+    private FakeExecutionReferenceRepo refRepo;
     private GovernedSqlRuntime runtime;
 
     @BeforeEach
@@ -124,8 +132,9 @@ class GovernedSqlRuntimeTest {
         dynamicSql     = new FakeDynamicSql();
         execRepo       = new FakeExecutionRepo();
         connectionRepo = new FakeConnectionRepo();
+        refRepo        = new FakeExecutionReferenceRepo();
         runtime = new GovernedSqlRuntime(pipeline, dynamicSql, audit, EXTRACTOR,
-                execRepo, connectionRepo, new ObjectMapper());
+                execRepo, connectionRepo, refRepo, new ObjectMapper());
     }
 
     // ── fixtures ──────────────────────────────────────────────────────────────
@@ -166,14 +175,14 @@ class GovernedSqlRuntimeTest {
 
     private GovernedSqlRuntime.Outcome runAgent(String sql, ExecutionContract contract) {
         return runtime.execute(GovernedSqlRuntime.Request.forAgent(
-                "run-1", 1, CONN, sql, "u@x.com", contract));
+                "run-1", 1, CONN, sql, "u@x.com", contract, "conv-1", null));
     }
 
     private GovernedSqlRuntime.Outcome runPlanner(String sql, String objectKeys,
             Map<String, ColumnValueDomain> scope, Set<String> rejections) {
         return runtime.execute(GovernedSqlRuntime.Request.forPlanner(
                 "run-1", 1, CONN, objectKeys, sql, "u@x.com", false,
-                scope, List.of(), "the question", rejections, null, false));
+                scope, List.of(), "the question", rejections, null, false, "conv-1", null));
     }
 
     /** Planner policy with the business-object gate engaged in the given migration mode. */
@@ -181,7 +190,7 @@ class GovernedSqlRuntimeTest {
                                                        boolean enforce) {
         return runtime.execute(GovernedSqlRuntime.Request.forPlanner(
                 "run-1", 1, CONN, "obj-1", sql, "u@x.com", false,
-                Map.of(), List.of(), "the question", new HashSet<>(), contract, enforce));
+                Map.of(), List.of(), "the question", new HashSet<>(), contract, enforce, "conv-1", null));
     }
 
     // ── Phase 3 Step 2: the business-object gate on the conversational policy ──
@@ -238,6 +247,61 @@ class GovernedSqlRuntimeTest {
         assertFalse(pipeline.invoked, "an unapproved table never reaches governance");
         assertTrue(dynamicSql.calls.isEmpty(), "an unapproved table never reaches the database");
         assertTrue(audit.calls.isEmpty());
+    }
+
+    /**
+     * Enforce mode is now the conversational default. Its safety property: an <b>approved</b> table
+     * still reaches governance and executes normally — enabling enforcement must not reject valid
+     * queries. (The rejection case is covered by {@link #enforceModeRejectsBeforeGovernance()}.)
+     */
+    @Test
+    void enforceModeAllowsAnApprovedTableThrough() {
+        pipeline.outcome = executeOutcome("SELECT id FROM orders", 10);
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT id FROM orders", contractApproving("orders"), true);
+
+        assertEquals(GovernedSqlRuntime.Status.EXECUTED, o.status(),
+                "enforce must let an approved table execute — the default flip is safe for valid queries");
+        assertTrue(pipeline.invoked, "an approved table reaches governance");
+        assertEquals(1, dynamicSql.calls.size(), "an approved table executes");
+        assertTrue(o.unapprovedTables().isEmpty());
+    }
+
+    // ── Execution Continuity: the runtime emits an immutable ExecutionReference ──
+
+    /**
+     * A successful execution returns and persists an immutable ExecutionReference whose semantic
+     * snapshot is copied verbatim from the contract. Runtime records facts only — no comparison.
+     */
+    @Test
+    void executedStatementEmitsExecutionReferenceWithCopiedSnapshot() {
+        pipeline.outcome = executeOutcome("SELECT id FROM orders", 10);
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT id FROM orders", contractApproving("orders"), true);
+
+        assertEquals(GovernedSqlRuntime.Status.EXECUTED, o.status());
+        ExecutionReference ref = o.executionReference();
+        assertNotNull(ref, "an executed statement returns an ExecutionReference");
+        assertEquals(1, refRepo.saved.size(), "the reference is persisted immutably");
+        assertEquals("ctr-1", ref.contractId(), "contract id copied verbatim from the contract");
+        assertTrue(ref.retrievalTargets().contains("public.orders"),
+                "retrieval target copied from the approved object binding: " + ref.retrievalTargets());
+        assertEquals("conv-1", ref.conversationId(), "conversation id recorded as a fact");
+        assertEquals(1, ref.rowCount(), "row count is the factual result shape");
+        assertEquals("SELECT id FROM orders", ref.sqlReference(), "governed SQL kept for audit only");
+    }
+
+    /** Nothing executed ⇒ nothing to reference. Non-executed outcomes carry no reference. */
+    @Test
+    void nonExecutedOutcomesCarryNoExecutionReference() {
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT id FROM invoices", contractApproving("orders"), true);
+
+        assertEquals(GovernedSqlRuntime.Status.UNAPPROVED_OBJECTS, o.status());
+        assertNull(o.executionReference(), "a gated (non-executed) statement produced no execution");
+        assertTrue(refRepo.saved.isEmpty(), "nothing executed ⇒ nothing persisted");
     }
 
     // ── 1. business-object validation (agent policy) ──────────────────────────
@@ -470,7 +534,7 @@ class GovernedSqlRuntimeTest {
 
         runtime.execute(GovernedSqlRuntime.Request.forPlanner("run-1", 1, CONN, "obj-1",
                 "SELECT id FROM orders", "u@x.com", true, Map.of(), List.of(), "q", new HashSet<>(),
-                null, false));
+                null, false, "conv-1", null));
 
         assertTrue(pipeline.seenForceAsync, "the planner's forceAsync choice reaches governance");
     }
