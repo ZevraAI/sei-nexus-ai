@@ -88,8 +88,8 @@ class ChatGroundingReproProbe {
                 .sorted(java.util.Comparator.comparing(a -> a.canonicalIdentifier()))
                 .forEach(a -> System.out.println("  " + a.connectionKey() + " :: " + a.canonicalIdentifier()));
 
-        String bounded   = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, true, 1500));
-        String unbounded = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, true, 0));
+        String bounded   = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, 1500));
+        String unbounded = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, 0));
         int boundedTables   = bounded.split("TABLE `", -1).length - 1;
         int unboundedTables = unbounded.split("TABLE `", -1).length - 1;
         System.out.println("\n########## BUDGET EFFECT ##########");

@@ -55,15 +55,27 @@ public class MetadataRegistrationService {
     private final SemanticService              semanticService;
     private final RelationshipDiscoveryService relationshipDiscovery;
     private final EntityCandidateService       entityCandidates;
+    private final com.sei.nexus.enterprise.BusinessValueRepository businessValues;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
                                         SemanticService semanticService,
                                         RelationshipDiscoveryService relationshipDiscovery,
-                                        EntityCandidateService entityCandidates) {
+                                        EntityCandidateService entityCandidates,
+                                        com.sei.nexus.enterprise.BusinessValueRepository businessValues) {
         this.enterpriseMapService  = enterpriseMapService;
         this.semanticService       = semanticService;
         this.relationshipDiscovery = relationshipDiscovery;
         this.entityCandidates      = entityCandidates;
+        this.businessValues        = businessValues;
+    }
+
+    /** Backward-compatible convenience (tests): no Business Value persistence (⇒ step 5 is a no-op). */
+    public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
+                                        SemanticService semanticService,
+                                        RelationshipDiscoveryService relationshipDiscovery,
+                                        EntityCandidateService entityCandidates) {
+        this(enterpriseMapService, semanticService, relationshipDiscovery, entityCandidates, null);
     }
 
     /** Per-batch outcome record: counts plus per-step failure descriptions. */
@@ -191,6 +203,11 @@ public class MetadataRegistrationService {
                     failures.add("term " + term.get("term") + ": " + e.getMessage());
                 }
             }
+
+            // 5. Business Values + mappings (semantic layer over Value Domains). Optional: present
+            //    only when the review step produced them; absent ⇒ no-op (fully backward compatible).
+            //    Physical values are referenced by (value_domain_key, physical_value); none are stored here.
+            persistBusinessValues(entity, userEmail, failures);
         }
 
         // 4. Relationship discovery — once per batch, after all entities exist,
@@ -309,6 +326,75 @@ public class MetadataRegistrationService {
             return Double.parseDouble(String.valueOf(value));
         } catch (NumberFormatException e) {
             return 0.0;
+        }
+    }
+
+    /** Nullable confidence for Business Value metadata (distinct from the 0.0-defaulting entity gate). */
+    private static Double parseConfidenceNullable(Object value) {
+        if (value == null) return null;
+        try { return Double.parseDouble(String.valueOf(value)); } catch (NumberFormatException e) { return null; }
+    }
+
+    /**
+     * Persists the reviewed Business Values and their physical-value mappings for one entity
+     * (semantic layer over Value Domains). Optional and defensive: absent arrays ⇒ no-op, so every
+     * existing apply payload is unaffected. Applies the deterministic governance rules — physical→
+     * concept uniqueness/conflict and the cross-application / low-confidence approval requirement —
+     * before writing. Stores no physical values (mappings reference them by natural key).
+     */
+    @SuppressWarnings("unchecked")
+    private void persistBusinessValues(Map<String, Object> entity, String userEmail, List<String> failures) {
+        if (businessValues == null) return;
+
+        for (Map<String, Object> bv : (List<Map<String, Object>>) entity.getOrDefault("businessValues", List.of())) {
+            if (!Boolean.TRUE.equals(bv.get("approved"))) continue;
+            try {
+                String attr = (String) bv.get("businessAttributeKey");
+                String name = (String) bv.get("name");
+                String key  = strOrDefault(bv.get("businessValueKey"),
+                        "bv-" + slugify(name) + "-" + slugify(strOrDefault(attr, "attr")));
+                String source = strOrDefault(bv.get("source"), com.sei.nexus.enterprise.BusinessValue.SOURCE_AI);
+                String status = strOrDefault(bv.get("approvalStatus"),
+                        com.sei.nexus.enterprise.BusinessValue.SOURCE_MANUAL.equals(source)
+                                ? com.sei.nexus.enterprise.BusinessValue.STATUS_APPROVED
+                                : com.sei.nexus.enterprise.BusinessValue.STATUS_PENDING);
+                businessValues.saveBusinessValue(new com.sei.nexus.enterprise.BusinessValue(
+                        key, attr, name, (String) bv.get("description"), source,
+                        parseConfidenceNullable(bv.get("confidence")), status, userEmail, null, null, null, null));
+            } catch (Exception e) {
+                failures.add("business value " + bv.get("name") + ": " + e.getMessage());
+            }
+        }
+
+        for (Map<String, Object> m : (List<Map<String, Object>>) entity.getOrDefault("businessValueMappings", List.of())) {
+            if (!Boolean.TRUE.equals(m.get("approved"))) continue;
+            try {
+                String vdk = (String) m.get("valueDomainKey");
+                String pv  = String.valueOf(m.get("physicalValue"));
+                String bvk = (String) m.get("businessValueKey");
+                boolean crossApp = Boolean.TRUE.equals(m.get("crossApplication"));
+                var proposed = new com.sei.nexus.enterprise.BusinessValueMapping(
+                        "bvm-" + slugify(vdk) + "-" + slugify(pv), vdk, pv, bvk,
+                        strOrDefault(m.get("source"), com.sei.nexus.enterprise.BusinessValue.SOURCE_AI),
+                        parseConfidenceNullable(m.get("confidence")),
+                        com.sei.nexus.enterprise.BusinessValue.STATUS_PENDING, crossApp,
+                        userEmail, null, null, null, null);
+
+                var existing = businessValues.findMapping(vdk, pv).orElse(null);
+                if (com.sei.nexus.enterprise.BusinessValueGovernance.conflictsWith(proposed, existing)) {
+                    failures.add("business value mapping " + vdk + "/" + pv
+                            + " conflicts with existing concept " + existing.businessValueKey());
+                    continue;
+                }
+                String status = com.sei.nexus.enterprise.BusinessValueGovernance.requiresCustomerApproval(proposed)
+                        ? com.sei.nexus.enterprise.BusinessValue.STATUS_PENDING
+                        : com.sei.nexus.enterprise.BusinessValue.STATUS_APPROVED;
+                businessValues.saveMapping(new com.sei.nexus.enterprise.BusinessValueMapping(
+                        proposed.mappingKey(), vdk, pv, bvk, proposed.source(), proposed.confidence(),
+                        status, crossApp, userEmail, null, null, null, null));
+            } catch (Exception e) {
+                failures.add("business value mapping: " + e.getMessage());
+            }
         }
     }
 

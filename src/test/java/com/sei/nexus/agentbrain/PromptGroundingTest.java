@@ -60,6 +60,38 @@ class PromptGroundingTest {
     }
 
     @Test
+    void groundsBusinessValueLabelsOnObservedDomainValues() {
+        // Approved Business Value mappings projected onto the status domain as presentation labels.
+        com.sei.nexus.semanticmodel.ColumnValueDomain statusDomain =
+                new com.sei.nexus.semanticmodel.ColumnValueDomain(
+                        "purchase_orders", "status", false,
+                        List.of("10", "20", "30", "40"),
+                        Map.of("10", "Draft", "20", "Submitted", "30", "Approved", "40", "Closed"));
+
+        BusinessObject po = new BusinessObject("obj-po", "Purchase Order", "",
+                List.of(new BusinessAttribute("c-status", "Status", AttributeRole.ATTRIBUTE)),
+                List.of());
+
+        ResolvedBusinessModel model = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "show me draft purchase orders",
+                List.of(po),
+                Map.of("obj-po", new PhysicalTable("conn-1", "retail_core", "purchase_orders")),
+                Map.of("c-status", new PhysicalColumn("conn-1", "retail_core", "purchase_orders",
+                        "status", "varchar", statusDomain)));
+
+        String grounding = promptAssembler.assemble(
+                promptContextBuilder.build(builder.compile(model)),
+                new PromptAssembler.RenderOptions(true, true, true, 100_000));
+
+        // The LLM sees each physical code with its canonical Business Value — reason on "Draft",
+        // execute on '10'. Membership is unchanged; labels are additive presentation.
+        assertTrue(grounding.contains("10 = Draft"), grounding);
+        assertTrue(grounding.contains("20 = Submitted"), grounding);
+        assertTrue(grounding.contains("30 = Approved"), grounding);
+        assertTrue(grounding.contains("40 = Closed"), grounding);
+    }
+
+    @Test
     void emptyContractGroundsToNoObjects() {
         ExecutionContract contract = builder.compile(
                 new ResolvedBusinessModel("a", List.of("c"), "q", List.of(), Map.of(), Map.of()));

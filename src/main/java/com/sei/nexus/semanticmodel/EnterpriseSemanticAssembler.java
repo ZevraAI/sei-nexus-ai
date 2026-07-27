@@ -2,6 +2,8 @@ package com.sei.nexus.semanticmodel;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sei.nexus.enterprise.BusinessValueMapping;
+import com.sei.nexus.enterprise.BusinessValueRepository;
 import com.sei.nexus.enterprise.DataColumn;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
@@ -34,20 +36,31 @@ public class EnterpriseSemanticAssembler {
 
     private final EnterpriseMapRepository enterpriseMap;
     private final ObjectMapper            objectMapper;
+    // Business Value overlay: approved physical→concept mappings, projected onto value domains as
+    // presentation-only labels. Nullable for the test-convenience constructor (⇒ no labels).
+    private final BusinessValueRepository businessValues;
 
     // Two constructors exist (the second is a test convenience), so the injection point must be
     // marked explicitly — otherwise Spring cannot choose and falls back to a non-existent no-arg
     // constructor at startup.
     @org.springframework.beans.factory.annotation.Autowired
     public EnterpriseSemanticAssembler(EnterpriseMapRepository enterpriseMap,
+                                       BusinessValueRepository businessValues,
                                        ObjectMapper objectMapper) {
-        this.enterpriseMap = enterpriseMap;
-        this.objectMapper  = objectMapper;
+        this.enterpriseMap  = enterpriseMap;
+        this.businessValues = businessValues;
+        this.objectMapper   = objectMapper;
     }
 
-    /** Backward-compatible convenience (tests): parses persisted value-domain JSON with a default mapper. */
+    /** Backward-compatible convenience (tests): parses persisted value-domain JSON with a default
+     *  mapper and no Business Value overlay. */
     public EnterpriseSemanticAssembler(EnterpriseMapRepository enterpriseMap) {
-        this(enterpriseMap, new ObjectMapper());
+        this(enterpriseMap, null, new ObjectMapper());
+    }
+
+    /** Backward-compatible convenience (tests): explicit mapper, no Business Value overlay. */
+    public EnterpriseSemanticAssembler(EnterpriseMapRepository enterpriseMap, ObjectMapper objectMapper) {
+        this(enterpriseMap, null, objectMapper);
     }
 
     /**
@@ -79,6 +92,8 @@ public class EnterpriseSemanticAssembler {
         // Value domains are looked up once per key — several columns can share one enum type
         // across the object list. This is projection of owned metadata, not discovery.
         Map<String, Optional<ValueDomain>> domainCache = new LinkedHashMap<>();
+        // Business Value names resolved once per key across the object list (presentation labels).
+        Map<String, String> bvNameCache = new LinkedHashMap<>();
 
         for (DataObject object : objects) {
             List<BusinessAttribute> attributes = new ArrayList<>();
@@ -91,7 +106,7 @@ public class EnterpriseSemanticAssembler {
                 attributeTargets.put(column.columnKey(), new PhysicalColumn(
                         object.connectionKey(), object.schemaName(), object.tableName(),
                         column.columnName(), column.dataType(),
-                        valueDomainOf(object, column, domainCache)));
+                        valueDomainOf(object, column, domainCache, bvNameCache)));
             }
             businessObjects.add(new BusinessObject(
                     object.objectKey(),                     // stable semantic identity
@@ -115,7 +130,8 @@ public class EnterpriseSemanticAssembler {
      * never samples or discovers values. {@code null} when the column has no domain.
      */
     private ColumnValueDomain valueDomainOf(DataObject object, DataColumn column,
-                                            Map<String, Optional<ValueDomain>> cache) {
+                                            Map<String, Optional<ValueDomain>> cache,
+                                            Map<String, String> bvNameCache) {
         if (column.valueDomainKey() == null || column.valueDomainKey().isBlank()) return null;
         ValueDomain domain = cache
                 .computeIfAbsent(column.valueDomainKey(), enterpriseMap::findValueDomainByKey)
@@ -124,7 +140,27 @@ public class EnterpriseSemanticAssembler {
         List<String> values = parseValues(domain.domainValuesJson());
         if (values.isEmpty()) return null;
         return new ColumnValueDomain(object.tableName(), column.columnName(),
-                domain.isAuthoritative(), values);
+                domain.isAuthoritative(), values,
+                businessValueLabels(column.valueDomainKey(), bvNameCache));
+    }
+
+    /**
+     * Projects the <b>approved</b> Business Value mappings for a value domain into a
+     * {@code physicalValue → conceptName} map (presentation-only). Empty when there is no Business
+     * Value overlay (test constructor) or no approved mappings — so behavior is unchanged until a
+     * customer approves mappings. This never affects membership or validation.
+     */
+    private Map<String, String> businessValueLabels(String valueDomainKey, Map<String, String> bvNameCache) {
+        if (businessValues == null) return Map.of();
+        List<BusinessValueMapping> mappings = businessValues.findApprovedMappingsByDomain(valueDomainKey);
+        if (mappings.isEmpty()) return Map.of();
+        Map<String, String> labels = new LinkedHashMap<>();
+        for (BusinessValueMapping m : mappings) {
+            String name = bvNameCache.computeIfAbsent(m.businessValueKey(),
+                    k -> businessValues.findBusinessValue(k).map(com.sei.nexus.enterprise.BusinessValue::name).orElse(null));
+            if (name != null) labels.put(m.physicalValue(), name);
+        }
+        return labels;
     }
 
     private List<String> parseValues(String domainValuesJson) {

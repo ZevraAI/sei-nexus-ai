@@ -32,11 +32,17 @@ public class PromptAssembler {
      * @param includeDataType show each column's physical data type
      * @param maxChars        rendering budget over the object listing; 0 = unbounded
      */
+    // RenderOptions carries ONLY presentation policy — how much descriptive detail to show and how
+    // to format it. It deliberately does NOT carry any semantic-grounding decision: which business
+    // objects, attributes, and value domains the model reasons over is shared grounding produced by
+    // the pipeline, identical for every execution strategy (Unified Answer Engine conformance).
+    // (Value-domain exposure was previously a field here — a semantic decision an execution strategy
+    // could toggle; it is now always rendered, see renderDetail/renderValueDomainsOnly.)
     public record RenderOptions(boolean qualifyLocation, boolean includeDataType,
-                                boolean includeValueDomains, boolean includePurpose, int maxChars) {
-        /** The autonomous-agent policy: compact, unqualified, unbounded — the historical default. */
+                                boolean includePurpose, int maxChars) {
+        /** The autonomous-agent presentation policy: compact, unqualified, unbounded. */
         public static RenderOptions compact() {
-            return new RenderOptions(false, false, false, false, 0);
+            return new RenderOptions(false, false, false, 0);
         }
         boolean bounded() { return maxChars > 0; }
     }
@@ -81,6 +87,9 @@ public class PromptAssembler {
             } else {
                 detailBudgetExhausted = true;
                 sb.append("  (columns omitted to fit the context budget)\n");
+                // The presentation budget may drop DESCRIPTIVE detail, but never SEMANTIC value
+                // knowledge — value domains are shared grounding and always survive the budget.
+                sb.append(renderValueDomainsOnly(o));
             }
             sb.append('\n');
         }
@@ -140,21 +149,44 @@ public class PromptAssembler {
             if (differs(a.businessName(), a.physicalColumn())) {
                 sb.append("  — ").append(a.businessName().trim());
             }
-            if (opts.includeValueDomains()) {
-                sb.append(renderValueDomain(a.valueDomain()));
-            }
+            // Value domains are SHARED semantic grounding, not a presentation option — always
+            // rendered, identical for every execution strategy. Never gated by RenderOptions.
+            sb.append(renderValueDomain(a.valueDomain()));
             sb.append('\n');
         }
         return sb.toString();   // the per-object blank-line separator is appended by the caller
     }
 
-    /** Renders a column's legal/observed values, capped; empty when the column has no domain. */
+    /**
+     * The value domains for an object's domain-bearing columns, with no descriptive detail — the
+     * semantic value grounding that always survives the presentation budget (used when the budget
+     * omits an object's descriptive column detail). Empty when the object has no value domains.
+     */
+    private static String renderValueDomainsOnly(PromptContext.PromptObject o) {
+        StringBuilder sb = new StringBuilder();
+        for (PromptContext.PromptAttribute a : o.attributes()) {
+            String vd = renderValueDomain(a.valueDomain());
+            if (!vd.isEmpty()) {
+                sb.append("    `").append(a.physicalColumn()).append('`').append(vd).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Renders a column's legal/observed values, capped; empty when the column has no domain. When a
+     * physical value carries a Business Value label (an approved mapping), it renders as
+     * {@code value = Concept} (e.g. {@code 10 = Draft}); unmapped values render bare. Labels are
+     * presentation only — they never change which physical values are legal.
+     */
     private static String renderValueDomain(com.sei.nexus.semanticmodel.ColumnValueDomain vd) {
         if (vd == null || vd.values().isEmpty()) return "";
         java.util.List<String> values = vd.values();
         boolean truncated = values.size() > MAX_RENDERED_VALUES;
-        String joined = String.join(" | ",
-                truncated ? values.subList(0, MAX_RENDERED_VALUES) : values);
+        java.util.List<String> shown = truncated ? values.subList(0, MAX_RENDERED_VALUES) : values;
+        String joined = shown.stream()
+                .map(v -> { String label = vd.labelFor(v); return label != null ? v + " = " + label : v; })
+                .collect(java.util.stream.Collectors.joining(" | "));
         return "  [" + (vd.authoritative() ? "legal" : "observed") + " values: "
                 + joined + (truncated ? " | …" : "") + "]";
     }

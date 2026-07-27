@@ -68,7 +68,7 @@ class PromptContextEnrichmentTest {
     @Test
     void fullRenderSurfacesConnectionSchemaAndType() {
         String out = pa.assemble(pcb.build(builder.compile(model())),
-                new PromptAssembler.RenderOptions(true, true, true, true, 0));
+                new PromptAssembler.RenderOptions(true, true, true, 0));
 
         assertTrue(out.contains("TABLE `retail_core.inventory_balances`"), out);
         assertTrue(out.contains("connection_key: conn-1 (use this exact value)"), out);
@@ -76,9 +76,15 @@ class PromptContextEnrichmentTest {
         assertTrue(out.contains("`status` (dimension, character varying)"), out);
     }
 
-    /** When the carried attribute has a value domain, the full policy renders it (capped); compact does not. */
+    /**
+     * Unified Answer Engine conformance: value domains are SHARED semantic grounding, not a
+     * presentation option. Every execution strategy renders them identically — the full
+     * conversational policy AND the compact autonomous-agent policy. An execution strategy can no
+     * longer decide whether the model sees value knowledge; only presentation (types, connection
+     * line, budget) is strategy-specific.
+     */
     @Test
-    void fullRenderSurfacesValueDomainWhenPresent() {
+    void valueDomainsRenderIdenticallyUnderEveryPresentationPolicy() {
         BusinessObject stores = new BusinessObject("obj-stores", "Stores", "",
                 List.of(new BusinessAttribute("c-status", "Status", AttributeRole.DIMENSION)), List.of());
         ResolvedBusinessModel m = new ResolvedBusinessModel("a", List.of("conn-1"), "q",
@@ -90,11 +96,38 @@ class PromptContextEnrichmentTest {
                                 List.of("open", "closed")))));
         PromptContext ctx = pcb.build(builder.compile(m));
 
-        String full = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, true, 0));
-        assertTrue(full.contains("[legal values: open | closed]"), full);
+        String full    = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, 0));
+        String compact = pa.assemble(ctx);   // autonomous-agent presentation policy
 
-        String compact = pa.assemble(ctx);   // agent policy
-        assertFalse(compact.contains("legal values"), "compact never renders value domains");
+        // The value domain is present under BOTH policies — semantic grounding does not vary by strategy.
+        assertTrue(full.contains("[legal values: open | closed]"), full);
+        assertTrue(compact.contains("[legal values: open | closed]"),
+                "the agent policy must render value domains too — semantic grounding is shared: " + compact);
+    }
+
+    /**
+     * The presentation budget (a per-strategy option) may drop DESCRIPTIVE detail, but must never
+     * drop SEMANTIC value knowledge. Even at a budget too small to fit the column detail, the value
+     * domain still renders — so semantic grounding is identical regardless of the budget a strategy chooses.
+     */
+    @Test
+    void valueDomainsSurviveThePresentationBudget() {
+        BusinessObject stores = new BusinessObject("obj-stores", "Stores", "",
+                List.of(new BusinessAttribute("c-status", "Status", AttributeRole.DIMENSION)), List.of());
+        ResolvedBusinessModel m = new ResolvedBusinessModel("a", List.of("conn-1"), "q",
+                List.of(stores),
+                Map.of("obj-stores", new PhysicalTable("conn-1", "retail_core", "stores")),
+                Map.of("c-status", new PhysicalColumn("conn-1", "retail_core", "stores", "status",
+                        "USER-DEFINED",
+                        new com.sei.nexus.semanticmodel.ColumnValueDomain("stores", "status", true,
+                                List.of("open", "closed")))));
+        PromptContext ctx = pcb.build(builder.compile(m));
+
+        String tiny = pa.assemble(ctx, new PromptAssembler.RenderOptions(true, true, true, 1));
+        assertTrue(tiny.contains("(columns omitted to fit the context budget)"),
+                "descriptive column detail is dropped by the tiny budget: " + tiny);
+        assertTrue(tiny.contains("[legal values: open | closed]"),
+                "value domains (semantic) survive the presentation budget regardless: " + tiny);
     }
 
     // ── the compact (agent) policy is byte-for-byte unchanged ─────────────────
@@ -151,8 +184,8 @@ class PromptContextEnrichmentTest {
         ExecutionContract contract = builder.compile(manyObjects(20));
         PromptContext ctx = pcb.build(contract);
 
-        String bounded   = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, false, 400));
-        String unbounded = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, false, 0));
+        String bounded   = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, 400));
+        String unbounded = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, 0));
 
         assertTrue(bounded.length() < unbounded.length(), "the budget bounds descriptive detail");
 
@@ -171,7 +204,7 @@ class PromptContextEnrichmentTest {
     @Test
     void everyObjectIdentitySurvivesAnUnrealisticallySmallBudget() {
         PromptContext ctx = pcb.build(builder.compile(manyObjects(5)));
-        String out = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, false, 1));
+        String out = pa.assemble(ctx, new PromptAssembler.RenderOptions(false, false, false, 1));
         assertEquals(5, out.split("TABLE `", -1).length - 1,
                 "all five identities render even at budget=1 — only column detail is sacrificed");
     }

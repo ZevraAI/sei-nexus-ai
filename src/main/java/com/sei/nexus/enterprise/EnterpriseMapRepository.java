@@ -250,6 +250,19 @@ public class EnterpriseMapRepository {
      * (connection, source schema, domain name, source). Returns the persisted
      * domain_value_key — the existing one when the domain was already known,
      * so re-scans never create duplicates.
+     *
+     * <p><b>Additive retention (OBSERVED domains).</b> Observed value domains are sampled via
+     * {@code SELECT DISTINCT … LIMIT}, so a value present in an earlier scan can be absent from a
+     * later one (rows deleted, temporary absence, sampling variance). Overwriting would silently
+     * lose it and orphan any Business Value mapping keyed on that physical value. On conflict the
+     * stored set therefore becomes the <b>union</b> of previously-observed and newly-observed
+     * values (deduplicated, sorted) — previously observed values are never lost, so downstream
+     * mappings stay stable over time. The union is computed atomically in the {@code ON CONFLICT}
+     * update, so concurrent re-scans of a shared domain cannot lose an update.
+     *
+     * <p><b>AUTHORITATIVE (enum) domains replace.</b> Enum domains come from a complete catalog
+     * read (not a sample), so the freshly-read set is the source of truth and is written verbatim,
+     * preserving enum order.
      */
     public String upsertValueDomain(ValueDomain d) {
         return jdbc.queryForObject("""
@@ -258,7 +271,13 @@ public class EnterpriseMapRepository {
                      source, is_authoritative, domain_values, scanned_at, created_at, updated_at)
                 VALUES (?,?,?,?,?,?,?::jsonb,NOW(),NOW(),NOW())
                 ON CONFLICT (connection_key, source_schema, domain_name, source) DO UPDATE SET
-                    domain_values    = EXCLUDED.domain_values,
+                    domain_values = CASE
+                        WHEN EXCLUDED.source = 'OBSERVED' THEN (
+                            SELECT COALESCE(jsonb_agg(DISTINCT elem ORDER BY elem), '[]'::jsonb)
+                            FROM jsonb_array_elements_text(
+                                nexus_value_domain.domain_values || EXCLUDED.domain_values) AS elem)
+                        ELSE EXCLUDED.domain_values
+                    END,
                     is_authoritative = EXCLUDED.is_authoritative,
                     scanned_at       = NOW(),
                     updated_at       = NOW()

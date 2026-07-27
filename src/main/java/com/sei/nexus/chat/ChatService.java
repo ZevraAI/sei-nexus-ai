@@ -948,7 +948,7 @@ public class ChatService {
         boolean hasMemory = memChunks != null && !memChunks.isEmpty();
         if (!promptContext.isEmpty()) {
             sb.append(promptAssembler.assemble(promptContext,
-                    new PromptAssembler.RenderOptions(true, true, true, true, maxEntityContextChars)))
+                    new PromptAssembler.RenderOptions(true, true, true, maxEntityContextChars)))
               .append('\n');
         } else {
             sb.append("=== TABLE SCHEMA ===\n");
