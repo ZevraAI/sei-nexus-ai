@@ -44,6 +44,10 @@ import com.sei.nexus.agentrunner.AgentRunner;
 import com.sei.nexus.agentrunner.ZevraAgent;
 import com.sei.nexus.agentrunner.ZevraAgentRouter;
 import com.sei.nexus.agentrunner.ZevraSession;
+import com.sei.nexus.strategy.ExecutionStrategy;
+import com.sei.nexus.strategy.ExecutionStrategySelector;
+import com.sei.nexus.strategy.IntentType;
+import com.sei.nexus.strategy.RequestAnalysis;
 import com.sei.nexus.semantic.LearningContextBuilder;
 import com.sei.nexus.semantic.ResolvedQuestion;
 import com.sei.nexus.semantic.SemanticLearningService;
@@ -94,6 +98,8 @@ public class ChatService {
     // ── Semantic learning (Phase 3) ───────────────────────────────────────────
     private final SemanticLearningService  semanticLearningService;
     private final LearningContextBuilder   learningContextBuilder;
+    // ── Execution Strategy Selection (Unified Answer Engine front door) ───────
+    private final ExecutionStrategySelector strategySelector;
     // ── Zevra Agentic AI routing ──────────────────────────────────────────────
     private final ZevraAgentRouter         zevraAgentRouter;
     private final AgentRunner              agentRunner;
@@ -154,6 +160,7 @@ public class ChatService {
                        ReasoningEventBus reasoningEventBus,
                        SemanticLearningService semanticLearningService,
                        LearningContextBuilder learningContextBuilder,
+                       ExecutionStrategySelector strategySelector,
                        ZevraAgentRouter zevraAgentRouter,
                        AgentRunner agentRunner,
                        AgentBrain agentBrain,
@@ -187,6 +194,7 @@ public class ChatService {
         this.reasoningEventBus        = reasoningEventBus;
         this.semanticLearningService  = semanticLearningService;
         this.learningContextBuilder   = learningContextBuilder;
+        this.strategySelector         = strategySelector;
         this.zevraAgentRouter         = zevraAgentRouter;
         this.agentRunner              = agentRunner;
         this.agentBrain               = agentBrain;
@@ -228,8 +236,20 @@ public class ChatService {
         // Check active agents before loading attachment or running the full pipeline.
         // Falls through silently if no agent matches or routing fails.
         String tenantSchemaForRouting = com.sei.nexus.tenant.TenantContext.getSchemaStrict();
-        java.util.Optional<ZevraAgent> routedZevraAgent =
-                zevraAgentRouter.route(raw, tenantSchemaForRouting);
+
+        // Unified Answer Engine front door: the Execution Strategy Selector owns HOW this request
+        // executes. It classifies on execution characteristics only (never data ownership),
+        // producing the canonical RequestAnalysis exactly once (Invariant 1, 3). The Agent Router
+        // (which agent) runs ONLY when the selected strategy is AGENT — it is never the front door
+        // (Invariant 2). AGENT with no suitable agent falls back to CHAT (approved graceful path).
+        RequestAnalysis requestAnalysis = strategySelector.analyze(raw, tenantSchemaForRouting);
+        java.util.Optional<ZevraAgent> routedZevraAgent = java.util.Optional.empty();
+        if (shouldInvokeAgentRouter(requestAnalysis)) {
+            routedZevraAgent = zevraAgentRouter.route(raw, tenantSchemaForRouting);
+            if (routedZevraAgent.isEmpty()) {
+                log.info("Strategy AGENT selected but no suitable agent matched — falling back to CHAT");
+            }
+        }
         // One NexusRun per conversation request: derive the identities once and persist
         // exactly one run, shared by the routed-agent branch and the normal pipeline. This
         // prevents a routed fall-through from re-inserting the same run_key (ADR-0003 A2
@@ -266,7 +286,7 @@ public class ChatService {
                 runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", null);
 
                 OrchestratorDecision decision = new OrchestratorDecision(
-                        "ZEVRA_AGENT", "OPERATIONAL_INVESTIGATION", "LIVE_DATA",
+                        "ZEVRA_AGENT", requestAnalysis.intentType().name(), "LIVE_DATA",
                         true, false, false);
                 return new ChatResponse(conversationId, runKey, answer, List.of(), decision,
                         za.slug(), za.name(), null, 0.9, false, "",
@@ -583,7 +603,8 @@ public class ChatService {
             List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, raw);
             return buildResponse(conversationId, runKey, answer, decisionType,
                     agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType),
-                    quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied);
+                    quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied,
+                    requestAnalysis.intentType());
 
         } catch (Exception e) {
             // The raw exception (SQL, table names, driver detail) is kept for operators only —
@@ -1058,6 +1079,20 @@ public class ChatService {
     }
 
     // =========================================================================
+    // Execution strategy dispatch (Unified Answer Engine front door)
+    // =========================================================================
+
+    /**
+     * The one gate that keeps the Agent Router from being the front door (Invariant 2): the router
+     * is invoked only after the selector has chosen {@link ExecutionStrategy#AGENT}. Package-private
+     * and static so the architectural conformance test can pin it without constructing ChatService —
+     * a regression guard against reintroducing unconditional (data-ownership-driven) routing.
+     */
+    static boolean shouldInvokeAgentRouter(RequestAnalysis analysis) {
+        return analysis != null && analysis.strategy() == ExecutionStrategy.AGENT;
+    }
+
+    // =========================================================================
     // Response building
     // =========================================================================
 
@@ -1066,11 +1101,24 @@ public class ChatService {
             List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps,
             List<Map<String, Object>> queryData, List<Map<String, Object>> reasoningSteps,
             List<String> learningsApplied) {
+        // Auxiliary callers (read-only boundary, source request, knowledge gap) keep the historical
+        // intent label — behaviour unchanged. The main conversational path uses the overload below
+        // to surface the canonical, front-door intentType (computed once, reused — never re-derived).
+        return buildResponse(conversationId, runKey, answer, decisionType, agent, confidence,
+                needsKnowledge, quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied,
+                IntentType.OPERATIONAL_INVESTIGATION);
+    }
+
+    private ChatResponse buildResponse(String conversationId, String runKey, String answer,
+            String decisionType, NexusAgent agent, double confidence, boolean needsKnowledge,
+            List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps,
+            List<Map<String, Object>> queryData, List<Map<String, Object>> reasoningSteps,
+            List<String> learningsApplied, IntentType intentType) {
         String evidenceMode = (decisionType.contains("QUERY") || decisionType.contains("HYBRID"))
                 ? "LIVE_DATA" : "MEMORY";
         OrchestratorDecision decision = new OrchestratorDecision(
                 decisionType,
-                "OPERATIONAL_INVESTIGATION",
+                intentType.name(),
                 evidenceMode,
                 decisionType.contains("QUERY") || decisionType.contains("HYBRID"),
                 !decisionType.contains("QUERY"),
