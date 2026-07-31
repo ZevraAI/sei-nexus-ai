@@ -167,9 +167,19 @@ public class AgentToolRegistry {
                     "error", "Query too large to run inline (" + outcome.governance().classification()
                             + "). Add a filter or narrow the range, then try again."));
 
-            // Preserves the prior behaviour: the failure propagates to execute()'s handler,
-            // which renders it as {"error": ...} for the model.
-            case FAILED -> throw outcome.failure();
+            // A query that reached execution and failed (e.g. the model referenced a column
+            // that does not exist on an otherwise-approved table) is a RECOVERABLE tool
+            // observation, not a fatal fault. Hand the database error back to the model so the
+            // ReAct loop can correct the SQL and retry. Throwing here surfaces as a
+            // NexusException, which execute() re-throws — aborting the whole run and, for the
+            // morning brief, zeroing the agent's entire contribution.
+            case FAILED -> mapper.writeValueAsString(Map.of(
+                    "error", (outcome.failure() != null && outcome.failure().getMessage() != null
+                                    ? outcome.failure().getMessage()
+                                    : "Query failed.")
+                            + " — Verify every column exists on the exact table you referenced: use only "
+                            + "the columns listed for that table in your grounding (a column on one table "
+                            + "may not exist on another). Then revise the SQL and try again."));
 
             case EXECUTED -> outcome.rowsJson();
 
