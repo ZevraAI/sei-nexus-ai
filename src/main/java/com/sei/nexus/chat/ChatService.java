@@ -522,7 +522,7 @@ public class ChatService {
                     // Conclude the reasoning session and, when the investigation was backed by real
                     // query results, persist an OperationalFinding — so the homepage reflects real
                     // intelligence (Open findings / Recommendations / Signals) instead of staying empty.
-                    persistInvestigationOutcome(sessionKey, agent, raw, answer, queryData, resultSnapshot);
+                    persistInvestigationOutcome(sessionKey, agent, raw, answer, queryData);
 
                     // Phase 3 Step 2: record what the business-object gate would have rejected,
                     // so the migration can be measured before enforcement is switched on.
@@ -1180,8 +1180,7 @@ public class ChatService {
      * a persistence failure never breaks the user's answer.
      */
     private void persistInvestigationOutcome(String sessionKey, NexusAgent agent, String question,
-                                             String answer, List<Map<String, Object>> queryData,
-                                             String resultSnapshot) {
+                                             String answer, List<Map<String, Object>> queryData) {
         try {
             boolean dataBacked  = queryData != null && !queryData.isEmpty();
             boolean substantive = answer != null && answer.trim().length() > 40;
@@ -1199,9 +1198,11 @@ public class ChatService {
                     ? agent.domainKeys() : "PLATFORM";
             String agentKey  = agent != null ? agent.agentKey() : null;
 
+            // evidence_summary is left null — never raw query JSON or internal snapshots. The
+            // description carries the analysis; the UI renders evidence_summary verbatim.
             OperationalFinding finding = new OperationalFinding(
                     Keys.uniqueKey("finding"), domainKey, agentKey, "INVESTIGATION",
-                    findingTitle(question, answer), answer, resultSnapshot, null,
+                    findingTitle(question, answer), answer, null, null,
                     confidence, "OPEN", now, now, null);
             reasoningRepository.saveFinding(finding);
         } catch (Exception e) {
@@ -1247,10 +1248,13 @@ public class ChatService {
                         question, null, "CONCLUDED", title, confidence, now, now));
             } catch (Exception ignore) { /* session recording is best-effort */ }
 
+            // evidence_summary is left null: the description already carries the full analysis,
+            // and this field must never hold raw query JSON or internal text — the UI renders it
+            // verbatim across every tenant.
             OperationalFinding finding = new OperationalFinding(
                     Keys.uniqueKey("finding"), "PLATFORM",
                     agent != null ? agent.id() : null, "INVESTIGATION",
-                    title, answer, "Investigation: " + question, null,
+                    title, answer, null, null,
                     confidence, "OPEN", now, now, null);
             reasoningRepository.saveFinding(finding);
         } catch (Exception e) {
