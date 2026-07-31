@@ -285,6 +285,10 @@ public class ChatService {
                         : "The agent completed but produced no response.";
                 runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", null);
 
+                // Record a data-backed investigation as an OperationalFinding so the homepage
+                // surfaces real intelligence (Open findings / Recommendations / Signals).
+                persistAgentFinding(za, raw, answer, session, runKey, conversationId);
+
                 OrchestratorDecision decision = new OrchestratorDecision(
                         "ZEVRA_AGENT", requestAnalysis.intentType().name(), "LIVE_DATA",
                         true, false, false);
@@ -515,6 +519,11 @@ public class ChatService {
                     answer = composeAnswer(raw, attachmentSummary, execResults, memChunks, semCtx,
                             findings, anomalyCtx, agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
 
+                    // Conclude the reasoning session and, when the investigation was backed by real
+                    // query results, persist an OperationalFinding — so the homepage reflects real
+                    // intelligence (Open findings / Recommendations / Signals) instead of staying empty.
+                    persistInvestigationOutcome(sessionKey, agent, raw, answer, queryData, resultSnapshot);
+
                     // Phase 3 Step 2: record what the business-object gate would have rejected,
                     // so the migration can be measured before enforcement is switched on.
                     if (!reasonResult.shadowGateFindings().isEmpty()) {
@@ -742,7 +751,11 @@ public class ChatService {
         if (!semCtx.isBlank()) ctx.append("Entity Context:\n").append(semCtx).append("\n\n");
         String prompt = "Question: " + question + "\n\nKnowledge:\n" + ctx;
         return nlComposer.compose(NaturalLanguageComposer.CompositionRequest.text(prompt,
-                "You are SEI Nexus. Answer using only the provided knowledge. Be concise and business-focused.",
+                """
+                You are Zevra, an enterprise intelligence AI briefing an executive. Answer using ONLY the
+                provided knowledge. Lead with a single-sentence verdict (the conclusion, ending in a period),
+                then 1-2 short sentences on why. Be concise and business-focused; do not enumerate records.
+                """,
                 "Unable to retrieve answer from memory at this time."));
     }
 
@@ -825,13 +838,20 @@ public class ChatService {
 
             String systemPrompt = anyRows
                     ? """
-                    You are Zevra, an enterprise operational intelligence AI.
-                    The full data is already shown to the user in a table and chart — do NOT list individual records or reproduce row-level data.
-                    Write a concise analyst summary of 2-4 sentences covering:
-                    1. Total count and headline distribution (e.g. "42 records: 28 active, 10 closed, 4 pending")
-                    2. The single most important insight or anomaly
-                    3. One actionable recommendation only if clearly warranted
-                    Use plain prose. Bold key numbers. No markdown headings or bullet lists unless there are multiple distinct anomalies.
+                    You are Zevra, an enterprise operational intelligence AI briefing a busy executive.
+                    Answer like a chief of staff, not a database.
+
+                    - LEAD with a single-sentence VERDICT: the conclusion itself, as one plain declarative
+                      sentence that ends with a period and can stand alone
+                      (e.g. "Margins are healthy overall, but two beauty products are priced below cost.").
+                    - Then give 1-2 short sentences on WHY it matters — the driver or the exception.
+                    - Add ONE recommendation only if clearly warranted, as its own sentence.
+                    - The full data is already shown to the user in a table and chart — NEVER enumerate
+                      individual records, do a product-by-product (or row-by-row) breakdown, or reproduce
+                      row-level values. Summarise; do not transcribe.
+                    - Bold the key figures. Plain prose only; no markdown headings or bullet lists unless
+                      there are several genuinely distinct, independent findings.
+                    - Be brief: 2 to 5 sentences total. Stop once the point is made.
                     """
                     : zeroRowSystemPrompt(attachmentSummary != null && !attachmentSummary.isBlank());
 
@@ -1150,6 +1170,110 @@ public class ChatService {
             }
         }
         return results;
+    }
+
+    /**
+     * Persists the outcome of a live-data investigation: concludes the reasoning session and,
+     * when the investigation was backed by real query results, records an OperationalFinding.
+     * Findings are created only from data-backed, substantive conclusions (never empty/error
+     * answers), so the homepage surfaces real intelligence rather than noise. Best-effort:
+     * a persistence failure never breaks the user's answer.
+     */
+    private void persistInvestigationOutcome(String sessionKey, NexusAgent agent, String question,
+                                             String answer, List<Map<String, Object>> queryData,
+                                             String resultSnapshot) {
+        try {
+            boolean dataBacked  = queryData != null && !queryData.isEmpty();
+            boolean substantive = answer != null && answer.trim().length() > 40;
+            Double  confidence  = dataBacked ? 0.8 : 0.6;   // evidence-strength annotation, not a business figure
+            Instant now         = Instant.now();
+
+            // The session is no longer running — conclude it with the composed answer.
+            reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED",
+                    substantive ? answer : null, substantive ? confidence : null, now);
+
+            // Only data-backed, substantive investigations become findings.
+            if (!dataBacked || !substantive) return;
+
+            String domainKey = (agent != null && agent.domainKeys() != null && !agent.domainKeys().isBlank())
+                    ? agent.domainKeys() : "PLATFORM";
+            String agentKey  = agent != null ? agent.agentKey() : null;
+
+            OperationalFinding finding = new OperationalFinding(
+                    Keys.uniqueKey("finding"), domainKey, agentKey, "INVESTIGATION",
+                    findingTitle(question, answer), answer, resultSnapshot, null,
+                    confidence, "OPEN", now, now, null);
+            reasoningRepository.saveFinding(finding);
+        } catch (Exception e) {
+            log.warn("Failed to persist investigation outcome for session {}: {}", sessionKey, e.getMessage());
+        }
+    }
+
+    /**
+     * When a routed-agent chat produces a substantive, data-backed answer, record it as an
+     * OperationalFinding so the homepage reflects real intelligence. Best-effort — a persistence
+     * failure never affects the user's answer.
+     */
+    /** Phrases that mark an answer as a non-finding (missing data/schema/knowledge). */
+    private static final java.util.List<String> NON_ANSWER_MARKERS = java.util.List.of(
+            "does not contain", "no tables", "not available", "cannot find", "couldn't find",
+            "could not find", "i don't have", "i do not have", "no data", "schema provided",
+            "unable to", "no approved", "not present in", "does not include", "no relevant");
+
+    private void persistAgentFinding(ZevraAgent agent, String question, String answer,
+                                     ZevraSession session, String runKey, String conversationId) {
+        try {
+            if (answer == null || answer.trim().length() < 40) return;
+            String lower = answer.toLowerCase();
+            // A finding must be a real, data-grounded conclusion — not an "I couldn't find it"
+            // non-answer. Skip responses that signal missing data/schema/knowledge.
+            for (String marker : NON_ANSWER_MARKERS) {
+                if (lower.contains(marker)) return;
+            }
+            // Data-backed when the agent actually executed a query that returned rows.
+            boolean dataBacked = session != null && session.stepsJson() != null
+                    && session.stepsJson().contains("\"rowCount\"")
+                    && !session.stepsJson().contains("\"rowCount\":0");
+            double  confidence = dataBacked ? 0.8 : 0.6;
+            Instant now        = Instant.now();
+            String  title      = findingTitle(question, answer);
+            String  agentName  = agent != null && agent.name() != null ? agent.name() : "Zevra";
+
+            // Record the investigation as a concluded reasoning session so the homepage
+            // "Investigations" panel reflects real, varied agent activity (not test noise).
+            try {
+                reasoningRepository.saveSession(new com.sei.nexus.reasoning.ReasoningSession(
+                        Keys.uniqueKey("rsession"), runKey, conversationId, agentName, "PLATFORM",
+                        question, null, "CONCLUDED", title, confidence, now, now));
+            } catch (Exception ignore) { /* session recording is best-effort */ }
+
+            OperationalFinding finding = new OperationalFinding(
+                    Keys.uniqueKey("finding"), "PLATFORM",
+                    agent != null ? agent.id() : null, "INVESTIGATION",
+                    title, answer, "Investigation: " + question, null,
+                    confidence, "OPEN", now, now, null);
+            reasoningRepository.saveFinding(finding);
+        } catch (Exception e) {
+            log.warn("Failed to persist agent finding: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * A clean finding/investigation title: the answer's opening statement, unless that opener is a
+     * list intro (ends with ':' or "as follows"/"are:") — in which case the question reads better.
+     */
+    private static String findingTitle(String question, String answer) {
+        String t = answer.trim().replaceAll("\\s+", " ");
+        int dot = t.indexOf(". ");
+        String first = dot > 15 ? t.substring(0, dot + 1) : (t.length() <= 120 ? t : null);
+        if (first != null) {
+            String fl = first.toLowerCase();
+            boolean listIntro = first.endsWith(":") || fl.contains("as follows")
+                    || fl.contains("are:") || fl.contains("the following");
+            if (!listIntro && first.length() <= 140) return first;
+        }
+        String q = question == null ? "Investigation" : question.trim();
+        return q.length() <= 140 ? q : q.substring(0, 140).trim() + "…";
     }
 
     // =========================================================================

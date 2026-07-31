@@ -37,6 +37,23 @@ public class ReasoningRepository {
             "started_at, concluded_at FROM nexus_reasoning_session " +
             "WHERE conversation_id = ? ORDER BY started_at DESC";
 
+    // Tenant-wide recent sessions (homepage activity feed — no single conversation).
+    private static final String FIND_RECENT_SESSIONS =
+            "SELECT session_key, run_key, conversation_id, agent_key, domain_key, " +
+            "initial_question, investigation_plan, status, conclusion, confidence_score, " +
+            "started_at, concluded_at FROM nexus_reasoning_session " +
+            "ORDER BY started_at DESC LIMIT ?";
+
+    // Tenant-wide recent findings across all domains (homepage). When status is null,
+    // all statuses are returned and the caller filters actionable vs observed.
+    private static final String FIND_RECENT_FINDINGS_ALL =
+            "SELECT finding_key, domain_key, agent_key, finding_type, title, description, " +
+            "evidence_summary, related_entity_keys, confidence, status, " +
+            "first_observed_at, last_confirmed_at, resolved_at " +
+            "FROM nexus_operational_finding " +
+            "WHERE (?::text IS NULL OR status = ?) " +
+            "ORDER BY last_confirmed_at DESC NULLS LAST LIMIT ?";
+
     // ── Step SQL ─────────────────────────────────────────────────────────────
     private static final String INSERT_STEP =
             "INSERT INTO nexus_reasoning_step " +
@@ -134,6 +151,11 @@ public class ReasoningRepository {
         return jdbc.query(FIND_SESSIONS_BY_CONVERSATION, sessionMapper(), conversationId);
     }
 
+    /** Recent sessions across the whole tenant (homepage — no conversation filter). */
+    public List<ReasoningSession> findRecentSessions(int limit) {
+        return jdbc.query(FIND_RECENT_SESSIONS, sessionMapper(), limit);
+    }
+
     // ── Steps ────────────────────────────────────────────────────────────────
 
     public void saveStep(ReasoningStep step) {
@@ -179,6 +201,12 @@ public class ReasoningRepository {
 
     public void updateFindingStatus(String findingKey, String status, Instant resolvedAt) {
         jdbc.update(UPDATE_FINDING, status, toTimestamp(Instant.now()), toTimestamp(resolvedAt), findingKey);
+    }
+
+    /** Recent findings across all domains for the tenant (homepage). status null → all. */
+    public List<OperationalFinding> findRecentFindingsAllDomains(String status, int limit) {
+        String s = (status == null || status.isBlank() || "ALL".equalsIgnoreCase(status)) ? null : status;
+        return jdbc.query(FIND_RECENT_FINDINGS_ALL, findingMapper(), s, s, limit);
     }
 
     public List<OperationalFinding> findFindingsByDomain(String domainKey, String status) {
