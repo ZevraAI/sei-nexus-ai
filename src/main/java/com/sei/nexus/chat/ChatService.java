@@ -283,7 +283,15 @@ public class ChatService {
                 String answer = session.finalOutput() != null && !session.finalOutput().isBlank()
                         ? session.finalOutput()
                         : "The agent completed but produced no response.";
-                runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", null);
+
+                // Surface + persist the agent's query results so the investigation's evidence is
+                // reproducible: Live Mode renders the table now, and reload / Report Mode render the
+                // identical table later. The rows already exist in the agent's step log — we
+                // denormalise them into the existing result_snapshot, exactly as the reasoning path
+                // does (RunRepository.update). No new storage, no pipeline change.
+                List<Map<String, Object>> agentRows = extractAgentQueryRows(session.stepsJson());
+                String resultSnapshot = agentRows.isEmpty() ? null : toJson(agentRows);
+                runRepository.update(runKey, answer, "ZEVRA_AGENT", "COMPLETE", resultSnapshot);
 
                 // Record a data-backed investigation as an OperationalFinding so the homepage
                 // surfaces real intelligence (Open findings / Recommendations / Signals).
@@ -294,7 +302,7 @@ public class ChatService {
                         true, false, false);
                 return new ChatResponse(conversationId, runKey, answer, List.of(), decision,
                         za.slug(), za.name(), null, 0.9, false, "",
-                        List.of(), List.of(), List.of(), List.of(), List.of(),
+                        List.of(), List.of(), agentRows, List.of(), List.of(),
                         session.id());
             } catch (Exception e) {
                 log.warn("ZevraAgent '{}' failed, falling through to normal chat: {}",
@@ -522,7 +530,7 @@ public class ChatService {
                     // Conclude the reasoning session and, when the investigation was backed by real
                     // query results, persist an OperationalFinding — so the homepage reflects real
                     // intelligence (Open findings / Recommendations / Signals) instead of staying empty.
-                    persistInvestigationOutcome(sessionKey, agent, raw, answer, queryData);
+                    persistInvestigationOutcome(sessionKey, agent, raw, answer, queryData, conversationId);
 
                     // Phase 3 Step 2: record what the business-object gate would have rejected,
                     // so the migration can be measured before enforcement is switched on.
@@ -1180,7 +1188,8 @@ public class ChatService {
      * a persistence failure never breaks the user's answer.
      */
     private void persistInvestigationOutcome(String sessionKey, NexusAgent agent, String question,
-                                             String answer, List<Map<String, Object>> queryData) {
+                                             String answer, List<Map<String, Object>> queryData,
+                                             String conversationId) {
         try {
             boolean dataBacked  = queryData != null && !queryData.isEmpty();
             boolean substantive = answer != null && answer.trim().length() > 40;
@@ -1199,10 +1208,11 @@ public class ChatService {
             String agentKey  = agent != null ? agent.agentKey() : null;
 
             // evidence_summary is left null — never raw query JSON or internal snapshots. The
-            // description carries the analysis; the UI renders evidence_summary verbatim.
+            // description carries the analysis; related_entity_keys carries the investigation
+            // lineage (the conversation) so the Executive Brief can open the exact investigation.
             OperationalFinding finding = new OperationalFinding(
                     Keys.uniqueKey("finding"), domainKey, agentKey, "INVESTIGATION",
-                    findingTitle(question, answer), answer, null, null,
+                    findingTitle(question, answer), answer, null, conversationId,
                     confidence, "OPEN", now, now, null);
             reasoningRepository.saveFinding(finding);
         } catch (Exception e) {
@@ -1215,6 +1225,32 @@ public class ChatService {
      * OperationalFinding so the homepage reflects real intelligence. Best-effort — a persistence
      * failure never affects the user's answer.
      */
+    /**
+     * The agent's query results, pulled from its recorded step log — the rows the agent already
+     * produced during execution (each query_database TOOL_CALL's output). Returns the most
+     * data-rich result set, capped at 100 rows, matching the reasoning path's query_data.
+     * Presentation/persistence only — nothing is re-executed. Empty when no query ran.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> extractAgentQueryRows(String stepsJson) {
+        if (stepsJson == null || stepsJson.isBlank()) return List.of();
+        try {
+            List<Map<String, Object>> steps = objectMapper.readValue(stepsJson, List.class);
+            List<Map<String, Object>> best = List.of();
+            for (Map<String, Object> step : steps) {
+                if (!"TOOL_CALL".equals(step.get("type"))) continue;
+                Object output = step.get("output");
+                if (output instanceof List<?> rows && rows.size() > best.size()
+                        && !rows.isEmpty() && rows.get(0) instanceof Map) {
+                    best = (List<Map<String, Object>>) rows;
+                }
+            }
+            return best.size() > 100 ? new java.util.ArrayList<>(best.subList(0, 100)) : best;
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     /** Phrases that mark an answer as a non-finding (missing data/schema/knowledge). */
     private static final java.util.List<String> NON_ANSWER_MARKERS = java.util.List.of(
             "does not contain", "no tables", "not available", "cannot find", "couldn't find",
@@ -1250,11 +1286,13 @@ public class ChatService {
 
             // evidence_summary is left null: the description already carries the full analysis,
             // and this field must never hold raw query JSON or internal text — the UI renders it
-            // verbatim across every tenant.
+            // verbatim across every tenant. related_entity_keys carries the investigation lineage
+            // (the conversation that produced this finding) so the Executive Brief can always open
+            // the exact investigation — deterministic traceability, not inference.
             OperationalFinding finding = new OperationalFinding(
                     Keys.uniqueKey("finding"), "PLATFORM",
                     agent != null ? agent.id() : null, "INVESTIGATION",
-                    title, answer, null, null,
+                    title, answer, null, conversationId,
                     confidence, "OPEN", now, now, null);
             reasoningRepository.saveFinding(finding);
         } catch (Exception e) {
