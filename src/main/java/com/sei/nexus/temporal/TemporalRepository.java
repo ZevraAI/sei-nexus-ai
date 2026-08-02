@@ -75,6 +75,14 @@ public class TemporalRepository {
             "severity, status, finding_key " +
             "FROM nexus_anomaly_event WHERE domain_key = ? ORDER BY detected_at DESC";
 
+    // Tenant-wide recent anomalies across all domains (homepage). status null → all statuses.
+    private static final String FIND_RECENT_ANOMALIES_ALL =
+            "SELECT anomaly_key, baseline_key, domain_key, entity_key, detected_at, metric_name, " +
+            "baseline_value, observed_value, deviation_pct, deviation_stddev, " +
+            "severity, status, finding_key " +
+            "FROM nexus_anomaly_event WHERE (?::text IS NULL OR status = ?) " +
+            "ORDER BY detected_at DESC LIMIT ?";
+
     private static final String FIND_RECENT_ANOMALIES =
             "SELECT anomaly_key, baseline_key, domain_key, entity_key, detected_at, metric_name, " +
             "baseline_value, observed_value, deviation_pct, deviation_stddev, " +
@@ -139,6 +147,12 @@ public class TemporalRepository {
             return jdbc.query(FIND_ANOMALIES_BY_DOMAIN_ALL, anomalyMapper(), domainKey);
         }
         return jdbc.query(FIND_ANOMALIES_BY_DOMAIN, anomalyMapper(), domainKey, status);
+    }
+
+    /** Recent anomalies across all domains for the tenant (homepage). status null → all. */
+    public List<AnomalyEvent> findRecentAnomaliesAllDomains(String status, int limit) {
+        String s = (status == null || status.isBlank() || "ALL".equalsIgnoreCase(status)) ? null : status;
+        return jdbc.query(FIND_RECENT_ANOMALIES_ALL, anomalyMapper(), s, s, limit);
     }
 
     public List<AnomalyEvent> findRecentAnomalies(List<String> domainKeys, int limit) {

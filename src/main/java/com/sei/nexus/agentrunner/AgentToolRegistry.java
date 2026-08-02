@@ -1,9 +1,10 @@
 package com.sei.nexus.agentrunner;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sei.nexus.agentbrain.ExecutionContract;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.common.NexusException;
-import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.runtime.GovernedSqlRuntime;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -17,16 +18,16 @@ import java.util.Map;
 @Service
 public class AgentToolRegistry {
 
-    private final DynamicSqlService dynamicSql;
-    private final AzureOpenAiClient openAi;
-    private final ObjectMapper      mapper;
+    private final AzureOpenAiClient   openAi;
+    private final ObjectMapper        mapper;
+    private final GovernedSqlRuntime  runtime;
 
-    public AgentToolRegistry(DynamicSqlService dynamicSql,
-                              AzureOpenAiClient openAi,
-                              ObjectMapper mapper) {
-        this.dynamicSql = dynamicSql;
-        this.openAi     = openAi;
-        this.mapper     = mapper;
+    public AgentToolRegistry(AzureOpenAiClient openAi,
+                              ObjectMapper mapper,
+                              GovernedSqlRuntime runtime) {
+        this.openAi  = openAi;
+        this.mapper  = mapper;
+        this.runtime = runtime;
     }
 
     // ── Tool definitions sent to the LLM ─────────────────────────────────────
@@ -107,11 +108,15 @@ public class AgentToolRegistry {
      * Security: validates connection_key is within the agent's allowed list.
      */
     public String execute(String toolName, Map<String, Object> args,
-                           List<String> allowedConnections) {
+                           List<String> allowedConnections,
+                           String userEmail, String runKey, int stepNo,
+                           ExecutionContract contract,
+                           String conversationId, String parentExecutionId) {
         try {
             return switch (toolName) {
-                case "query_database"  -> execQueryDatabase(args, allowedConnections);
-                case "describe_schema" -> execDescribeSchema(args, allowedConnections);
+                case "query_database"  -> execQueryDatabase(args, allowedConnections, userEmail, runKey, stepNo,
+                        contract, conversationId, parentExecutionId);
+                case "describe_schema" -> execDescribeSchema(args, allowedConnections, contract);
                 case "analyze_image"   -> execAnalyzeImage(args);
                 case "final_answer"    -> String.valueOf(args.get("answer"));
                 default -> throw new NexusException(HttpStatus.BAD_REQUEST,
@@ -125,7 +130,10 @@ public class AgentToolRegistry {
     }
 
     private String execQueryDatabase(Map<String, Object> args,
-                                      List<String> allowedConnections) throws Exception {
+                                      List<String> allowedConnections,
+                                      String userEmail, String runKey, int stepNo,
+                                      ExecutionContract contract,
+                                      String conversationId, String parentExecutionId) throws Exception {
         String connKey = getString(args, "connection_key");
         String sql     = getString(args, "sql");
 
@@ -133,21 +141,72 @@ public class AgentToolRegistry {
             throw new NexusException(HttpStatus.FORBIDDEN,
                     "Agent is not permitted to access connection: " + connKey);
 
-        List<Map<String, Object>> rows = dynamicSql.executeQuery(connKey, sql, 100);
-        return mapper.writeValueAsString(rows);
+        // Deterministic execution (Unified Answer Engine, Phase 1): the shared
+        // GovernedSqlRuntime owns the business-object gate (ADR-0003 A14), the governance
+        // chain (ADR-0003 A2, SqlGovernancePipeline unchanged), read-only execution, and
+        // audit. This registry keeps only the agent-facing presentation: each deterministic
+        // verdict becomes a physical tool observation the ReAct loop can re-plan against;
+        // the business explanation is the model's final_answer, not the runtime's.
+        GovernedSqlRuntime.Outcome outcome = runtime.execute(
+                GovernedSqlRuntime.Request.forAgent(runKey, stepNo, connKey, sql, userEmail, contract,
+                        conversationId, parentExecutionId));
+
+        return switch (outcome.status()) {
+            case UNAPPROVED_OBJECTS -> mapper.writeValueAsString(Map.of(
+                    "error", "Query references table(s) not in the approved execution contract for connection '"
+                            + connKey + "': " + outcome.unapprovedTables() + ". Approved physical tables: ["
+                            + outcome.approvedTables() + "]. Use an approved business object, or state via "
+                            + "final_answer that the requested data is not available."));
+
+            case GOVERNANCE_BLOCKED, CONTRACT_BLOCKED -> mapper.writeValueAsString(Map.of(
+                    "error", "Query rejected: " + outcome.message()
+                            + ". Only read-only SELECT queries within your governed scope are permitted — revise the query."));
+
+            // The agent loop is synchronous; surface a narrow-the-query observation.
+            case ASYNC -> mapper.writeValueAsString(Map.of(
+                    "error", "Query too large to run inline (" + outcome.governance().classification()
+                            + "). Add a filter or narrow the range, then try again."));
+
+            // A query that reached execution and failed (e.g. the model referenced a column
+            // that does not exist on an otherwise-approved table) is a RECOVERABLE tool
+            // observation, not a fatal fault. Hand the database error back to the model so the
+            // ReAct loop can correct the SQL and retry. Throwing here surfaces as a
+            // NexusException, which execute() re-throws — aborting the whole run and, for the
+            // morning brief, zeroing the agent's entire contribution.
+            case FAILED -> mapper.writeValueAsString(Map.of(
+                    "error", (outcome.failure() != null && outcome.failure().getMessage() != null
+                                    ? outcome.failure().getMessage()
+                                    : "Query failed.")
+                            + " — Verify every column exists on the exact table you referenced: use only "
+                            + "the columns listed for that table in your grounding (a column on one table "
+                            + "may not exist on another). Then revise the SQL and try again."));
+
+            case EXECUTED -> outcome.rowsJson();
+
+            // Literal validation is not engaged on the agent path (no domain scope today).
+            default -> mapper.writeValueAsString(Map.of("error", String.valueOf(outcome.message())));
+        };
     }
 
     private String execDescribeSchema(Map<String, Object> args,
-                                       List<String> allowedConnections) throws Exception {
+                                       List<String> allowedConnections,
+                                       ExecutionContract contract) throws Exception {
         String connKey = getString(args, "connection_key");
 
         if (!allowedConnections.contains(connKey))
             throw new NexusException(HttpStatus.FORBIDDEN,
                     "Agent is not permitted to access connection: " + connKey);
 
-        List<Map<String, Object>> tables =
-                dynamicSql.listTablesWithColumnCounts(connKey, "public");
-        return mapper.writeValueAsString(tables);
+        // Scoped to the approved ExecutionContract (ADR-0003 A14) — the runtime never
+        // exposes the raw information_schema catalog to the model; it returns only the
+        // business objects Agent Brain approved for this connection.
+        List<Map<String, Object>> objects = contract.executionBindings().objectBindings().values().stream()
+                .filter(t -> connKey.equals(t.connectionKey()))
+                .map(t -> Map.<String, Object>of(
+                        "table",  t.table(),
+                        "schema", t.schema() == null ? "" : t.schema()))
+                .toList();
+        return mapper.writeValueAsString(objects);
     }
 
     private String execAnalyzeImage(Map<String, Object> args) {

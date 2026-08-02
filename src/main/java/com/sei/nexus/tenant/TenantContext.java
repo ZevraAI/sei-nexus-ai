@@ -48,6 +48,23 @@ public final class TenantContext {
         return SCHEMA.get() != null;
     }
 
+    /**
+     * Returns the current tenant schema, or throws when no tenant context has been established.
+     *
+     * <p>Unlike {@link #getSchema()}, this never falls back to {@code public}. Tenant-scoped data
+     * access must call this so a missing context fails <b>closed</b> (a clear error) rather than
+     * silently reading the shared {@code public} schema. Registry/login/migration paths that
+     * legitimately run without a tenant keep using {@link #getSchema()}.
+     */
+    public static String getSchemaStrict() {
+        String schema = SCHEMA.get();
+        if (schema == null || schema.isBlank()) {
+            throw new IllegalStateException(
+                    "No tenant context established for this request; refusing to fall back to 'public'");
+        }
+        return schema;
+    }
+
     /** Must be called in a {@code finally} block after every request to prevent leaks. */
     public static void clear() {
         SCHEMA.remove();

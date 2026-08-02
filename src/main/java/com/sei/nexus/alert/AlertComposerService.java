@@ -1,51 +1,48 @@
 package com.sei.nexus.alert;
 
-import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.response.NaturalLanguageComposer;
 import com.sei.nexus.temporal.AnomalyEvent;
 import com.sei.nexus.temporal.OperationalBaseline;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-
-import java.util.List;
 
 /**
  * Generates a concise, professional natural-language alert message for a detected anomaly.
  * The message is used across all channels — Slack, email, and in-app.
+ *
+ * <p>Unified Answer Engine, Phase 4: the model-call mechanics are delegated to the shared
+ * {@link NaturalLanguageComposer}. This service owns only the alert <b>policy</b> — the prompt,
+ * the system prompt (tone/format), and the deterministic template fallback.
  */
 @Service
 public class AlertComposerService {
 
-    private static final Logger log = LoggerFactory.getLogger(AlertComposerService.class);
+    /** The alert composition policy (tone/format). Passed to the shared composer as a system prompt. */
+    private static final String ALERT_SYSTEM_PROMPT = """
+            You are Zevra, an enterprise operational intelligence platform.
+            Write a concise, professional alert message for a business analyst.
+            Use 2-3 sentences maximum. Include:
+            1. The metric name and what changed (with exact numbers)
+            2. Why it matters operationally
+            3. One specific recommended action
+            Do not use markdown. Write in plain professional English.
+            Start directly with the finding — no preamble.
+            """;
 
-    private final AzureOpenAiClient aiClient;
+    private final NaturalLanguageComposer nlComposer;
 
-    public AlertComposerService(AzureOpenAiClient aiClient) {
-        this.aiClient = aiClient;
+    public AlertComposerService(NaturalLanguageComposer nlComposer) {
+        this.nlComposer = nlComposer;
     }
 
     /**
      * Composes a plain-English alert message from the anomaly and its baseline context.
-     * Falls back to a deterministic template if the AI call fails.
+     * Falls back to a deterministic template if the AI call fails (the fallback is built lazily,
+     * only when composition fails).
      */
     public String compose(AlertRule rule, AnomalyEvent anomaly, OperationalBaseline baseline) {
-        try {
-            String prompt = buildPrompt(rule, anomaly, baseline);
-            return aiClient.chat(List.of(ChatMessage.user(prompt)), """
-                    You are Zevra, an enterprise operational intelligence platform.
-                    Write a concise, professional alert message for a business analyst.
-                    Use 2-3 sentences maximum. Include:
-                    1. The metric name and what changed (with exact numbers)
-                    2. Why it matters operationally
-                    3. One specific recommended action
-                    Do not use markdown. Write in plain professional English.
-                    Start directly with the finding — no preamble.
-                    """);
-        } catch (Exception e) {
-            log.warn("AI alert composition failed, using template: {}", e.getMessage());
-            return buildFallbackMessage(rule, anomaly, baseline);
-        }
+        String prompt = buildPrompt(rule, anomaly, baseline);
+        return nlComposer.compose(NaturalLanguageComposer.CompositionRequest.text(
+                prompt, ALERT_SYSTEM_PROMPT, () -> buildFallbackMessage(rule, anomaly, baseline)));
     }
 
     private String buildPrompt(AlertRule rule, AnomalyEvent anomaly, OperationalBaseline baseline) {

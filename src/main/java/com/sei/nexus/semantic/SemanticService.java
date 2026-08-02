@@ -18,11 +18,11 @@ public class SemanticService {
 
     private static final String FIND_ENTITIES =
             "SELECT entity_key, entity_name, node_type, description, " +
-            "operational_meaning, investigation_hints, status " +
+            "operational_meaning, investigation_hints, status, primary_object_key " +
             "FROM nexus_business_entity WHERE domain_key = ANY(?::text[]) AND status = 'ACTIVE' LIMIT 50";
 
     private static final String FIND_VOCABULARY =
-            "SELECT term, definition, sql_equivalent " +
+            "SELECT term, definition, sql_equivalent, entity_key " +
             "FROM nexus_operational_vocabulary WHERE domain_key = ANY(?::text[]) AND status = 'ACTIVE' LIMIT 30";
 
     private final JdbcTemplate jdbc;
@@ -37,61 +37,142 @@ public class SemanticService {
     }
 
     /**
+     * A business term (an entity name or a vocabulary term) bound to the physical
+     * table it resolves to via nexus_business_entity.primary_object_key. The
+     * primaryObjectKey equals nexus_data_object.object_key, i.e. the key of the
+     * business object the term resolves to.
+     */
+    public record EntityBinding(String matchText, String primaryObjectKey) {}
+
+    /**
+     * Rendered semantic context plus two derivations from the same rows, so the
+     * context assembler (ChatService) needs no extra queries:
+     * <ul>
+     *   <li>{@code bindings} — term→table bindings for entity-block ranking (PRO-19);</li>
+     *   <li>{@code termLinesByObjectKey} — pre-rendered "Business terms" lines
+     *       ({@code "term" = sql_equivalent}) per bound table, attached to the
+     *       selected entity blocks as structural companions (PRO-24). Only ACTIVE
+     *       terms with a non-blank SQL equivalent qualify, capped per table.</li>
+     * </ul>
+     */
+    public record SemanticContext(String contextText, List<EntityBinding> bindings,
+                                  Map<String, List<String>> termLinesByObjectKey) {
+        public static final SemanticContext EMPTY = new SemanticContext("", List.of(), Map.of());
+    }
+
+    // Business-terms lines attached per entity block (PRO-24) — bounded per table
+    // so prompt cost never scales with vocabulary volume.
+    private static final int MAX_TERM_LINES_PER_OBJECT = 3;
+
+    // Internal row shapes — keep query mapping separate from assembly so the
+    // rendering + binding logic is testable without a database.
+    record EntityRow(String entityKey, String name, String type, String description,
+                     String meaning, String hints, String primaryObjectKey) {}
+    record VocabRow(String term, String definition, String sqlEquivalent, String entityKey) {}
+
+    /**
      * Builds a semantic context string for a given question within the specified domains.
      * Returns relevant entity definitions and vocabulary that help answer the question.
      */
     public String buildSemanticContext(List<String> domainKeys, String question) {
+        return semanticContextWithBindings(domainKeys, question).contextText();
+    }
+
+    /**
+     * Same rendered context as {@link #buildSemanticContext}, plus the
+     * entity-name and vocabulary-term → primary_object_key bindings used by the
+     * planner context assembler as its primary relevance signal.
+     */
+    public SemanticContext semanticContextWithBindings(List<String> domainKeys, String question) {
         if (domainKeys == null || domainKeys.isEmpty()) {
-            return "";
+            return SemanticContext.EMPTY;
         }
         try {
-            StringBuilder sb = new StringBuilder();
-
-            // Load business entities
             String[] domainArray = domainKeys.toArray(new String[0]);
-            List<String> entityRows = jdbc.query(FIND_ENTITIES,
+
+            List<EntityRow> entities = jdbc.query(FIND_ENTITIES,
                     ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", domainArray)),
-                    (rs, rowNum) -> {
-                        String name    = rs.getString("entity_name");
-                        String type    = rs.getString("node_type");
-                        String desc    = rs.getString("description");
-                        String meaning = rs.getString("operational_meaning");
-                        String hints   = rs.getString("investigation_hints");
-                        StringBuilder row = new StringBuilder(name);
-                        if (type != null && !type.isBlank()) row.append(" (").append(type).append(")");
-                        if (desc != null && !desc.isBlank()) row.append(": ").append(desc);
-                        if (meaning != null && !meaning.isBlank()) row.append(" | ").append(meaning);
-                        if (hints != null && !hints.isBlank()) row.append(" | Hint: ").append(hints);
-                        return row.toString();
-                    });
+                    (rs, rowNum) -> new EntityRow(
+                            rs.getString("entity_key"),
+                            rs.getString("entity_name"),
+                            rs.getString("node_type"),
+                            rs.getString("description"),
+                            rs.getString("operational_meaning"),
+                            rs.getString("investigation_hints"),
+                            rs.getString("primary_object_key")));
 
-            if (!entityRows.isEmpty()) {
-                sb.append("=== Business Entities ===\n");
-                entityRows.forEach(e -> sb.append("- ").append(e).append("\n"));
-                sb.append("\n");
-            }
-
-            // Load vocabulary
-            List<String> vocabRows = jdbc.query(FIND_VOCABULARY,
+            List<VocabRow> vocab = jdbc.query(FIND_VOCABULARY,
                     ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", domainArray)),
-                    (rs, rowNum) -> {
-                        String term = rs.getString("term");
-                        String def  = rs.getString("definition");
-                        String sql  = rs.getString("sql_equivalent");
-                        String row  = term + ": " + def;
-                        return (sql != null && !sql.isBlank()) ? row + " [SQL: " + sql + "]" : row;
-                    });
+                    (rs, rowNum) -> new VocabRow(
+                            rs.getString("term"),
+                            rs.getString("definition"),
+                            rs.getString("sql_equivalent"),
+                            rs.getString("entity_key")));
 
-            if (!vocabRows.isEmpty()) {
-                sb.append("=== Operational Vocabulary ===\n");
-                vocabRows.forEach(v -> sb.append("- ").append(v).append("\n"));
-            }
-
-            return sb.toString();
+            return assemble(entities, vocab);
         } catch (Exception e) {
             log.warn("Failed to build semantic context for domains {}: {}", domainKeys, e.getMessage());
-            return "";
+            return SemanticContext.EMPTY;
         }
+    }
+
+    /**
+     * Renders the semantic context text (format unchanged) and collects the
+     * term→table bindings. Vocabulary terms resolve to a table transitively:
+     * term.entity_key → entity.primary_object_key. Entities without a table
+     * link (e.g. pack-created entities) contribute context text but no binding.
+     */
+    static SemanticContext assemble(List<EntityRow> entities, List<VocabRow> vocab) {
+        StringBuilder sb = new StringBuilder();
+        Map<String, String> entityTable = new java.util.HashMap<>();
+        List<EntityBinding> bindings = new java.util.ArrayList<>();
+
+        if (!entities.isEmpty()) {
+            sb.append("=== Business Entities ===\n");
+            for (EntityRow e : entities) {
+                StringBuilder row = new StringBuilder(e.name());
+                if (e.type() != null && !e.type().isBlank()) row.append(" (").append(e.type()).append(")");
+                if (e.description() != null && !e.description().isBlank()) row.append(": ").append(e.description());
+                if (e.meaning() != null && !e.meaning().isBlank()) row.append(" | ").append(e.meaning());
+                if (e.hints() != null && !e.hints().isBlank()) row.append(" | Hint: ").append(e.hints());
+                sb.append("- ").append(row).append("\n");
+
+                if (e.primaryObjectKey() != null && !e.primaryObjectKey().isBlank()) {
+                    if (e.entityKey() != null) entityTable.put(e.entityKey(), e.primaryObjectKey());
+                    if (e.name() != null) bindings.add(new EntityBinding(e.name(), e.primaryObjectKey()));
+                }
+            }
+            sb.append("\n");
+        }
+
+        Map<String, List<String>> termLines = new java.util.LinkedHashMap<>();
+        if (!vocab.isEmpty()) {
+            sb.append("=== Operational Vocabulary ===\n");
+            for (VocabRow v : vocab) {
+                String row = v.term() + ": " + v.definition();
+                if (v.sqlEquivalent() != null && !v.sqlEquivalent().isBlank()) {
+                    row = row + " [SQL: " + v.sqlEquivalent() + "]";
+                }
+                sb.append("- ").append(row).append("\n");
+
+                String objectKey = v.entityKey() != null ? entityTable.get(v.entityKey()) : null;
+                if (v.term() != null && objectKey != null) {
+                    bindings.add(new EntityBinding(v.term(), objectKey));
+
+                    // Business-terms companion line (PRO-24): only sql-equipped
+                    // terms earn prompt tokens; capped per bound table.
+                    if (v.sqlEquivalent() != null && !v.sqlEquivalent().isBlank()) {
+                        List<String> lines = termLines.computeIfAbsent(
+                                objectKey, k -> new java.util.ArrayList<>());
+                        if (lines.size() < MAX_TERM_LINES_PER_OBJECT) {
+                            lines.add("\"" + v.term() + "\" = " + v.sqlEquivalent());
+                        }
+                    }
+                }
+            }
+        }
+
+        return new SemanticContext(sb.toString(), List.copyOf(bindings), Map.copyOf(termLines));
     }
 
     // -------------------------------------------------------------------------

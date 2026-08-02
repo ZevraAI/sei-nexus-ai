@@ -1,8 +1,7 @@
 package com.sei.nexus.brief;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.response.NaturalLanguageComposer;
 import com.sei.nexus.agentrunner.AgentRunner;
 import com.sei.nexus.agentrunner.ZevraAgent;
 import com.sei.nexus.agentrunner.ZevraAgentRepository;
@@ -94,18 +93,18 @@ public class MorningBriefService {
     private final MorningBriefRepository  briefRepository;
     private final ZevraAgentRepository    agentRepository;
     private final AgentRunner             agentRunner;
-    private final AzureOpenAiClient       openAi;
+    private final NaturalLanguageComposer nlComposer;
     private final ObjectMapper            mapper;
 
     public MorningBriefService(MorningBriefRepository briefRepository,
                                 ZevraAgentRepository agentRepository,
                                 AgentRunner agentRunner,
-                                AzureOpenAiClient openAi,
+                                NaturalLanguageComposer nlComposer,
                                 ObjectMapper mapper) {
         this.briefRepository = briefRepository;
         this.agentRepository  = agentRepository;
         this.agentRunner      = agentRunner;
-        this.openAi           = openAi;
+        this.nlComposer       = nlComposer;
         this.mapper           = mapper;
     }
 
@@ -251,7 +250,9 @@ public class MorningBriefService {
 
                     com.sei.nexus.usage.UsageContext.set("brief", null, agent.name());
                     String briefQuestion = String.format(BRIEF_QUESTION_TEMPLATE, agent.goal());
-                    ZevraSession session = agentRunner.run(cappedAgent, briefQuestion);
+                    // The brief is autonomous execution — the runtime creates its own
+                    // governance run (existingRunKey = null).
+                    ZevraSession session = agentRunner.run(cappedAgent, briefQuestion, agent.createdBy(), null);
 
                     // Include the raw SQL query results from steps — not just the vague
                     // narrative in finalOutput. This gives synthesis concrete numbers.
@@ -335,8 +336,10 @@ public class MorningBriefService {
         String userPrompt = "Agent reports:\n\n" + combinedOutputs +
                 "\n\nAgents that contributed: " + String.join(", ", agentNames);
 
-        return openAi.chatWithJson(
-                List.of(ChatMessage.user(userPrompt)),
-                SYNTHESIS_SYSTEM_PROMPT);
+        // Shared composition mechanics (Phase 4), JSON mode. No fallback: a synthesis failure
+        // propagates so the caller marks the brief FAILED — the brief's existing behaviour.
+        // The SYNTHESIS_SYSTEM_PROMPT (brief's JSON shape) stays here as Brief's composition policy.
+        return nlComposer.compose(NaturalLanguageComposer.CompositionRequest
+                .jsonPropagating(userPrompt, SYNTHESIS_SYSTEM_PROMPT));
     }
 }

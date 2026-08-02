@@ -2,11 +2,8 @@ package com.sei.nexus.reasoning;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.Keys;
-import com.sei.nexus.connection.ConnectionRepository;
-import com.sei.nexus.governance.*;
-import com.sei.nexus.query.QueryExecutionRepository;
-import com.sei.nexus.query.QueryGovernanceService;
-import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.runtime.GovernedSqlRuntime;
+import com.sei.nexus.semanticmodel.ColumnValueDomain;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -40,61 +37,47 @@ public class ReasoningEngine {
     private final ReasoningEvaluator       evaluator;
     private final ReasoningEventBus        eventBus;
     private final ReasoningRepository      reasoningRepository;
-    private final ConnectionRepository     connectionRepository;
-    private final QueryGovernanceService   governanceService;
-    private final QueryExecutionRepository executionRepository;
-    private final DynamicSqlService        dynamicSqlService;
-    private final DataContractService      contractService;
-    private final RowLevelSecurityService  rlsService;
-    private final ColumnMaskingService     maskingService;
-    private final GovernanceAuditService   auditService;
-    private final UserAttributesRepository userAttrsRepository;
+    private final GovernedSqlRuntime       runtime;
     private final ObjectMapper             objectMapper;
 
     public ReasoningEngine(ReasoningPlanner planner,
                            ReasoningEvaluator evaluator,
                            ReasoningEventBus eventBus,
                            ReasoningRepository reasoningRepository,
-                           ConnectionRepository connectionRepository,
-                           QueryGovernanceService governanceService,
-                           QueryExecutionRepository executionRepository,
-                           DynamicSqlService dynamicSqlService,
-                           DataContractService contractService,
-                           RowLevelSecurityService rlsService,
-                           ColumnMaskingService maskingService,
-                           GovernanceAuditService auditService,
-                           UserAttributesRepository userAttrsRepository,
+                           GovernedSqlRuntime runtime,
                            ObjectMapper objectMapper) {
-        this.planner              = planner;
-        this.evaluator            = evaluator;
-        this.eventBus             = eventBus;
-        this.reasoningRepository  = reasoningRepository;
-        this.connectionRepository = connectionRepository;
-        this.governanceService    = governanceService;
-        this.executionRepository  = executionRepository;
-        this.dynamicSqlService    = dynamicSqlService;
-        this.contractService      = contractService;
-        this.rlsService           = rlsService;
-        this.maskingService       = maskingService;
-        this.auditService         = auditService;
-        this.userAttrsRepository  = userAttrsRepository;
-        this.objectMapper         = objectMapper;
+        this.planner               = planner;
+        this.evaluator             = evaluator;
+        this.eventBus              = eventBus;
+        this.reasoningRepository   = reasoningRepository;
+        this.runtime               = runtime;
+        this.objectMapper          = objectMapper;
     }
 
     /**
      * Result produced by a full reasoning session.
      *
-     * @param evidence        All step evidence accumulated.
-     * @param queryData       Rows from the most productive step (for frontend visualisation).
-     * @param resultSnapshot  JSON of the last sync result (for conversation memory).
-     * @param crossSource     True when data from more than one database was used.
+     * @param evidence          All step evidence accumulated.
+     * @param queryData         Rows from the most productive step (for frontend visualisation).
+     * @param resultSnapshot    JSON of the last sync result (for conversation memory).
+     * @param crossSource       True when data from more than one database was used.
+     * @param validatedBindings Literal bindings the planner declared that passed
+     *                          deterministic domain validation on a step that
+     *                          executed successfully (PRO-33) — the trace and
+     *                          learning-capture payload.
      */
     public record ReasoningResult(
             EvidenceStore          evidence,
             List<Map<String, Object>> queryData,
             String                 resultSnapshot,
-            boolean                crossSource
+            boolean                crossSource,
+            List<ValidatedBinding> validatedBindings,
+            List<String>           shadowGateFindings
     ) {}
+
+    /** A planner-declared literal resolution confirmed against a persisted domain. */
+    public record ValidatedBinding(String surface, String column, String value,
+                                   boolean authoritative) {}
 
     /**
      * Run the iterative reasoning loop for a single user question.
@@ -103,17 +86,30 @@ public class ReasoningEngine {
      * @param enrichedQ   Enriched version that may include uploaded file content.
      * @param sessionKey  Reasoning session key (already created by the caller).
      * @param schemaCtx   Approved schema context string for the planner.
-     * @param runKey      Parent run key — used for governance audit events.
-     * @param userEmail   Authenticated user.
-     * @param forceAsync  If true, heavy steps are queued for async execution.
+     * @param runKey       Parent run key — used for governance audit events.
+     * @param userEmail    Authenticated user.
+     * @param forceAsync   If true, heavy steps are queued for async execution.
+     * @param literalScope Domain-bearing columns in scope for deterministic
+     *                     literal validation (PRO-33); null/empty disables the
+     *                     gate and reproduces pre-DLR behavior exactly.
      */
     public ReasoningResult reason(String question, String enrichedQ, String sessionKey,
                                   String schemaCtx, String runKey, String userEmail,
-                                  boolean forceAsync) {
+                                  boolean forceAsync,
+                                  Map<String, ColumnValueDomain> literalScope,
+                                  com.sei.nexus.agentbrain.ExecutionContract contract,
+                                  boolean enforceContractGate,
+                                  String conversationId, String parentExecutionId) {
 
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
         int           stepNo         = 1;
+        // PRO-33 retry memory: (column, literal) pairs already rejected once —
+        // the "re-prompted once" bound of PRO-32 §5.
+        Set<String>            literalRejections = new HashSet<>();
+        List<ValidatedBinding> validatedBindings = new ArrayList<>();
+        // Phase 3 Step 2: what the business-object gate would have rejected, when shadowing.
+        List<String>           shadowGateFindings = new ArrayList<>();
 
         while (stepNo <= MAX_STEPS) {
             // ── 1. Plan the next step ─────────────────────────────────────────
@@ -128,100 +124,146 @@ public class ReasoningEngine {
                     "stepNo",      stepNo,
                     "description", plan.description()));
 
-            // ── 2. Validate the connection ────────────────────────────────────
-            if (connectionRepository.findByKeyOrName(plan.connectionKey()).isEmpty()) {
+            // ── 2. Deterministic execution (Unified Answer Engine, Phase 1) ────
+            //     The shared GovernedSqlRuntime owns literal validation (PRO-33),
+            //     the connection existence check, the governance chain
+            //     (SqlGovernancePipeline unchanged), execution, execution-record
+            //     tracking, and audit — in that order, exactly as this engine
+            //     sequenced them inline before Phase 1. This engine keeps reasoning,
+            //     evidence, evaluation, PRO-33 capture, event publishing, and loop
+            //     control — behaviour identical to the prior inline chain.
+            GovernedSqlRuntime.Outcome ro = runtime.execute(
+                    GovernedSqlRuntime.Request.forPlanner(runKey, stepNo, plan.connectionKey(),
+                            plan.objectKeys(), plan.sql(), userEmail, forceAsync,
+                            literalScope, plan.literalBindings(), enrichedQ, literalRejections,
+                            contract, enforceContractGate, conversationId, parentExecutionId));
+
+            // Connection named by the planner does not exist — skip the step.
+            if (ro.status() == GovernedSqlRuntime.Status.CONNECTION_NOT_FOUND) {
                 log.warn("Step {} skipped — connection '{}' not found", stepNo, plan.connectionKey());
                 eventBus.publish(runKey, "step_error", Map.of(
                         "stepNo", stepNo,
-                        "reason", "Connection '" + plan.connectionKey() + "' not found"));
+                        "reason", ro.message()));
                 break;
             }
 
-            // ── 3. Governance chain ───────────────────────────────────────────
-            var gov = governanceService.govern(runKey, stepNo, "", plan.connectionKey(),
-                    plan.objectKeys(), plan.sql(), forceAsync);
-
-            if ("BLOCK".equals(gov.route())) {
+            // Business-object gate (ADR-0003 A14) — the referenced table is outside the
+            // approved surface. Like the agent path, this is a deterministic, physical
+            // observation the planner can re-plan against rather than a hard failure.
+            if (ro.status() == GovernedSqlRuntime.Status.UNAPPROVED_OBJECTS) {
+                String reason = "Query references table(s) not in the approved execution contract: "
+                        + ro.unapprovedTables() + ". Approved tables: [" + ro.approvedTables() + "].";
+                log.info("Step {} gated for run '{}': {}", stepNo, runKey, reason);
                 evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "BLOCKED", gov.decisionReason(), 0L);
-                saveStep(sessionKey, stepNo, plan, "BLOCKED", gov.decisionReason(), evidence, List.of(), null);
-                eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", gov.decisionReason()));
-                break;
+                        List.of(), plan.rationale(), "UNAPPROVED_OBJECTS", reason, 0L);
+                saveStep(sessionKey, stepNo, plan, "UNAPPROVED_OBJECTS", reason,
+                        evidence, List.of(), null);
+                eventBus.publish(runKey, "step_error", Map.of("stepNo", stepNo, "reason", reason));
+                stepNo++;
+                continue;   // the planner sees the approved list and re-plans
             }
 
-            if ("EXECUTE_ASYNC".equals(gov.route())) {
-                executionRepository.updateStatus(gov.executionKey(), "QUEUED", null, null, null);
-                eventBus.publish(runKey, "step_async", Map.of("stepNo", stepNo, "execution_key", gov.executionKey()));
-                break;
+            // Shadow mode: the gate would have rejected this step but is not enforcing.
+            // Recorded for migration measurement only — execution proceeds unchanged.
+            if (!ro.unapprovedTables().isEmpty()) {
+                shadowGateFindings.add("step " + stepNo + ": " + ro.unapprovedTables()
+                        + " not in approved surface (approved: [" + ro.approvedTables() + "])");
             }
 
-            // ── 4. Data contract, RLS, column masking ─────────────────────────
-            List<String> objKeys = parseKeys(plan.objectKeys());
-            ContractResult contract = contractService.evaluate(gov.approvedSql(), objKeys);
-
-            if (contract.isBlocked()) {
-                String reason = contract.violationMessages().isEmpty()
-                        ? "Data contract blocked this query."
-                        : String.join("; ", contract.violationMessages());
+            // Literal hard block — a repeat violation on an authoritative domain.
+            if (ro.status() == GovernedSqlRuntime.Status.LITERAL_BLOCKED) {
                 evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "CONTRACT_BLOCKED", reason, 0L);
-                saveStep(sessionKey, stepNo, plan, "CONTRACT_BLOCKED", reason, evidence, List.of(), null);
-                eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", reason));
-
-                // Record governance audit event
-                AuditContext auditCtx = AuditContext.of(userEmail, userAttrsRepository.getRole(userEmail), runKey, plan.connectionKey())
-                        .addObjectKeys(objKeys).originalSql(gov.approvedSql()).executedSql(gov.approvedSql())
-                        .applyContractResult(contract);
-                auditService.record(auditCtx, true);
+                        List.of(), plan.rationale(), "LITERAL_BLOCKED", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "LITERAL_BLOCKED", ro.message(),
+                        evidence, List.of(), null);
+                eventBus.publish(runKey, "step_blocked",
+                        Map.of("stepNo", stepNo, "reason", ro.message()));
                 break;
             }
 
-            String effectiveSql = contract.effectiveSql(gov.approvedSql());
-            RlsResult  rls      = rlsService.apply(effectiveSql, userEmail, objKeys);
-            MaskResult mask     = maskingService.apply(rls.sql(), userEmail, objKeys);
-
-            // ── 5. Execute ────────────────────────────────────────────────────
-            long startMs = System.currentTimeMillis();
-            AuditContext auditCtx = AuditContext.of(userEmail, userAttrsRepository.getRole(userEmail), runKey, plan.connectionKey())
-                    .addObjectKeys(objKeys).originalSql(gov.approvedSql()).executedSql(mask.sql())
-                    .applyContractResult(contract).applyRlsResult(rls).applyMaskResult(mask);
-            try {
-                executionRepository.updateStatus(gov.executionKey(), "RUNNING", Instant.now(), null, null);
-                List<Map<String, Object>> rows = dynamicSqlService.executeQuery(
-                        plan.connectionKey(), mask.sql(), gov.rowLimit());
-                String rJson = objectMapper.writeValueAsString(rows);
-                executionRepository.updateResult(gov.executionKey(), rJson, "SUCCESS", Instant.now());
-                resultSnapshot = rJson;
-
-                long elapsed = System.currentTimeMillis() - startMs;
-                auditCtx.rowCount(rows.size()).executionMs((int) elapsed);
-                auditService.record(auditCtx, false);
-
-                // ── 6. Evaluate ───────────────────────────────────────────────
-                ReasoningEvaluator.EvaluationResult eval = evaluator.evaluate(question, buildTempEvidence(evidence, stepNo, plan, rows, elapsed));
+            // Literal reject — rejects-never-rewrites: the exact legal list returns
+            // through this same loop as evidence for one bounded re-plan.
+            if (ro.status() == GovernedSqlRuntime.Status.LITERAL_REJECTED) {
+                log.info("Step {} literal-rejected for run '{}': {}", stepNo, runKey, ro.message());
                 evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        rows, plan.rationale(), eval.decision(), eval.rationale(), elapsed);
-                saveStep(sessionKey, stepNo, plan, eval.decision(), eval.rationale(), evidence, rows, rJson);
+                        List.of(), plan.rationale(), "LITERAL_REJECTED", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "LITERAL_REJECTED", ro.message(),
+                        evidence, List.of(), null);
+                eventBus.publish(runKey, "step_error",
+                        Map.of("stepNo", stepNo, "reason", ro.message()));
+                stepNo++;
+                continue;   // planner sees the legal list and retries
+            }
 
-                eventBus.publish(runKey, "step_completed", Map.of(
-                        "stepNo",   stepNo,
-                        "rowCount", rows.size(),
-                        "summary",  evidence.getSteps().get(evidence.stepCount() - 1).rowSummary()));
-                eventBus.publish(runKey, "evaluation", Map.of(
-                        "stepNo",   stepNo,
-                        "decision", eval.decision(),
-                        "rationale",eval.rationale()));
-
-                if (eval.isSufficient() || "DEAD_END".equals(eval.decision())) break;
-
-            } catch (Exception ex) {
-                executionRepository.updateStatus(gov.executionKey(), "FAILED", null, Instant.now(), ex.getMessage());
-                auditService.record(auditCtx, false);
-                log.error("Step {} execution failed: {}", stepNo, ex.getMessage(), ex);
+            // Governance BLOCK (safety / allow-list / joins) — not audited today.
+            if (ro.status() == GovernedSqlRuntime.Status.GOVERNANCE_BLOCKED) {
                 evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "ERROR", ex.getMessage(), 0L);
+                        List.of(), plan.rationale(), "BLOCKED", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "BLOCKED", ro.message(), evidence, List.of(), null);
+                eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", ro.message()));
                 break;
             }
+
+            if (ro.status() == GovernedSqlRuntime.Status.ASYNC) {
+                eventBus.publish(runKey, "step_async",
+                        Map.of("stepNo", stepNo, "execution_key", ro.governance().executionKey()));
+                break;
+            }
+
+            // Contract BLOCK — already audited (blocked=true) by the runtime.
+            if (ro.status() == GovernedSqlRuntime.Status.CONTRACT_BLOCKED) {
+                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        List.of(), plan.rationale(), "CONTRACT_BLOCKED", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "CONTRACT_BLOCKED", ro.message(),
+                        evidence, List.of(), null);
+                eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", ro.message()));
+                break;
+            }
+
+            // Execution failed — already audited by the runtime.
+            if (ro.status() == GovernedSqlRuntime.Status.FAILED) {
+                log.error("Step {} execution failed: {}", stepNo, ro.message(), ro.failure());
+                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        List.of(), plan.rationale(), "ERROR", ro.message(), 0L);
+                break;
+            }
+
+            // ── 4. Executed: evaluate the evidence and decide whether to continue ──
+            List<Map<String, Object>> rows = ro.rows();
+            String rJson   = ro.rowsJson();
+            long   elapsed = ro.executionMs();
+            resultSnapshot = rJson;
+
+            // ── PRO-33: declared bindings confirmed against a persisted
+            // domain on a step that actually executed — trace + learning.
+            if (literalScope != null && plan.literalBindings() != null) {
+                for (ReasoningPlanner.LiteralBinding b : plan.literalBindings()) {
+                    ColumnValueDomain d =
+                            LiteralValidator.lookup(literalScope, b.column());
+                    if (d != null && d.values().contains(b.value())) {
+                        ValidatedBinding vb = new ValidatedBinding(
+                                b.surface(), d.qualifiedColumn(), b.value(), d.authoritative());
+                        if (!validatedBindings.contains(vb)) validatedBindings.add(vb);
+                    }
+                }
+            }
+
+            // ── 6. Evaluate ───────────────────────────────────────────────
+            ReasoningEvaluator.EvaluationResult eval = evaluator.evaluate(question, buildTempEvidence(evidence, stepNo, plan, rows, elapsed));
+            evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                    rows, plan.rationale(), eval.decision(), eval.rationale(), elapsed);
+            saveStep(sessionKey, stepNo, plan, eval.decision(), eval.rationale(), evidence, rows, rJson);
+
+            eventBus.publish(runKey, "step_completed", Map.of(
+                    "stepNo",   stepNo,
+                    "rowCount", rows.size(),
+                    "summary",  evidence.getSteps().get(evidence.stepCount() - 1).rowSummary()));
+            eventBus.publish(runKey, "evaluation", Map.of(
+                    "stepNo",   stepNo,
+                    "decision", eval.decision(),
+                    "rationale",eval.rationale()));
+
+            if (eval.isSufficient() || "DEAD_END".equals(eval.decision())) break;
 
             stepNo++;
         }
@@ -237,7 +279,8 @@ public class ReasoningEngine {
         boolean crossSource = evidence.connectionKeys().size() > 1;
         reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED", null, 0.8, Instant.now());
 
-        return new ReasoningResult(evidence, queryData, resultSnapshot, crossSource);
+        return new ReasoningResult(evidence, queryData, resultSnapshot, crossSource,
+                List.copyOf(validatedBindings), List.copyOf(shadowGateFindings));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -275,13 +318,4 @@ public class ReasoningEngine {
         }
     }
 
-    private List<String> parseKeys(String keys) {
-        if (keys == null || keys.isBlank()) return List.of();
-        List<String> result = new ArrayList<>();
-        for (String k : keys.split(",")) {
-            String t = k.trim();
-            if (!t.isEmpty()) result.add(t);
-        }
-        return result;
-    }
 }

@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.agent.AgentRepository;
 import com.sei.nexus.agent.AgentService;
-import com.sei.nexus.semantic.RelationshipDiscoveryService;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.connection.ConnectionRepository;
@@ -45,7 +44,8 @@ public class OnboardingService {
     private final JdbcTemplate             jdbc;
     private final AgentService                agentService;
     private final AgentRepository             agentRepository;
-    private final RelationshipDiscoveryService relationshipDiscovery;
+    private final MetadataRegistrationService metadataRegistration;
+    private final com.sei.nexus.semantic.EntityCandidateService entityCandidates;
     private final com.sei.nexus.pack.IndustryPackService industryPackService;
 
     public OnboardingService(TenantSettingsRepository settings,
@@ -58,7 +58,8 @@ public class OnboardingService {
                               JdbcTemplate jdbc,
                               AgentService agentService,
                               AgentRepository agentRepository,
-                              RelationshipDiscoveryService relationshipDiscovery,
+                              MetadataRegistrationService metadataRegistration,
+                              com.sei.nexus.semantic.EntityCandidateService entityCandidates,
                               com.sei.nexus.pack.IndustryPackService industryPackService) {
         this.settings              = settings;
         this.connectionRepository  = connectionRepository;
@@ -70,7 +71,8 @@ public class OnboardingService {
         this.jdbc                  = jdbc;
         this.agentService          = agentService;
         this.agentRepository       = agentRepository;
-        this.relationshipDiscovery = relationshipDiscovery;
+        this.metadataRegistration  = metadataRegistration;
+        this.entityCandidates      = entityCandidates;
         this.industryPackService   = industryPackService;
     }
 
@@ -348,6 +350,11 @@ public class OnboardingService {
 
                 String schemaText = buildSchemaText(schemaName, tableName, columns);
 
+                // PRO-22 tier 1/2: offer existing-entity candidates so the AI can
+                // reuse instead of minting a drifted duplicate. Zero prompt cost
+                // when no candidates exist (both blocks render empty).
+                var candidates = entityCandidates.retrieve(domainKey, tableName);
+
                 String systemPrompt = """
                         You are an enterprise data analyst onboarding a new database into an
                         operational intelligence platform. Analyse the table schema and respond
@@ -374,9 +381,10 @@ public class OnboardingService {
                         - suggestedQuestions must be 3 natural-language questions, industry-agnostic.
                         - vocabularySuggestions: 2-4 key business terms from this table.
                         - readinessScore: 0.0-1.0 reflecting how well the schema reveals intent.
-                        """;
+                        """ + entityCandidates.resolutionContract(candidates);
 
-                String userMessage = "Domain: " + domainKey + "\n" + schemaText;
+                String userMessage = "Domain: " + domainKey + "\n" + schemaText
+                        + entityCandidates.renderPromptBlock(candidates);
                 String analysisJson = aiClient.chatWithJson(
                         List.of(ChatMessage.user(userMessage)), systemPrompt);
 
@@ -412,101 +420,34 @@ public class OnboardingService {
     // ── Apply ─────────────────────────────────────────────────────────────────
 
     /**
-     * Bulk-saves the approved entities from the review step:
-     * <ol>
-     *   <li>Creates a data object (+ scans columns) for each approved entity.</li>
-     *   <li>Creates the business entity in the semantic layer.</li>
-     *   <li>Creates approved vocabulary terms.</li>
-     *   <li>Stores suggested questions in tenant settings.</li>
-     * </ol>
+     * Wizard apply = the canonical Metadata Registration Pipeline
+     * ({@link MetadataRegistrationService#register}) followed by the wizard-only
+     * bootstrap tail (suggested questions, default agent). The registration core
+     * is shared with every other onboarding entry point (PRO-21) — only the
+     * bootstrap steps below are first-run-specific.
      */
     @SuppressWarnings("unchecked")
     public Map<String, Object> applySelections(Map<String, Object> request, String userEmail) {
         String connectionKey = (String) request.get("connectionKey");
-        String schemaName    = (String) request.get("schemaName");
         String domainKey     = (String) request.get("domainKey");
         List<Map<String, Object>> entities =
                 (List<Map<String, Object>>) request.getOrDefault("entities", List.of());
 
-        int entitiesCreated = 0;
-        int vocabCreated    = 0;
-        int objectsCreated  = 0;
-        List<String> allQuestions = new ArrayList<>();
+        // 1. Canonical metadata registration — identical for every entry point:
+        //    data objects (+ columns + value domains + version snapshots), linked
+        //    entities, linked vocabulary, then batch relationship discovery.
+        MetadataRegistrationService.RegistrationResult reg =
+                metadataRegistration.register(request, userEmail);
 
+        // ── Bootstrap tail — wizard-only from here on ─────────────────────────
+
+        // 2. Persist the best 3 suggested questions from the approved drafts
+        List<String> allQuestions = new ArrayList<>();
         for (Map<String, Object> entity : entities) {
             if (!Boolean.TRUE.equals(entity.get("approved"))) continue;
-
-            String tableName  = (String) entity.get("tableName");
-            String entityKey  = (String) entity.getOrDefault("entityKey", slugify(tableName));
-            String entityName = (String) entity.getOrDefault("entityName", toTitleCase(tableName));
-            String purpose    = (String) entity.getOrDefault("purpose", "");
-            String opMeaning  = (String) entity.getOrDefault("operationalMeaning", "");
-            String hints      = (String) entity.getOrDefault("investigationHints", "");
-
-            // 1. Create enterprise map data object — capture its key for the entity link
-            String objectKey = null;
-            try {
-                Map<String, Object> objBody = new LinkedHashMap<>();
-                objBody.put("domainKey",     domainKey);
-                objBody.put("connectionKey", connectionKey);
-                objBody.put("schemaName",    schemaName);
-                objBody.put("tableName",     tableName);
-                objBody.put("entityName",    entityName);
-                objBody.put("businessName",  entityName + "s");
-                objBody.put("purpose",       purpose);
-                var dataObj = enterpriseMapService.createOrUpdateObject(objBody, userEmail);
-                objectKey = dataObj.objectKey();
-                objectsCreated++;
-            } catch (Exception e) {
-                log.warn("Failed to create data object for {}: {}", tableName, e.getMessage());
-            }
-
-            // 2. Create semantic business entity — link to the data object via primaryObjectKey
-            try {
-                Map<String, Object> entityBody = new LinkedHashMap<>();
-                entityBody.put("entityKey",          entityKey);
-                entityBody.put("entityName",         entityName);
-                entityBody.put("description",        purpose);
-                entityBody.put("operationalMeaning", opMeaning);
-                entityBody.put("investigationHints", hints);
-                entityBody.put("domainKey",          domainKey);
-                entityBody.put("status",             "ACTIVE");
-                if (objectKey != null) {
-                    entityBody.put("primaryObjectKey", objectKey);
-                }
-                semanticService.createOrUpdateEntity(entityBody, userEmail);
-                entitiesCreated++;
-            } catch (Exception e) {
-                log.warn("Failed to create entity {}: {}", entityKey, e.getMessage());
-            }
-
-            // 3. Create approved vocabulary terms
-            List<Map<String, Object>> vocab =
-                    (List<Map<String, Object>>) entity.getOrDefault("vocabulary", List.of());
-            for (Map<String, Object> term : vocab) {
-                if (!Boolean.TRUE.equals(term.get("approved"))) continue;
-                try {
-                    Map<String, Object> termBody = new LinkedHashMap<>();
-                    termBody.put("termKey",      slugify((String) term.get("term")) + "-" + entityKey);
-                    termBody.put("term",         term.get("term"));
-                    termBody.put("definition",   term.get("definition"));
-                    termBody.put("sqlEquivalent", term.getOrDefault("sqlEquivalent", ""));
-                    termBody.put("domainKey",    domainKey);
-                    termBody.put("entityKey",    entityKey);
-                    termBody.put("status",       "ACTIVE");
-                    semanticService.createTerm(termBody);
-                    vocabCreated++;
-                } catch (Exception e) {
-                    log.warn("Failed to create vocab term: {}", e.getMessage());
-                }
-            }
-
-            // Collect suggested questions
             List<String> qs = (List<String>) entity.getOrDefault("suggestedQuestions", List.of());
             allQuestions.addAll(qs);
         }
-
-        // 4. Persist the best 3 suggested questions
         List<String> topQuestions = allQuestions.stream().distinct().limit(3)
                 .collect(Collectors.toList());
         try {
@@ -515,20 +456,7 @@ public class OnboardingService {
             log.warn("Failed to store suggested questions: {}", e.getMessage());
         }
 
-        // 5. Auto-discover entity relationships from FK constraints and column-name heuristics.
-        //    Runs after all entities are created so the table→entity index is populated.
-        if (connectionKey != null && !connectionKey.isBlank()) {
-            try {
-                String schema = request.containsKey("schemaName")
-                        ? (String) request.get("schemaName") : "public";
-                int rels = relationshipDiscovery.discoverAndPersist(connectionKey, schema, domainKey);
-                log.info("Auto-discovered {} relationships for domain '{}'", rels, domainKey);
-            } catch (Exception e) {
-                log.warn("Relationship auto-discovery failed (non-fatal): {}", e.getMessage());
-            }
-        }
-
-        // 6. Auto-create a default Data Analyst agent if no active agents exist yet.
+        // 3. Auto-create a default Data Analyst agent if no active agents exist yet.
         //    Only runs once per tenant — skipped if the user has already configured agents.
         try {
             if (agentRepository.findActive().isEmpty()) {
@@ -548,10 +476,11 @@ public class OnboardingService {
         }
 
         return Map.of(
-                "entities_created",      entitiesCreated,
-                "vocab_terms_created",   vocabCreated,
-                "data_objects_created",  objectsCreated,
-                "suggested_questions",   topQuestions
+                "entities_created",      reg.entitiesCreated(),
+                "vocab_terms_created",   reg.vocabCreated(),
+                "data_objects_created",  reg.objectsCreated(),
+                "suggested_questions",   topQuestions,
+                "failures",              reg.failures()
         );
     }
 
@@ -694,25 +623,13 @@ public class OnboardingService {
         return (start >= 0 && end > start) ? text.substring(start, end + 1) : "{}";
     }
 
+    // Entity/term identity derivation lives with the canonical registration
+    // pipeline so every entry point produces identical keys.
     private String slugify(String input) {
-        if (input == null) return "entity";
-        return input.toLowerCase()
-                    .replaceAll("[^a-z0-9]+", "-")
-                    .replaceAll("^-+|-+$", "")
-                    .substring(0, Math.min(input.length(), 80));
+        return MetadataRegistrationService.slugify(input);
     }
 
     private String toTitleCase(String input) {
-        if (input == null || input.isBlank()) return "Entity";
-        String[] words = input.replace('_', ' ').replace('-', ' ').split("\\s+");
-        StringBuilder sb = new StringBuilder();
-        for (String w : words) {
-            if (!w.isEmpty()) {
-                sb.append(Character.toUpperCase(w.charAt(0)));
-                if (w.length() > 1) sb.append(w.substring(1).toLowerCase());
-                sb.append(' ');
-            }
-        }
-        return sb.toString().trim();
+        return MetadataRegistrationService.toTitleCase(input);
     }
 }

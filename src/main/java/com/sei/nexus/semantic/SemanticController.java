@@ -21,16 +21,19 @@ public class SemanticController {
     private final EnterpriseMapService         enterpriseMapService;
     private final RelationshipDiscoveryService discoveryService;
     private final LearnedMappingRepository     learnedMappingRepository;
+    private final com.sei.nexus.onboarding.MetadataRegistrationService metadataRegistration;
 
     public SemanticController(SemanticService service, SemanticRepository repository,
                                EnterpriseMapService enterpriseMapService,
                                RelationshipDiscoveryService discoveryService,
-                               LearnedMappingRepository learnedMappingRepository) {
+                               LearnedMappingRepository learnedMappingRepository,
+                               com.sei.nexus.onboarding.MetadataRegistrationService metadataRegistration) {
         this.service                 = service;
         this.repository              = repository;
         this.enterpriseMapService    = enterpriseMapService;
         this.discoveryService        = discoveryService;
         this.learnedMappingRepository = learnedMappingRepository;
+        this.metadataRegistration    = metadataRegistration;
     }
 
     // -------------------------------------------------------------------------
@@ -180,6 +183,34 @@ public class SemanticController {
     public ResponseEntity<Map<String, Object>> discover(@RequestBody Map<String, Object> body) {
         Map<String, Object> result = enterpriseMapService.analyzeForOnboarding(body);
         return ResponseEntity.ok(result);
+    }
+
+    /**
+     * POST /semantic/discover/apply
+     *
+     * <p>Persists the approved drafts from the discovery review step by executing
+     * the canonical Metadata Registration Pipeline (PRO-21) — the same pipeline
+     * the Onboarding Wizard runs: data object + column scan + value domains +
+     * version snapshot, entity linked via primary_object_key, vocabulary linked
+     * via entity_key, then batch relationship discovery. Bootstrap operations
+     * (suggested questions, default agent, completion flag) are wizard-only and
+     * deliberately not executed here.
+     *
+     * <p>Request body mirrors /onboarding/apply:
+     * { "connectionKey": "...", "schemaName": "...", "domainKey": "...",
+     *   "entities": [ { "approved": true, "tableName": "...", ... , "vocabulary": [...] } ] }
+     */
+    @PostMapping("/discover/apply")
+    public ResponseEntity<Map<String, Object>> discoverApply(@RequestBody Map<String, Object> body) {
+        UserAccount user = currentUser();
+        var result = metadataRegistration.register(body, user.email());
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("data_objects_created",      result.objectsCreated());
+        response.put("entities_created",          result.entitiesCreated());
+        response.put("vocab_terms_created",       result.vocabCreated());
+        response.put("relationships_discovered",  result.relationshipsDiscovered());
+        response.put("failures",                  result.failures());
+        return ResponseEntity.ok(response);
     }
 
     /**

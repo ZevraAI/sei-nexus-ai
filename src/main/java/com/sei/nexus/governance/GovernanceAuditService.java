@@ -78,6 +78,41 @@ public class GovernanceAuditService {
         }
     }
 
+    /**
+     * Constructs an {@link AuditContext} from a {@link GovernanceOutcome} (produced by
+     * {@link SqlGovernancePipeline}) plus the caller's runtime facts, then persists it.
+     *
+     * <p>This service is the <b>sole owner</b> of AuditContext construction: callers pass
+     * governance facts and execution results, never a pre-built context. To preserve
+     * existing audit content exactly, {@code original_sql} is the outcome's
+     * {@code approvedSql} (the post-govern, pre-protection SQL) and {@code executed_sql}
+     * is the {@code governedSql}; the latter falls back to {@code approvedSql} when
+     * nothing was executed (blocked verdicts), so an ACCESS_DENIED event still records
+     * what was attempted. The outcome's contract/RLS/masking results are applied only
+     * when present (a blocked outcome carries no RLS/mask results).
+     *
+     * @param rowCount    rows returned; {@code null} when the query did not execute
+     * @param executionMs execution time; {@code null} when the query did not execute
+     * @param blocked     whether this event denotes a governance block
+     */
+    @Async
+    public void recordOutcome(GovernanceOutcome outcome, String userEmail, String runKey,
+                              String connectionKey, List<String> objectKeys,
+                              Integer rowCount, Integer executionMs, boolean blocked) {
+        AuditContext ctx = AuditContext.of(userEmail, outcome.resolvedRole(), runKey, connectionKey)
+                .addObjectKeys(objectKeys)
+                .originalSql(outcome.approvedSql())
+                .executedSql(outcome.governedSql() != null ? outcome.governedSql() : outcome.approvedSql());
+
+        if (outcome.contractOutcome() != null) ctx.applyContractResult(outcome.contractOutcome());
+        if (outcome.rlsOutcome() != null)      ctx.applyRlsResult(outcome.rlsOutcome());
+        if (outcome.maskingOutcome() != null)  ctx.applyMaskResult(outcome.maskingOutcome());
+        if (rowCount != null)    ctx.rowCount(rowCount);
+        if (executionMs != null) ctx.executionMs(executionMs);
+
+        record(ctx, blocked);
+    }
+
     // ── Retention purge ───────────────────────────────────────────────────────
 
     /**

@@ -136,6 +136,17 @@ public class BaselineService {
         return b;
     }
 
+    /**
+     * Manual refresh of a single baseline: re-measure now and, if the new value is anomalous,
+     * deliver alerts through any matching rules — mirroring the scheduled refresh path so a
+     * user-triggered refresh behaves identically to an automatic one.
+     */
+    public AnomalyEvent refreshBaseline(OperationalBaseline baseline) {
+        AnomalyEvent anomaly = anomalyDetector.checkBaseline(baseline);
+        if (anomaly != null) alertService.evaluateAndDeliver(baseline, anomaly);
+        return anomaly;
+    }
+
     /** Returns a formatted anomaly context string for LLM prompts. */
     public String getAnomalyContext(List<String> domainKeys) {
         return anomalyDetector.getAnomalyContext(domainKeys);

@@ -20,11 +20,14 @@ public class ReasoningController {
         this.reasoningRepository = reasoningRepository;
     }
 
-    /** GET /reasoning/sessions?conversationId= */
+    /** GET /reasoning/sessions[?conversationId=] — tenant-wide recent sessions when omitted. */
     @GetMapping("/sessions")
     public ResponseEntity<List<ReasoningSession>> findSessions(
-            @RequestParam String conversationId) {
-        return ResponseEntity.ok(reasoningRepository.findSessionsByConversation(conversationId));
+            @RequestParam(required = false) String conversationId) {
+        return ResponseEntity.ok(
+                (conversationId == null || conversationId.isBlank())
+                        ? reasoningRepository.findRecentSessions(50)
+                        : reasoningRepository.findSessionsByConversation(conversationId));
     }
 
     /** GET /reasoning/sessions/{sessionKey} — session + steps + hypotheses */
@@ -44,12 +47,18 @@ public class ReasoningController {
         return ResponseEntity.ok(result);
     }
 
-    /** GET /reasoning/findings?domainKey=&status= */
+    /** GET /reasoning/findings[?domainKey=&status=] — tenant-wide (all domains/statuses) when domainKey omitted. */
     @GetMapping("/findings")
     public ResponseEntity<List<OperationalFinding>> getFindings(
-            @RequestParam String domainKey,
-            @RequestParam(defaultValue = "ACTIVE") String status) {
-        return ResponseEntity.ok(reasoningRepository.findFindingsByDomain(domainKey, status));
+            @RequestParam(required = false) String domainKey,
+            @RequestParam(required = false) String status) {
+        if (domainKey == null || domainKey.isBlank()) {
+            // Homepage call: recent findings across every domain; null status → all statuses,
+            // the client filters actionable vs observed.
+            return ResponseEntity.ok(reasoningRepository.findRecentFindingsAllDomains(status, 50));
+        }
+        String s = (status == null || status.isBlank()) ? "ACTIVE" : status;
+        return ResponseEntity.ok(reasoningRepository.findFindingsByDomain(domainKey, s));
     }
 
     /** GET /reasoning/findings/{findingKey} */

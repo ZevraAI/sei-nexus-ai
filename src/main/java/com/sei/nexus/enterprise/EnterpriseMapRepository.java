@@ -97,6 +97,42 @@ public class EnterpriseMapRepository {
                 """, dataObjectMapper(), agentKey);
     }
 
+    /**
+     * Returns the approved (non-ARCHIVED) data objects whose connection_key is in the
+     * supplied list — the authoritative business-object surface for a ZevraAgent's
+     * connections (ADR-0003 A9). Unlike findDataObjectsByAgentConnections(agentKey),
+     * which resolves nexus_agent, this takes the connection keys directly, so it fits the
+     * ZevraAgent model (nexus_zevra_agent.connection_keys). Consumed only by AgentBrain.
+     */
+    /**
+     * Returns all non-archived data objects belonging to any of the given business domains.
+     * The batch form of {@link #findDataObjectsByDomain(String)} — one query instead of one
+     * per domain. An object carries a single {@code domain_key}, so the union cannot duplicate.
+     */
+    public List<DataObject> findDataObjectsByDomainKeys(List<String> domainKeys) {
+        if (domainKeys == null || domainKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < domainKeys.size(); i++) {
+            placeholders.append(i == 0 ? "?" : ", ?");
+        }
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
+                        + "AND domain_key IN (" + placeholders + ") ORDER BY entity_name",
+                dataObjectMapper(), domainKeys.toArray());
+    }
+
+    public List<DataObject> findDataObjectsByConnectionKeys(List<String> connectionKeys) {
+        if (connectionKeys == null || connectionKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < connectionKeys.size(); i++) {
+            placeholders.append(i == 0 ? "?" : ", ?");
+        }
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
+                        + "AND connection_key IN (" + placeholders + ") ORDER BY entity_name",
+                dataObjectMapper(), connectionKeys.toArray());
+    }
+
     public void archiveDataObject(String objectKey) {
         jdbc.update("""
                 UPDATE nexus_data_object
@@ -144,8 +180,8 @@ public class EnterpriseMapRepository {
                     (column_key, object_key, column_name, data_type, is_nullable,
                      business_meaning, is_identifier, is_status, is_error,
                      is_sensitive, is_filterable, udt_name, value_domain_key,
-                     created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     role_source, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (object_key, column_name) DO UPDATE SET
                     data_type        = EXCLUDED.data_type,
                     is_nullable      = EXCLUDED.is_nullable,
@@ -162,6 +198,7 @@ public class EnterpriseMapRepository {
                     is_filterable    = EXCLUDED.is_filterable,
                     udt_name         = EXCLUDED.udt_name,
                     value_domain_key = EXCLUDED.value_domain_key,
+                    role_source      = EXCLUDED.role_source,
                     updated_at       = NOW()
                 """,
                 col.columnKey(), col.objectKey(), col.columnName(), col.dataType(),
@@ -169,10 +206,13 @@ public class EnterpriseMapRepository {
                 col.isIdentifier(), col.isStatus(), col.isError(),
                 col.isSensitive(), col.isFilterable(),
                 col.udtName(), col.valueDomainKey(),
+                col.roleSource() != null ? col.roleSource() : DataColumn.ROLE_INFERRED,
                 Timestamp.from(col.createdAt() != null ? col.createdAt() : Instant.now()),
                 Timestamp.from(col.updatedAt() != null ? col.updatedAt() : Instant.now()));
     }
 
+    /** Human role assertion (PRO-29): the edit is CONFIRMED — authoritative over
+     *  every producer; scans never recompute these flags away. */
     public void updateColumn(String objectKey, String columnName, String businessMeaning,
                              boolean isIdentifier, boolean isStatus, boolean isError,
                              boolean isSensitive, boolean isFilterable) {
@@ -184,6 +224,7 @@ public class EnterpriseMapRepository {
                        is_error         = ?,
                        is_sensitive     = ?,
                        is_filterable    = ?,
+                       role_source      = 'CONFIRMED',
                        updated_at       = NOW()
                  WHERE object_key = ? AND column_name = ?
                 """, businessMeaning, isIdentifier, isStatus, isError,
@@ -209,6 +250,19 @@ public class EnterpriseMapRepository {
      * (connection, source schema, domain name, source). Returns the persisted
      * domain_value_key — the existing one when the domain was already known,
      * so re-scans never create duplicates.
+     *
+     * <p><b>Additive retention (OBSERVED domains).</b> Observed value domains are sampled via
+     * {@code SELECT DISTINCT … LIMIT}, so a value present in an earlier scan can be absent from a
+     * later one (rows deleted, temporary absence, sampling variance). Overwriting would silently
+     * lose it and orphan any Business Value mapping keyed on that physical value. On conflict the
+     * stored set therefore becomes the <b>union</b> of previously-observed and newly-observed
+     * values (deduplicated, sorted) — previously observed values are never lost, so downstream
+     * mappings stay stable over time. The union is computed atomically in the {@code ON CONFLICT}
+     * update, so concurrent re-scans of a shared domain cannot lose an update.
+     *
+     * <p><b>AUTHORITATIVE (enum) domains replace.</b> Enum domains come from a complete catalog
+     * read (not a sample), so the freshly-read set is the source of truth and is written verbatim,
+     * preserving enum order.
      */
     public String upsertValueDomain(ValueDomain d) {
         return jdbc.queryForObject("""
@@ -217,7 +271,13 @@ public class EnterpriseMapRepository {
                      source, is_authoritative, domain_values, scanned_at, created_at, updated_at)
                 VALUES (?,?,?,?,?,?,?::jsonb,NOW(),NOW(),NOW())
                 ON CONFLICT (connection_key, source_schema, domain_name, source) DO UPDATE SET
-                    domain_values    = EXCLUDED.domain_values,
+                    domain_values = CASE
+                        WHEN EXCLUDED.source = 'OBSERVED' THEN (
+                            SELECT COALESCE(jsonb_agg(DISTINCT elem ORDER BY elem), '[]'::jsonb)
+                            FROM jsonb_array_elements_text(
+                                nexus_value_domain.domain_values || EXCLUDED.domain_values) AS elem)
+                        ELSE EXCLUDED.domain_values
+                    END,
                     is_authoritative = EXCLUDED.is_authoritative,
                     scanned_at       = NOW(),
                     updated_at       = NOW()
@@ -339,6 +399,7 @@ public class EnterpriseMapRepository {
                 rs.getBoolean("is_filterable"),
                 rs.getString("udt_name"),
                 rs.getString("value_domain_key"),
+                rs.getString("role_source"),
                 toInstant(rs, "created_at"),
                 toInstant(rs, "updated_at"));
     }

@@ -46,6 +46,37 @@ public class SemanticRepository {
              ORDER BY entity_name
             """;
 
+    // PRO-22 tier 0 — the deterministic binding lookup. When duplicates share a
+    // binding (pre-existing data), the OLDEST row wins: it is the original,
+    // curated concept; later rows are the drift duplicates.
+    private static final String FIND_ACTIVE_BY_PRIMARY_OBJECT = """
+            SELECT entity_key, domain_key, entity_name, description, primary_object_key,
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+              FROM nexus_business_entity
+             WHERE primary_object_key = ? AND status = 'ACTIVE'
+             ORDER BY created_at ASC
+             LIMIT 1
+            """;
+
+    // PRO-22 tier 1 — bounded candidate retrieval. Matching is SQL-side against
+    // normalized tokens (never load-all-then-filter): entity name equality,
+    // separator-free entity-key equality, or ACTIVE vocabulary term equality.
+    private static final String FIND_CANDIDATE_ENTITIES = """
+            SELECT DISTINCT be.entity_key, be.entity_name, be.description,
+                   be.primary_object_key, o.table_name AS bound_table
+              FROM nexus_business_entity be
+              LEFT JOIN nexus_operational_vocabulary v
+                     ON v.entity_key = be.entity_key AND v.status = 'ACTIVE'
+              LEFT JOIN nexus_data_object o
+                     ON o.object_key = be.primary_object_key
+             WHERE be.domain_key = ? AND be.status = 'ACTIVE'
+               AND (lower(be.entity_name)            = ANY(?::text[])
+                    OR replace(be.entity_key, '-', '') = ANY(?::text[])
+                    OR lower(v.term)                  = ANY(?::text[]))
+             ORDER BY be.entity_name
+             LIMIT ?
+            """;
+
     private static final String ARCHIVE_ENTITY = """
             UPDATE nexus_business_entity SET status = 'ARCHIVED', updated_at = NOW()
              WHERE entity_key = ?
@@ -175,6 +206,37 @@ public class SemanticRepository {
 
     public List<BusinessEntity> findEntitiesByDomain(String domainKey) {
         return jdbc.query(FIND_ENTITIES_BY_DOMAIN, entityMapper(), domainKey);
+    }
+
+    /** PRO-22 tier 0: the ACTIVE entity already bound to this data object, oldest first. */
+    public Optional<BusinessEntity> findActiveByPrimaryObjectKey(String objectKey) {
+        List<BusinessEntity> rows = jdbc.query(FIND_ACTIVE_BY_PRIMARY_OBJECT, entityMapper(), objectKey);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    /** A tier-1 selection candidate: identity + name + physical grounding, nothing more. */
+    public record EntityCandidate(String entityKey, String entityName, String description,
+                                  String primaryObjectKey, String boundTable) {}
+
+    /** PRO-22 tier 1: bounded, SQL-side candidate retrieval by normalized match tokens. */
+    public List<EntityCandidate> findCandidateEntities(String domainKey, List<String> tokens, int limit) {
+        if (tokens == null || tokens.isEmpty()) return List.of();
+        String[] tokenArray = tokens.toArray(new String[0]);
+        return jdbc.query(FIND_CANDIDATE_ENTITIES,
+                ps -> {
+                    java.sql.Array arr = ps.getConnection().createArrayOf("text", tokenArray);
+                    ps.setString(1, domainKey);
+                    ps.setArray(2, arr);
+                    ps.setArray(3, arr);
+                    ps.setArray(4, arr);
+                    ps.setInt(5, limit);
+                },
+                (rs, rowNum) -> new EntityCandidate(
+                        rs.getString("entity_key"),
+                        rs.getString("entity_name"),
+                        rs.getString("description"),
+                        rs.getString("primary_object_key"),
+                        rs.getString("bound_table")));
     }
 
     public void archiveEntity(String entityKey) {

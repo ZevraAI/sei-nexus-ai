@@ -23,6 +23,16 @@ public record DataColumn(
         String udtName,
         // Reference to nexus_value_domain when a discovered domain matches udtName.
         String valueDomainKey,
+        // Provenance of the role flags above (PRO-29 Semantic Role ownership):
+        // INFERRED (name hints, recomputable) | DECLARED (onboarding/API
+        // declaration, survives rescans) | CONFIRMED (human, authoritative —
+        // never recomputed away).
+        String roleSource,
         Instant createdAt,
         Instant updatedAt
-) {}
+) {
+
+    public static final String ROLE_INFERRED  = "INFERRED";
+    public static final String ROLE_DECLARED  = "DECLARED";
+    public static final String ROLE_CONFIRMED = "CONFIRMED";
+}

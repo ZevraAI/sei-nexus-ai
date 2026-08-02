@@ -1,0 +1,52 @@
+package com.sei.nexus.agentbrain;
+
+import com.sei.nexus.semantic.ResolvedQuestion;
+import com.sei.nexus.semanticmodel.ColumnValueDomain;
+import com.sei.nexus.semanticmodel.BusinessObject;
+import com.sei.nexus.semanticmodel.PhysicalColumn;
+import com.sei.nexus.semanticmodel.PhysicalTable;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * AgentBrain's business-reasoning output (ADR-0003 semantic model, Phase 1B): the resolved
+ * semantic scope (canonical {@link BusinessObject}s, ranked by relevance) plus the execution-plane
+ * raw material for those objects/attributes, carried through from the assembler so
+ * {@link ExecutionContractBuilder} can compile the bindings. AgentBrain reasons over the semantic
+ * objects; the physical targets are pass-through (AgentBrain does not interpret them).
+ *
+ * <p><b>Unified Answer Engine, Phase 2.</b> The model additionally carries the Semantic
+ * Foundation signals AgentBrain resolved for this question — the {@link ResolvedQuestion}
+ * (business-language resolutions, expansion tokens, literal candidates) and the derived literal
+ * validation scope. Both are empty for a scope with no business domains, which reproduces the
+ * pre-Phase-2 behaviour byte for byte.
+ */
+public record ResolvedBusinessModel(
+        String                      agentId,
+        List<String>                connectionKeys,
+        String                      question,
+        List<BusinessObject>        objects,
+        Map<String, PhysicalTable>  objectTargets,
+        Map<String, PhysicalColumn> attributeTargets,
+        ResolvedQuestion            resolution,
+        Map<String, ColumnValueDomain> literalScope
+) {
+    public ResolvedBusinessModel {
+        connectionKeys   = List.copyOf(connectionKeys);
+        objects          = List.copyOf(objects);
+        objectTargets    = Map.copyOf(objectTargets);
+        attributeTargets = Map.copyOf(attributeTargets);
+        if (resolution == null)   resolution   = ResolvedQuestion.empty(question);
+        literalScope = literalScope == null ? Map.of() : Map.copyOf(literalScope);
+    }
+
+    /** A model with no Semantic Foundation enrichment (a scope with no business domains). */
+    public ResolvedBusinessModel(String agentId, List<String> connectionKeys, String question,
+                                 List<BusinessObject> objects,
+                                 Map<String, PhysicalTable> objectTargets,
+                                 Map<String, PhysicalColumn> attributeTargets) {
+        this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
+                ResolvedQuestion.empty(question), Map.of());
+    }
+}
