@@ -44,7 +44,21 @@ public class ReasoningPlanner {
             - Use the exact connection_key shown for each table.
             - Do NOT repeat a query that has already been executed (check "Evidence so far").
             - If the evidence already answers the question, return: {"done": true}
-            - Write focused SQL — a targeted SELECT, not SELECT *.
+            - Write focused SQL — a targeted SELECT, not SELECT *. Select the columns whose
+              business meaning is relevant to the user's question, using each column's role
+              and business name from the approved schema — not every available column, and
+              never the * wildcard. "Focused" means well-chosen, not minimal: when the user
+              asks only for an identifier or code by name (e.g. "give me the order numbers"),
+              that column alone is enough. When the user asks to see, show, or list the
+              records themselves (e.g. "show me the orders"), a single identifier column is
+              NOT enough — include enough of the object's other columns (its dimensions,
+              measures, and attributes, not just its identifiers) for each row to be a
+              useful, self-explanatory record on its own. If the user names a specific
+              attribute (e.g. "...and expected delivery date"), include that column in
+              addition to the identifying and descriptive columns you already chose.
+              If the user explicitly asks for all fields or the full
+              record, list every approved column of the relevant table by name; never use
+              SELECT *.
             - Joins, aggregations, GROUP BY, ORDER BY, LIMIT are all allowed.
             - Extract filter values from the attached file content when present.
             - RESOLUTIONS map the user's terms to this tenant's canonical names and values.
@@ -54,6 +68,19 @@ public class ReasoningPlanner {
             - When a filter literal resolves a user term to a stored value (e.g. the user
               said "TX" and you filter on 'Texas' from a legal-values list), declare it in
               "literal_bindings". Omit the field when there is nothing to declare.
+            - Matching strategy for a text filter depends on the nature of the column being
+              filtered, never on how the question is phrased — a browse-sounding question and
+              a lookup-sounding question must be handled identically for the same column.
+            - For a free-text column (a human-authored name, title, or description) with no
+              legal-values list and no RESOLUTIONS entry for the term, do not assume the
+              user's phrase is the exact stored value. Prefer a comparison that tolerates
+              differences in punctuation, spacing, capitalization, or word form (e.g. a
+              possessive apostrophe, a hyphen, a plural) rather than requiring the phrase to
+              match the stored value exactly.
+            - For an identifier or code the user is clearly quoting verbatim — an invoice
+              number, PO number, SKU, promotion code, store or warehouse code, including
+              numeric values — match it exactly. Do not apply tolerant matching to numbers
+              or codes.
 
             Return JSON only (no markdown, no explanation):
             {"done":false,"description":"one-line goal","sql":"SELECT ...","connection_key":"...","object_keys":"key1,key2","rationale":"why this step advances the investigation","literal_bindings":[{"surface":"TX","column":"stores.state_province","value":"Texas"}]}

@@ -74,6 +74,28 @@ class BusinessLanguageResolverTest {
         assertEquals("show me all TX stores", r.original());
     }
 
+    // ── VALUE via curated multi-value predicate (the "open orders" case) ─────
+
+    @Test
+    void curatedPredicateSupportsMultiValueInListForTwoWordTerm() {
+        List<IndexEntry> idx = index(List.of(), List.of(
+                new IndexedVocab("open orders",
+                        "purchase_orders.status IN ('draft', 'submitted', 'acknowledged', 'partially_received')",
+                        null, "company")), List.of());
+
+        ResolvedQuestion r = BusinessLanguageResolver.resolveAgainstIndex(
+                "show me all open orders for turtleneck products", idx, CAP);
+
+        assertEquals(1, r.resolutions().size());
+        Resolution res = r.resolutions().get(0);
+        assertEquals("open orders", res.surface());
+        assertEquals(Kind.VALUE, res.kind());
+        assertEquals(
+                "purchase_orders.status IN ('draft', 'submitted', 'acknowledged', 'partially_received')",
+                res.target());
+        assertEquals("company", res.tier());
+    }
+
     // ── ENTITY via vocabulary term bound through entity_key (the SLIN case) ──
 
     @Test

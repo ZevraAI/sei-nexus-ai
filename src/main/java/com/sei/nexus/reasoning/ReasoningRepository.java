@@ -58,12 +58,14 @@ public class ReasoningRepository {
     private static final String INSERT_STEP =
             "INSERT INTO nexus_reasoning_step " +
             "(step_key, session_key, step_no, step_type, instruction, evidence_used, " +
-            " outcome, confidence_delta, execution_key, executed_at) " +
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            " outcome, confidence_delta, execution_key, executed_at, " +
+            " evaluator_decision, evaluator_rationale) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     private static final String FIND_STEPS_BY_SESSION =
             "SELECT step_key, session_key, step_no, step_type, instruction, evidence_used, " +
-            "outcome, confidence_delta, execution_key, executed_at " +
+            "outcome, confidence_delta, execution_key, executed_at, " +
+            "evaluator_decision, evaluator_rationale " +
             "FROM nexus_reasoning_step WHERE session_key = ? ORDER BY step_no ASC";
 
     // ── Hypothesis SQL ───────────────────────────────────────────────────────
@@ -162,7 +164,8 @@ public class ReasoningRepository {
         jdbc.update(INSERT_STEP,
                 step.stepKey(), step.sessionKey(), step.stepNo(), step.stepType(),
                 step.instruction(), step.evidenceUsed(), step.outcome(),
-                step.confidenceDelta(), step.executionKey(), toTimestamp(step.executedAt()));
+                step.confidenceDelta(), step.executionKey(), toTimestamp(step.executedAt()),
+                step.evaluatorDecision(), step.evaluatorRationale());
     }
 
     public List<ReasoningStep> findStepsBySession(String sessionKey) {
@@ -265,7 +268,9 @@ public class ReasoningRepository {
                     rs.getString("outcome"),
                     cd,
                     rs.getString("execution_key"),
-                    toInstant(rs, "executed_at"));
+                    toInstant(rs, "executed_at"),
+                    rs.getString("evaluator_decision"),
+                    rs.getString("evaluator_rationale"));
         };
     }
 

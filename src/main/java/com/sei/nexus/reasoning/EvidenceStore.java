@@ -87,12 +87,22 @@ public final class EvidenceStore {
 
     // ── Statistical row summariser ────────────────────────────────────────────
 
+    /**
+     * Small-result ceiling for explicit value rendering (below). Reuses the same magnitude
+     * already established by the distribution branch's own cardinality cap — not a new
+     * threshold invented for this case.
+     */
+    private static final int SMALL_RESULT_ROW_LIMIT = 10;
+
     private String buildRowSummary(List<Map<String, Object>> rows) {
         if (rows.isEmpty()) return "Query returned 0 rows.";
         StringBuilder sb = new StringBuilder();
         sb.append(rows.size()).append(" row(s). Columns: ");
         Set<String> cols = rows.get(0).keySet();
         sb.append(String.join(", ", cols)).append(".\n");
+
+        boolean smallResult = rows.size() <= SMALL_RESULT_ROW_LIMIT;
+        StringBuilder valuesBlock = new StringBuilder();
 
         for (String col : cols) {
             List<String> vals = rows.stream()
@@ -115,7 +125,21 @@ public final class EvidenceStore {
                   .append(", avg=").append(fmt(avg)).append('\n');
             } else if (lowCardinality && !looksNumeric) {
                 sb.append("  ").append(col).append(" distribution: ").append(dist).append('\n');
+            } else if (smallResult && !vals.isEmpty()) {
+                // Neither the aggregate nor the distribution branch captures a column whose
+                // value a later step may need to reuse verbatim — a single resolved id, a
+                // single resolved name, or a handful of distinct rows' values (including a
+                // numeric id, which the aggregate branch deliberately excludes). This only
+                // fires when the whole result is small (<= SMALL_RESULT_ROW_LIMIT rows), so
+                // a large result set is never enumerated here — it stays exactly as
+                // summarized as it was before this branch existed.
+                String joined = vals.stream().map(v -> truncate(v, 80)).collect(Collectors.joining(", "));
+                valuesBlock.append("  ").append(col).append(" = ").append(joined).append('\n');
             }
+        }
+
+        if (!valuesBlock.isEmpty()) {
+            sb.append("Values:\n").append(valuesBlock);
         }
         return sb.toString().trim();
     }

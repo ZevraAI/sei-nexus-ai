@@ -47,6 +47,15 @@ public class ExecutionReferenceRepository {
              LIMIT 1
             """;
 
+    private static final String FIND_BY_EXECUTION_ID = """
+            SELECT execution_id, parent_execution_id, conversation_id, run_key, connection_key,
+                   started_at, completed_at, execution_ms, governance_outcome, row_count,
+                   result_columns, result_json, sql_reference, contract_id, semantic_hash,
+                   retrieval_targets, object_bindings, attribute_bindings, approved_assets
+              FROM nexus_execution_reference
+             WHERE execution_id = ?
+            """;
+
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
 
@@ -68,6 +77,18 @@ public class ExecutionReferenceRepository {
     public Optional<ExecutionReference> findLatestByConversation(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return Optional.empty();
         List<ExecutionReference> found = jdbc.query(FIND_LATEST_BY_CONVERSATION, ROW_MAPPER, conversationId);
+        return found.isEmpty() ? Optional.empty() : Optional.of(found.get(0));
+    }
+
+    /**
+     * Exact lookup by execution id — no semantic interpretation, no "previous result"
+     * inference. Additive: does not change {@link #save} or {@link #findLatestByConversation}.
+     * Tenant isolation follows the same ambient {@code TenantAwareDataSource} routing as every
+     * other query in this repository — no explicit schema parameter is needed or added.
+     */
+    public Optional<ExecutionReference> findByExecutionId(String executionId) {
+        if (executionId == null || executionId.isBlank()) return Optional.empty();
+        List<ExecutionReference> found = jdbc.query(FIND_BY_EXECUTION_ID, ROW_MAPPER, executionId);
         return found.isEmpty() ? Optional.empty() : Optional.of(found.get(0));
     }
 

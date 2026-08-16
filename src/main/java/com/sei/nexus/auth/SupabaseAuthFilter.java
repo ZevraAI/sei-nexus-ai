@@ -82,6 +82,18 @@ public class SupabaseAuthFilter extends OncePerRequestFilter {
         this.jwtSecretBytes = decoded;
     }
 
+    /**
+     * Re-authenticate on Tomcat's async re-dispatch too (e.g. the SSE progress-streaming
+     * endpoint, {@code ReasoningStreamController}) — see {@code NexusAuthFilter}'s identical
+     * override for the full explanation. Without this, the primary (Supabase JWT) auth path
+     * is skipped on that dispatch and Spring Security denies it once no session-backed
+     * context is available to fall back on ({@code SessionCreationPolicy.STATELESS}).
+     */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest  request,
                                     HttpServletResponse response,

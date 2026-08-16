@@ -57,6 +57,16 @@ public class ImpersonationFilter extends OncePerRequestFilter {
         return request.getServletPath().startsWith("/admin/");
     }
 
+    /**
+     * Re-authenticate/re-derive TenantContext on Tomcat's async re-dispatch too (e.g. the SSE
+     * progress-streaming endpoint, {@code ReasoningStreamController}) — see
+     * {@code NexusAuthFilter}'s identical override for the full explanation.
+     */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest  request,
                                     HttpServletResponse response,

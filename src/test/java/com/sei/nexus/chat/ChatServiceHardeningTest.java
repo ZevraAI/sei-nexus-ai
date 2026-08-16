@@ -1,5 +1,6 @@
 package com.sei.nexus.chat;
 
+import com.sei.nexus.reasoning.EvidenceStore;
 import com.sei.nexus.runtime.ExecutionReference;
 import org.junit.jupiter.api.Test;
 
@@ -85,6 +86,114 @@ class ChatServiceHardeningTest {
         assertTrue(attach.contains("uploaded"), "the attachment variant references the uploaded file");
         assertNotEquals(ChatService.zeroRowSystemPrompt(false), ChatService.zeroRowSystemPrompt(true),
                 "the two empty-result cases must use different guidance");
+    }
+
+    // ── Failed execution vs. zero rows vs. blocked (the "order_date" defect) ────
+    //
+    // ChatService.composeAnswer() used to pick its system prompt from `anyRows` alone, so a
+    // genuine execution failure (zero rows, because the query never ran) was indistinguishable
+    // from a query that ran cleanly and simply matched nothing — producing "The query executed
+    // successfully and returned no matching records" for an actual SQL error. resultSystemPrompt
+    // now takes the failure/blocked signal as an explicit input alongside anyRows.
+
+    @Test
+    void successfulQueryWithRowsUsesTheDataAnswerPrompt() {
+        String p = ChatService.resultSystemPrompt(true, false, false, false);
+        assertTrue(p.contains("VERDICT"), "rows present ⇒ the normal executive-summary prompt");
+    }
+
+    @Test
+    void successfulQueryWithZeroRowsUsesTheZeroRowPrompt() {
+        String p = ChatService.resultSystemPrompt(false, false, false, false);
+        assertEquals(ChatService.zeroRowSystemPrompt(false), p);
+        assertTrue(p.toLowerCase().contains("executed successfully"),
+                "a genuinely clean, empty result may still say the query executed successfully");
+    }
+
+    @Test
+    void failedExecutionNeverClaimsSuccessOrNoRecords() {
+        // Both phrases legitimately appear once each, inside "Do NOT say ..." instructions —
+        // that's the point of the prompt. Assert the prohibitions are explicit, not their
+        // absence as a substring (which would false-positive on the prohibition text itself).
+        String p = ChatService.resultSystemPrompt(false, true, false, false).toLowerCase();
+        assertTrue(p.contains("do not say the query executed successfully"));
+        assertTrue(p.contains("do not say no"));
+        assertTrue(p.contains("could not be executed") || p.contains("failed"));
+    }
+
+    @Test
+    void blockedQueryIsDistinctFromFailureAndZeroRows() {
+        String p = ChatService.resultSystemPrompt(false, false, true, false).toLowerCase();
+        assertTrue(p.contains("do not say the query executed successfully"));
+        assertTrue(p.contains("do not say no"));
+        assertTrue(p.contains("governance") || p.contains("policy"));
+        assertNotEquals(ChatService.resultSystemPrompt(false, true, false, false),
+                ChatService.resultSystemPrompt(false, false, true, false),
+                "blocked and failed must be told apart, not collapsed into one message");
+    }
+
+    @Test
+    void rowsTakePrecedenceOverAnErrorOrBlockElsewhereInTheInvestigation() {
+        // An earlier step's real data still answers the question even if a later step in the
+        // same multi-step investigation failed or was blocked.
+        assertEquals(ChatService.resultSystemPrompt(true, false, false, false),
+                ChatService.resultSystemPrompt(true, true, false, false));
+        assertEquals(ChatService.resultSystemPrompt(true, false, false, false),
+                ChatService.resultSystemPrompt(true, false, true, false));
+    }
+
+    @Test
+    void fallbackMessagesMatchTheSamePrecedenceAndNeverClaimSuccessOnFailure() {
+        assertTrue(ChatService.resultFallbackMessage(true, false, false).contains("table below"));
+        assertFalse(ChatService.resultFallbackMessage(false, true, false).toLowerCase().contains("completed"));
+        assertTrue(ChatService.resultFallbackMessage(false, true, false).contains("could not be executed"));
+        assertTrue(ChatService.resultFallbackMessage(false, false, true).toLowerCase().contains("blocked"));
+        assertEquals("Investigation completed. No data returned.",
+                ChatService.resultFallbackMessage(false, false, false));
+    }
+
+    // ── evidenceToExecResults: rows / error / blocked map shapes ────────────────
+
+    @Test
+    void evidenceToExecResultsEmitsErrorForAFailedStep() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.add(1, "step", "SELECT po.order_date FROM retail_core.purchase_orders po",
+                "conn-1", List.of(), null, "ERROR",
+                "ERROR: column po.order_date does not exist", 5L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("error"));
+        assertFalse(results.get(0).containsKey("rows"));
+        assertFalse(results.get(0).containsKey("blocked"));
+    }
+
+    @Test
+    void evidenceToExecResultsEmitsBlockedForAGovernanceBlockedStep() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.add(1, "step", "SELECT * FROM retail_core.purchase_orders",
+                "conn-1", List.of(), null, "BLOCKED",
+                "SELECT * is not allowed; specify column names explicitly", 5L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("blocked"));
+        assertFalse(results.get(0).containsKey("error"));
+        assertFalse(results.get(0).containsKey("rows"));
+    }
+
+    @Test
+    void evidenceToExecResultsEmitsRowsForASuccessfulStep() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.add(1, "step", "SELECT po_number FROM retail_core.purchase_orders",
+                "conn-1", List.of(Map.of("po_number", "PO123")), null, "SUFFICIENT", "Answered", 5L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("rows"));
     }
 
     // ── Internal-error leakage ──────────────────────────────────────────────────

@@ -121,6 +121,11 @@ public class IndustryPackService {
 
         List<String> tables = getDiscoveredTableNames(domainKey);
         PackEntityMapper.EntityMatchResult matchResult = entityMapper.match(pack, tables);
+        // Foundation Fix #1: the matcher already resolved each entity to a physical table
+        // name; resolve that same table name to its nexus_data_object.object_key from the
+        // identical DataObject rows the table-name list was derived from — no new lookup,
+        // no semantic resolution, just retaining an identifier that was already available.
+        Map<String, String> tableNameToObjectKey = loadTableNameToObjectKey(domainKey);
 
         int entitiesCreated  = 0;
         int vocabAdded       = 0;
@@ -131,14 +136,22 @@ public class IndustryPackService {
             String tableName  = entry.getValue();
             try {
                 PackEntity packEntity = findPackEntity(pack, entityName);
-                semanticService.createOrUpdateEntity(Map.of(
-                        "domainKey",        domainKey,
-                        "entityName",       packEntity.name(),
-                        "nodeType",         "ENTITY",
-                        "description",      safe(packEntity.description()),
-                        "operationalMeaning", safe(packEntity.operationalMeaning()),
-                        "status",           "ACTIVE"),
-                        appliedBy);
+                Map<String, Object> entityBody = new HashMap<>();
+                entityBody.put("domainKey",          domainKey);
+                entityBody.put("entityName",         packEntity.name());
+                entityBody.put("nodeType",            "ENTITY");
+                entityBody.put("description",        safe(packEntity.description()));
+                entityBody.put("operationalMeaning", safe(packEntity.operationalMeaning()));
+                entityBody.put("status",              "ACTIVE");
+                String objectKey = tableNameToObjectKey.get(tableName);
+                if (objectKey != null) {
+                    entityBody.put("primaryObjectKey", objectKey);
+                } else {
+                    log.warn("Pack entity '{}' matched table '{}' but no object_key was found for it "
+                            + "(pack '{}') — created without a physical-object binding.",
+                            entityName, tableName, packKey);
+                }
+                semanticService.createOrUpdateEntity(entityBody, appliedBy);
                 entitiesCreated++;
             } catch (Exception e) {
                 log.warn("Failed to create entity '{}' from pack '{}': {}", entityName, packKey, e.getMessage());
@@ -213,6 +226,31 @@ public class IndustryPackService {
         } catch (Exception e) {
             log.warn("Could not load discovered tables: {}", e.getMessage());
             return List.of();
+        }
+    }
+
+    /**
+     * table_name -> object_key, from the exact same nexus_data_object rows
+     * {@link #getDiscoveredTableNames(String)} derives its table-name list from.
+     * Deterministic reuse of an identifier the query already returned — not a new
+     * discovery/resolution mechanism. If two objects share a table_name (not
+     * expected under the current schema), the first one wins.
+     */
+    private Map<String, String> loadTableNameToObjectKey(String domainKey) {
+        try {
+            List<DataObject> objects = domainKey != null && !domainKey.isBlank()
+                    ? enterpriseMapRepository.findDataObjectsByDomain(domainKey)
+                    : enterpriseMapRepository.findDataObjectsByDomain("PLATFORM");
+            Map<String, String> byTableName = new HashMap<>();
+            for (DataObject object : objects) {
+                if (object.tableName() != null) {
+                    byTableName.putIfAbsent(object.tableName(), object.objectKey());
+                }
+            }
+            return byTableName;
+        } catch (Exception e) {
+            log.warn("Could not load object-key bindings: {}", e.getMessage());
+            return Map.of();
         }
     }
 
