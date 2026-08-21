@@ -1,7 +1,9 @@
 package com.sei.nexus.reasoning;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.Keys;
+import com.sei.nexus.runtime.ExecutionReference;
 import com.sei.nexus.runtime.GovernedSqlRuntime;
 import com.sei.nexus.semanticmodel.ColumnValueDomain;
 import org.slf4j.Logger;
@@ -92,6 +94,13 @@ public class ReasoningEngine {
      * @param literalScope Domain-bearing columns in scope for deterministic
      *                     literal validation (PRO-33); null/empty disables the
      *                     gate and reproduces pre-DLR behavior exactly.
+     * @param priorExecution The conversation's last {@link ExecutionReference}, if any — the
+     *                       same record already fetched by the caller for execution-continuity
+     *                       grounding. When present, its result is loaded into this session's
+     *                       EvidenceStore as step 0 and {@link ReasoningEvaluator} judges
+     *                       whether it already answers THIS question before any planning
+     *                       happens. Planner never sees whether evidence was seeded or
+     *                       produced by this loop — it only ever sees an EvidenceStore.
      */
     public ReasoningResult reason(String question, String enrichedQ, String sessionKey,
                                   String schemaCtx, String runKey, String userEmail,
@@ -99,7 +108,8 @@ public class ReasoningEngine {
                                   Map<String, ColumnValueDomain> literalScope,
                                   com.sei.nexus.agentbrain.ExecutionContract contract,
                                   boolean enforceContractGate,
-                                  String conversationId, String parentExecutionId) {
+                                  String conversationId, String parentExecutionId,
+                                  ExecutionReference priorExecution) {
 
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
@@ -110,6 +120,37 @@ public class ReasoningEngine {
         List<ValidatedBinding> validatedBindings = new ArrayList<>();
         // Phase 3 Step 2: what the business-object gate would have rejected, when shadowing.
         List<String>           shadowGateFindings = new ArrayList<>();
+
+        // Reuses the existing ExecutionReference — no new persistence. Seeds this session's
+        // EvidenceStore with the conversation's last execution as step 0, then asks the
+        // evaluator (its existing, only job) whether that's already enough to answer THIS
+        // question. SUFFICIENT/DEAD_END skips the loop entirely; otherwise the loop below runs
+        // exactly as it does for a brand-new investigation, continuing from step 1.
+        if (priorExecution != null) {
+            String seedDescription = "Result carried over from the previous turn in this conversation";
+            evidence.add(0, seedDescription,
+                    priorExecution.sqlReference(), priorExecution.connectionKey(),
+                    parseRows(priorExecution.resultJson()), null, null, null,
+                    priorExecution.executionMs());
+            resultSnapshot = priorExecution.resultJson();
+
+            ReasoningEvaluator.EvaluationResult preEval = evaluator.evaluate(question, evidence);
+            // Observability: persist this decision exactly as loop iterations persist theirs
+            // (saveStep, same table, same columns) — without this, SUFFICIENT and DEAD_END are
+            // indistinguishable after the fact, which is how the Luxury Peptide defect stayed
+            // invisible until traced by hand.
+            ReasoningPlanner.StepPlan seedPlan = new ReasoningPlanner.StepPlan(
+                    seedDescription, priorExecution.sqlReference(), priorExecution.connectionKey(),
+                    null, null);
+            saveStep(sessionKey, 0, seedPlan, preEval.decision(), preEval.rationale(),
+                    evidence, evidence.latestRows(), priorExecution.resultJson());
+
+            if (preEval.isSufficient() || "DEAD_END".equals(preEval.decision())) {
+                stepNo = MAX_STEPS + 1;
+            } else {
+                stepNo = evidence.stepCount() + 1;
+            }
+        }
 
         while (stepNo <= MAX_STEPS) {
             // ── 1. Plan the next step ─────────────────────────────────────────
@@ -268,12 +309,22 @@ public class ReasoningEngine {
             stepNo++;
         }
 
-        // Choose the best rows for frontend visualisation (most rows from any step, capped at 100)
+        // Choose the rows for frontend visualisation. The step that concluded the
+        // investigation (marked SUFFICIENT) is the answer and wins outright — even a
+        // single-row SUFFICIENT step must be shown over an earlier lookup step that
+        // ties or exceeds it in row count (e.g. a Step 1 ID lookup vs. a Step 2 answer,
+        // both returning exactly one row). Only when no step was marked SUFFICIENT
+        // (the loop trailed off without a conclusive step) does this fall back to the
+        // prior heuristic: the most rows returned by any step.
         List<Map<String, Object>> queryData = evidence.getSteps().stream()
-                .filter(s -> !s.rows().isEmpty())
-                .max(Comparator.comparingInt(s -> s.rows().size()))
+                .filter(s -> "SUFFICIENT".equals(s.evaluatorDecision()))
+                .reduce((first, last) -> last)
                 .map(s -> s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows())
-                .orElse(List.of());
+                .orElseGet(() -> evidence.getSteps().stream()
+                        .filter(s -> !s.rows().isEmpty())
+                        .max(Comparator.comparingInt(s -> s.rows().size()))
+                        .map(s -> s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows())
+                        .orElse(List.of()));
 
         // Update session with final stats
         boolean crossSource = evidence.connectionKeys().size() > 1;
@@ -284,6 +335,17 @@ public class ReasoningEngine {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /** Parses an ExecutionReference's resultJson back into rows for evidence seeding. */
+    private List<Map<String, Object>> parseRows(String resultJson) {
+        if (resultJson == null || resultJson.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(resultJson, new TypeReference<List<Map<String, Object>>>() {});
+        } catch (Exception e) {
+            log.warn("Failed to parse prior execution result for evidence seeding: {}", e.getMessage());
+            return List.of();
+        }
+    }
 
     /** Builds a temporary EvidenceStore snapshot for evaluation — avoids mutating the real store. */
     private EvidenceStore buildTempEvidence(EvidenceStore existing, int stepNo,
@@ -311,7 +373,8 @@ public class ReasoningEngine {
                     Keys.uniqueKey("rstep"), sessionKey, stepNo,
                     "DATA_CHECK", plan.description(),
                     evidenceSummary.length() > 2000 ? evidenceSummary.substring(0, 2000) : evidenceSummary,
-                    null, 0.0, null, Instant.now());
+                    null, 0.0, null, Instant.now(),
+                    evaluatorDecision, evaluatorRationale);
             reasoningRepository.saveStep(step);
         } catch (Exception e) {
             log.warn("Failed to persist reasoning step: {}", e.getMessage());

@@ -15,32 +15,46 @@ import java.util.Optional;
 @Repository
 public class SemanticRepository {
 
+    // Foundation Fix #2: primary_object_key uses COALESCE on conflict, not a
+    // bare EXCLUDED overwrite. A partial update (e.g. the Semantic Layer
+    // entity-edit form, which has no primary_object_key field) omits the key
+    // from its request body, so SemanticService.createOrUpdateEntity passes
+    // null through here. Without the COALESCE, that null would silently wipe
+    // out a previously-correct binding on every such save — this is the exact
+    // corruption traced on the "region" entity in a real tenant. There is no
+    // code path anywhere that relies on omitted-primaryObjectKey meaning
+    // "explicitly unbind" (verified by search before this change), so
+    // preserving the existing value on omission is safe.
     private static final String UPSERT_ENTITY = """
             INSERT INTO nexus_business_entity
                 (entity_key, domain_key, entity_name, description, primary_object_key,
-                 operational_meaning, investigation_hints, status, created_by, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                 entity_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (entity_key) DO UPDATE SET
                 domain_key           = EXCLUDED.domain_key,
                 entity_name          = EXCLUDED.entity_name,
                 description          = EXCLUDED.description,
-                primary_object_key   = EXCLUDED.primary_object_key,
+                primary_object_key   = COALESCE(EXCLUDED.primary_object_key, nexus_business_entity.primary_object_key),
                 operational_meaning  = EXCLUDED.operational_meaning,
                 investigation_hints  = EXCLUDED.investigation_hints,
                 status               = EXCLUDED.status,
-                updated_at           = NOW()
+                updated_at           = NOW(),
+                entity_type          = EXCLUDED.entity_type
             """;
 
     private static final String FIND_ENTITY_BY_KEY = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type
               FROM nexus_business_entity
              WHERE entity_key = ?
             """;
 
     private static final String FIND_ENTITIES_BY_DOMAIN = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type
               FROM nexus_business_entity
              WHERE domain_key = ? AND status != 'ARCHIVED'
              ORDER BY entity_name
@@ -51,7 +65,8 @@ public class SemanticRepository {
     // curated concept; later rows are the drift duplicates.
     private static final String FIND_ACTIVE_BY_PRIMARY_OBJECT = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type
               FROM nexus_business_entity
              WHERE primary_object_key = ? AND status = 'ACTIVE'
              ORDER BY created_at ASC
@@ -196,7 +211,8 @@ public class SemanticRepository {
             e.entityKey(), e.domainKey(), e.entityName(), e.description(), e.primaryObjectKey(),
             e.operationalMeaning(), e.investigationHints(), e.status(), e.createdBy(),
             toTimestamp(e.createdAt() != null ? e.createdAt() : Instant.now()),
-            toTimestamp(e.updatedAt() != null ? e.updatedAt() : Instant.now()));
+            toTimestamp(e.updatedAt() != null ? e.updatedAt() : Instant.now()),
+            e.entityType());
     }
 
     public Optional<BusinessEntity> findEntityByKey(String key) {
@@ -407,7 +423,8 @@ public class SemanticRepository {
             rs.getString("status"),
             rs.getString("created_by"),
             toInstant(rs, "created_at"),
-            toInstant(rs, "updated_at"));
+            toInstant(rs, "updated_at"),
+            rs.getString("entity_type"));
     }
 
     private RowMapper<EntityLifecycleState> lifecycleMapper() {

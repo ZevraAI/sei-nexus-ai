@@ -15,6 +15,14 @@ import java.util.Map;
  * After each executed step, asks the LLM whether the accumulated evidence is
  * sufficient to answer the user's question, or whether more data is needed.
  *
+ * <p>Sufficiency has always implicitly required the evidence to be about the question asked —
+ * evidence gathered for a different subject was never truly "sufficient," it just never had
+ * the chance to be evidence for the wrong subject until follow-up questions began seeding this
+ * evaluator with a prior turn's results (see the Luxury Peptide/purchase-order investigation).
+ * The prompt below makes that requirement explicit rather than introducing a second axis of
+ * judgment — this remains a single responsibility: is the evidence in front of me, whatever
+ * its origin, sufficient to answer THIS question.
+ *
  * <p>Returns one of four decisions:
  * <ul>
  *   <li>{@code SUFFICIENT}              — stop; compose the answer now</li>
@@ -32,6 +40,8 @@ public class ReasoningEvaluator {
     private static final String SYSTEM_PROMPT = """
             You are evaluating whether enough data has been gathered to answer a question.
             You will see the original question and a summary of all queries executed so far.
+            Some of that evidence may have been carried over from an earlier question in the
+            same conversation, not gathered for the question you are evaluating now.
 
             Return JSON only:
             {
@@ -40,13 +50,25 @@ public class ReasoningEvaluator {
             }
 
             Decision guide:
-            - SUFFICIENT    : the evidence collected can answer the question fully or substantively.
-            - NEED_MORE_DATA: one more targeted query would materially improve the answer.
-            - DEAD_END      : the queries have run but the data is not available or the question
-                              cannot be answered from the accessible tables.
+            - SUFFICIENT    : the evidence collected is actually about what THIS question asks,
+                              AND it can answer it fully or substantively. Evidence that is
+                              complete and well-summarized for a different question — a different
+                              entity, metric, or business process than this one — is not
+                              sufficient no matter how much of it there is. Judge it against the
+                              question below, not against whatever question it was originally
+                              gathered to answer.
+            - NEED_MORE_DATA: the evidence is on-topic but a further targeted query would
+                              materially improve the answer — OR no evidence gathered so far
+                              actually addresses this question's subject yet, so a first query
+                              toward it is needed.
+            - DEAD_END      : queries have been run TOWARD THIS QUESTION's subject, and the data
+                              needed is confirmed not available or not accessible. Evidence that
+                              is simply about a different subject is not a dead end — that
+                              subject has not been queried yet at all.
 
-            Be decisive. Prefer SUFFICIENT over NEED_MORE_DATA when the evidence is good enough
-            for a meaningful business answer, even if not exhaustive.
+            Be decisive. Prefer SUFFICIENT over NEED_MORE_DATA when evidence that is actually
+            about this question is good enough for a meaningful business answer, even if not
+            exhaustive. Being decisive is never a reason to accept off-topic evidence.
             """;
 
     private final AzureOpenAiClient aiClient;

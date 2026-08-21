@@ -12,8 +12,17 @@ import static org.junit.jupiter.api.Assertions.*;
  * "matched no known term … ask for clarification" as grounds for
  * ASK_CLARIFICATION — returning before the QUERY_LIVE_DATA path, so the SQL
  * planner (the owner of the constrained literal choice) and the literal
- * validator never executed. Rule 7 closes that gap; this test keeps it,
+ * validator never executed. Rule 6 closes that gap; this test keeps it,
  * and the surrounding contract, from silently regressing.
+ *
+ * <p>ANSWER_FROM_PRIOR_RESULTS removal — the router previously judged whether
+ * previously-gathered evidence was sufficient to answer a follow-up, without
+ * ever seeing that evidence (e.g. "i need order details" against a cached
+ * supplier-aggregate produced a schema-description non-answer instead of a
+ * real query). That judgment now belongs entirely to ReasoningEvaluator,
+ * seeded from the conversation's ExecutionReference — see
+ * ReasoningEngine.reason(). This test keeps the decision type from
+ * silently reappearing in the router's vocabulary.
  */
 class DecisionRoutingPromptTest {
 
@@ -29,6 +38,14 @@ class DecisionRoutingPromptTest {
     }
 
     @Test
+    void answerFromPriorResultsIsNotARouterDecisionType() {
+        String p = ChatService.DECISION_SYSTEM_PROMPT;
+        assertFalse(p.contains("ANSWER_FROM_PRIOR_RESULTS"),
+                "evidence sufficiency belongs to ReasoningEvaluator, not the router");
+        assertTrue(p.contains("EVERY follow-up question in an existing conversation"));
+    }
+
+    @Test
     void preExistingRoutingContractIsUnchanged() {
         String p = ChatService.DECISION_SYSTEM_PROMPT;
         // The clarification guard itself stays (PRO-32 §3.4 escalation is preserved)
@@ -37,7 +54,7 @@ class DecisionRoutingPromptTest {
         assertTrue(p.contains("RESOLUTIONS map the user's terms to this tenant's canonical names and values."));
         // PRO-33 static sentence
         assertTrue(p.contains("Literals filtered on columns with listed legal values MUST be copied exactly"));
-        // Decision types unchanged
-        assertTrue(p.contains("ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP|ANSWER_FROM_PRIOR_RESULTS"));
+        // Decision types: ANSWER_FROM_PRIOR_RESULTS removed (see class Javadoc)
+        assertTrue(p.contains("ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP\""));
     }
 }

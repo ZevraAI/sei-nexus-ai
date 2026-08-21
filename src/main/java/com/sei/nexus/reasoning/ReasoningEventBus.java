@@ -76,6 +76,13 @@ public class ReasoningEventBus {
         payload.put("timestamp", Instant.now().toString());
         payload.putAll(data);
 
+        // Verification aid: every phase_* event's real emission time, greppable per run —
+        // lets the exact server-side phase sequence for any investigation be reconstructed
+        // from logs alone, independent of what the browser received or rendered.
+        if (log.isDebugEnabled() && (type.equals("phase_started") || type.equals("phase_completed"))) {
+            log.debug("[progress] run={} {} phase={} t={}", runKey, type, data.get("phase"), payload.get("timestamp"));
+        }
+
         // Buffer for late joiners
         buffer.computeIfAbsent(runKey, k -> Collections.synchronizedList(new ArrayList<>()))
               .add(new BufferedEvent(payload, Instant.now()));
@@ -87,6 +94,16 @@ public class ReasoningEventBus {
             if (!send(emitter, payload)) dead.add(emitter);
         }
         dead.forEach(e -> removeEmitter(runKey, e));
+    }
+
+    /** Runtime Progress Projection: a business-facing phase has actually started on the backend. */
+    public void phaseStarted(String runKey, ProgressPhase phase) {
+        publish(runKey, "phase_started", Map.of("phase", phase.id, "label", phase.label));
+    }
+
+    /** Runtime Progress Projection: a business-facing phase has actually finished on the backend. */
+    public void phaseCompleted(String runKey, ProgressPhase phase) {
+        publish(runKey, "phase_completed", Map.of("phase", phase.id, "label", phase.label));
     }
 
     /** Mark a run's stream as complete — all connected emitters will close. */

@@ -52,6 +52,21 @@ public class NexusAuthFilter extends OncePerRequestFilter {
         this.tenantRepository = tenantRepository;
     }
 
+    /**
+     * Re-authenticate on Tomcat's async re-dispatch too (e.g. the SSE progress-streaming
+     * endpoint, {@code ReasoningStreamController}). {@link OncePerRequestFilter}'s default
+     * ({@code true}) skips this filter on the ASYNC dispatch that resumes/completes a
+     * long-lived request — with {@code SessionCreationPolicy.STATELESS} there is no
+     * session-backed {@code SecurityContextRepository} to restore from on that resumed
+     * thread, so without re-running this filter, Spring Security's {@code AuthorizationFilter}
+     * sees an empty context and denies the dispatch (surfaces as {@code AccessDeniedException}
+     * — "response already committed" — once SSE bytes have already been streamed).
+     */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest  request,
                                     HttpServletResponse response,

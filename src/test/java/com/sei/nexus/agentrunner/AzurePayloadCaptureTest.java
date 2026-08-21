@@ -14,6 +14,7 @@ import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
 import com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler;
 import com.sei.nexus.sql.SqlTableReferenceExtractor;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
@@ -87,6 +88,16 @@ class AzurePayloadCaptureTest {
                     true, "" /* business_meaning empty in prod */, id, status, false, false, filt,
                     null, null, "DECLARED", Instant.now(), Instant.now());
         }
+    }
+
+    // These are JVM-wide system properties, not per-test state — Surefire reuses one
+    // JVM across test classes by default, so leaving them set here previously leaked
+    // into whatever test ran next (observed: AzureOpenAiClientThrottleTest's real HTTP
+    // seam was aborted by a stale abortBeforeSend from this test's prior run).
+    @AfterEach
+    void clearCaptureProperties() {
+        System.clearProperty("nexus.capture.payload.dir");
+        System.clearProperty("nexus.capture.abortBeforeSend");
     }
 
     @Test

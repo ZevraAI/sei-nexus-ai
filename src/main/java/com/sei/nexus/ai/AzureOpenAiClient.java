@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.usage.UsageService;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -17,6 +18,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 
 @Service
 public class AzureOpenAiClient {
@@ -43,12 +45,27 @@ public class AzureOpenAiClient {
     @Value("${nexus.openai.embedding-model:text-embedding-ada-002}")
     private String embeddingModel;
 
+    // Global backpressure valve: this one client instance is shared by EVERY
+    // tenant (chat, onboarding, packs, semantic learning) — with no cap, one
+    // tenant's burst (e.g. onboarding 15 tables at once) can rate-limit-storm
+    // every other tenant's calls too. Caps concurrency, not rate — a token-
+    // bucket limiter would be the follow-up if 429s persist after this.
+    @Value("${nexus.openai.max-concurrent-calls:6}")
+    private int maxConcurrentCalls;
+
+    private Semaphore globalCallLimit;
+
     public AzureOpenAiClient(ObjectMapper objectMapper, UsageService usageService) {
         this.objectMapper  = objectMapper;
         this.usageService  = usageService;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
+    }
+
+    @PostConstruct
+    void initThrottle() {
+        this.globalCallLimit = new Semaphore(Math.max(1, maxConcurrentCalls), true);
     }
 
     /**
@@ -319,6 +336,25 @@ public class AzureOpenAiClient {
         // (the API key is an Authorization header, never in the payload). No-op in normal runs.
         capturePayload(url, jsonBody);
 
+        // Global throttle: acquired before the retry loop begins, released only after it
+        // finally returns or throws — must wrap the whole retry+backoff sequence, not just
+        // the HTTP send, or a 429-storm still lets unlimited threads pile up mid-backoff,
+        // defeating the point of a concurrency cap.
+        try {
+            globalCallLimit.acquire();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "OpenAI call interrupted while waiting for capacity");
+        }
+        try {
+            return executeWithRetryLocked(url, jsonBody);
+        } finally {
+            globalCallLimit.release();
+        }
+    }
+
+    private String executeWithRetryLocked(String url, String jsonBody) {
         long backoffMs = INITIAL_BACKOFF_MS;
         Exception lastException = null;
 
@@ -332,8 +368,7 @@ public class AzureOpenAiClient {
                         .timeout(Duration.ofSeconds(60))
                         .build();
 
-                HttpResponse<String> response = httpClient.send(request,
-                        HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response = sendHttp(request);
 
                 int statusCode = response.statusCode();
 
@@ -380,5 +415,10 @@ public class AzureOpenAiClient {
         String reason = lastException != null ? lastException.getMessage() : "unknown error";
         throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
                 "OpenAI call failed: " + reason);
+    }
+
+    /** Overridable seam for tests — the real implementation just delegates to the JDK client. */
+    protected HttpResponse<String> sendHttp(HttpRequest request) throws Exception {
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
     }
 }

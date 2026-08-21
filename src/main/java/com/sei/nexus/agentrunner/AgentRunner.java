@@ -148,7 +148,7 @@ public class AgentRunner {
             // dropped the earlier result from its context), we return the cached
             // result instead of re-executing — re-injecting it into the recent
             // window, which breaks repeat loops at their cause.
-            Map<String, String> toolResultCache = new LinkedHashMap<>();
+            Map<String, AgentToolRegistry.ToolExecutionResult> toolResultCache = new LinkedHashMap<>();
 
             // 5. ReAct loop — set usage context so every LLM call is attributed
             com.sei.nexus.usage.UsageContext.set("agent", userEmail, agent.name());
@@ -184,18 +184,21 @@ public class AgentRunner {
                 String argsJson   = mapper.writeValueAsString(args);
 
                 String cacheKey = toolName + ":" + argsJson;
-                String cached   = toolResultCache.get(cacheKey);
+                AgentToolRegistry.ToolExecutionResult cached = toolResultCache.get(cacheKey);
 
-                String toolResult;
+                AgentToolRegistry.ToolExecutionResult result;
+                String llmContent;
                 if (cached != null) {
-                    toolResult = "NOTE: You already made this exact call — the result is " +
+                    result = cached;
+                    llmContent = "NOTE: You already made this exact call — the result is " +
                             "repeated below. Do not run it again; use the data you have " +
-                            "to progress toward final_answer.\n" + cached;
+                            "to progress toward final_answer.\n" + withExecutionIdNote(cached);
                 } else {
-                    toolResult = toolRegistry.execute(toolName, args,
+                    result = toolRegistry.executeWithReference(toolName, args,
                             agent.connectionKeys(), userEmail, governanceRunKey, iterations, contract,
                             conversationId, parentExecutionId);
-                    toolResultCache.put(cacheKey, toolResult);
+                    toolResultCache.put(cacheKey, result);
+                    llmContent = withExecutionIdNote(result);
                 }
 
                 long callMs = System.currentTimeMillis() - callStart;
@@ -203,13 +206,17 @@ public class AgentRunner {
                         cached != null
                                 ? Map.of("tool", toolName, "input", args, "cached", true)
                                 : Map.of("tool", toolName, "input", args),
-                        cached != null ? null : toolResult, callMs));
+                        cached != null ? null : result.content(), callMs));
 
-                // Append to conversation: assistant tool_call + tool result
+                // Append to conversation: assistant tool_call + tool result. The persisted step
+                // output above is always result.content() unchanged (so ChatService's
+                // extractAgentQueryRows keeps parsing query_database's rows as a List exactly as
+                // before); the execution_id — when present — is appended only to the message the
+                // LLM itself sees, via withExecutionIdNote, never merged into content's shape.
                 messages.add(AgentMessage.assistantToolCall(
                         response.toolCallId(), toolName, argsJson));
                 messages.add(AgentMessage.toolResult(
-                        response.toolCallId(), toolResult));
+                        response.toolCallId(), llmContent));
             }
 
             // Max iterations reached — force one last best-effort answer from the
@@ -311,6 +318,19 @@ public class AgentRunner {
      * region"). Kept in a single message so {@code pruneHistory} (which always keeps messages[0])
      * never drops the question or its context mid-loop.
      */
+    /**
+     * The LLM-facing decoration of a tool result: {@code content} unchanged, plus a trailing
+     * execution_id note when one is present (query_database EXECUTED only). This is the ONLY
+     * place execution_id reaches the LLM — never merged into content's own shape, so the
+     * persisted step output and any downstream parser of it (ChatService.extractAgentQueryRows)
+     * see exactly the same bare rows JSON as before this phase.
+     */
+    static String withExecutionIdNote(AgentToolRegistry.ToolExecutionResult result) {
+        if (result.executionId() == null) return result.content();
+        return result.content() + "\n\n[execution_id: " + result.executionId()
+                + " — use memory_get_execution_reference to recall this exact result on a later turn]";
+    }
+
     static String composeFirstMessage(String conversationContext, String inputMessage) {
         if (conversationContext == null || conversationContext.isBlank()) return inputMessage;
         return conversationContext + "\n\nCurrent question: " + inputMessage;
