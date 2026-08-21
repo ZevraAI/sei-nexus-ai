@@ -74,7 +74,9 @@ class OnboardingApplyBootstrapTest {
         agentService    = new FakeAgentService();
         service = new OnboardingService(settings, null, null, null, null, null,
                 new ObjectMapper(), null, agentService, agentRepository,
-                registration, null, null);
+                registration, null, null, null,
+                new com.sei.nexus.reasoning.ReasoningEventBus(new ObjectMapper()),
+                Runnable::run);
     }
 
     private static Map<String, Object> applyRequest() {

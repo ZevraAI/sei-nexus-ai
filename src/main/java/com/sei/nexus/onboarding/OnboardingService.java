@@ -6,20 +6,31 @@ import com.sei.nexus.agent.AgentRepository;
 import com.sei.nexus.agent.AgentService;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.common.Keys;
 import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.enterprise.EnterpriseMapService;
+import com.sei.nexus.reasoning.ReasoningEventBus;
 import com.sei.nexus.semantic.SemanticService;
+import com.sei.nexus.tenant.TenantContext;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import com.sei.nexus.sql.DynamicSqlService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +58,12 @@ public class OnboardingService {
     private final MetadataRegistrationService metadataRegistration;
     private final com.sei.nexus.semantic.EntityCandidateService entityCandidates;
     private final com.sei.nexus.pack.IndustryPackService industryPackService;
+    private final OnboardingAnalysisJobRepository jobRepository;
+    private final ReasoningEventBus        eventBus;
+    private final Executor                 onboardingJobExecutor;
+
+    @Value("${nexus.onboarding.table-concurrency:4}")
+    private int tableConcurrencyPerJob;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -60,7 +77,10 @@ public class OnboardingService {
                               AgentRepository agentRepository,
                               MetadataRegistrationService metadataRegistration,
                               com.sei.nexus.semantic.EntityCandidateService entityCandidates,
-                              com.sei.nexus.pack.IndustryPackService industryPackService) {
+                              com.sei.nexus.pack.IndustryPackService industryPackService,
+                              OnboardingAnalysisJobRepository jobRepository,
+                              ReasoningEventBus eventBus,
+                              @Qualifier("onboardingJobExecutor") Executor onboardingJobExecutor) {
         this.settings              = settings;
         this.connectionRepository  = connectionRepository;
         this.dynamicSqlService     = dynamicSqlService;
@@ -74,6 +94,9 @@ public class OnboardingService {
         this.metadataRegistration  = metadataRegistration;
         this.entityCandidates      = entityCandidates;
         this.industryPackService   = industryPackService;
+        this.jobRepository         = jobRepository;
+        this.eventBus              = eventBus;
+        this.onboardingJobExecutor = onboardingJobExecutor;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -333,88 +356,227 @@ public class OnboardingService {
     // ── Analyse ───────────────────────────────────────────────────────────────
 
     /**
-     * For each selected table, reads the live schema and asks the AI to
-     * produce: entity name, purpose, investigation hints, vocabulary terms,
-     * and 3 suggested investigative questions a business analyst might ask.
+     * Synchronous, sequential analysis of a table set — kept for anything that
+     * still wants the plain blocking shape (e.g. tests). {@link #startAnalysisJob}
+     * is the path the wizard actually uses; it runs the same per-table logic
+     * ({@link #analyzeOneTable}) with bounded concurrency instead of this loop.
      */
     public List<Map<String, Object>> analyzeTables(String connectionKey,
                                                      String schemaName,
                                                      String domainKey,
                                                      List<String> tableNames) {
-        List<Map<String, Object>> results = new ArrayList<>();
+        return tableNames.stream()
+                .map(tableName -> analyzeOneTable(connectionKey, schemaName, domainKey, tableName))
+                .collect(Collectors.toList());
+    }
 
-        for (String tableName : tableNames) {
-            try {
-                List<Map<String, Object>> columns =
-                        dynamicSqlService.describeTable(connectionKey, schemaName, tableName);
+    /**
+     * Reads one table's live schema and asks the AI to produce: entity name,
+     * purpose, investigation hints, vocabulary terms, and 3 suggested
+     * investigative questions a business analyst might ask. On any failure
+     * (including AI rate-limiting) degrades gracefully to a stub entry rather
+     * than throwing — a slow/failing table must never abort the whole batch.
+     */
+    private Map<String, Object> analyzeOneTable(String connectionKey, String schemaName,
+                                                  String domainKey, String tableName) {
+        try {
+            List<Map<String, Object>> columns =
+                    dynamicSqlService.describeTable(connectionKey, schemaName, tableName);
 
-                String schemaText = buildSchemaText(schemaName, tableName, columns);
+            String schemaText = buildSchemaText(schemaName, tableName, columns);
 
-                // PRO-22 tier 1/2: offer existing-entity candidates so the AI can
-                // reuse instead of minting a drifted duplicate. Zero prompt cost
-                // when no candidates exist (both blocks render empty).
-                var candidates = entityCandidates.retrieve(domainKey, tableName);
+            // PRO-22 tier 1/2: offer existing-entity candidates so the AI can
+            // reuse instead of minting a drifted duplicate. Zero prompt cost
+            // when no candidates exist (both blocks render empty).
+            var candidates = entityCandidates.retrieve(domainKey, tableName);
 
-                String systemPrompt = """
-                        You are an enterprise data analyst onboarding a new database into an
-                        operational intelligence platform. Analyse the table schema and respond
-                        with valid JSON only — no prose, no markdown fences.
+            String systemPrompt = """
+                    You are an enterprise data analyst onboarding a new database into an
+                    operational intelligence platform. Analyse the table schema and respond
+                    with valid JSON only — no prose, no markdown fences.
 
-                        Required JSON structure:
-                        {
-                          "entityName": "Human-readable singular noun, e.g. Order",
-                          "purpose": "One sentence describing what this table stores",
-                          "operationalMeaning": "Two sentences on how this table is used operationally",
-                          "investigationHints": "SQL hint a business analyst would use, e.g. SELECT ... FROM ... WHERE status='X'",
-                          "vocabularySuggestions": [
-                            { "term": "business term", "definition": "plain-English definition", "sqlEquivalent": "WHERE clause or expression" }
-                          ],
-                          "suggestedQuestions": [
-                            "Plain-English question a manager might ask about this data",
-                            "Another operational question",
-                            "A third question focused on anomalies or performance"
-                          ],
-                          "readinessScore": 0.0
-                        }
+                    Required JSON structure:
+                    {
+                      "entityName": "Human-readable singular noun, e.g. Order",
+                      "purpose": "One sentence describing what this table stores",
+                      "operationalMeaning": "Two sentences on how this table is used operationally",
+                      "investigationHints": "SQL hint a business analyst would use, e.g. SELECT ... FROM ... WHERE status='X'",
+                      "vocabularySuggestions": [
+                        { "term": "business term", "definition": "plain-English definition", "sqlEquivalent": "WHERE clause or expression" }
+                      ],
+                      "suggestedQuestions": [
+                        "Plain-English question a manager might ask about this data",
+                        "Another operational question",
+                        "A third question focused on anomalies or performance"
+                      ],
+                      "readinessScore": 0.0
+                    }
 
-                        Rules:
-                        - suggestedQuestions must be 3 natural-language questions, industry-agnostic.
-                        - vocabularySuggestions: 2-4 key business terms from this table.
-                        - readinessScore: 0.0-1.0 reflecting how well the schema reveals intent.
-                        """ + entityCandidates.resolutionContract(candidates);
+                    Rules:
+                    - suggestedQuestions must be 3 natural-language questions, industry-agnostic.
+                    - vocabularySuggestions: 2-4 key business terms from this table.
+                    - readinessScore: 0.0-1.0 reflecting how well the schema reveals intent.
+                    """ + entityCandidates.resolutionContract(candidates);
 
-                String userMessage = "Domain: " + domainKey + "\n" + schemaText
-                        + entityCandidates.renderPromptBlock(candidates);
-                String analysisJson = aiClient.chatWithJson(
-                        List.of(ChatMessage.user(userMessage)), systemPrompt);
+            String userMessage = "Domain: " + domainKey + "\n" + schemaText
+                    + entityCandidates.renderPromptBlock(candidates);
+            String analysisJson = aiClient.chatWithJson(
+                    List.of(ChatMessage.user(userMessage)), systemPrompt);
 
-                Map<String, Object> analysis = parseJson(analysisJson);
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("table_name",   tableName);
-                entry.put("schema_name",  schemaName);
-                entry.put("connection_key", connectionKey);
-                entry.put("domain_key",   domainKey);
-                entry.put("columns",      columns);
-                entry.put("entity_key",   slugify(
-                        (String) analysis.getOrDefault("entityName", tableName)));
-                entry.putAll(analysis);
-                results.add(entry);
+            Map<String, Object> analysis = parseJson(analysisJson);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("table_name",   tableName);
+            entry.put("schema_name",  schemaName);
+            entry.put("connection_key", connectionKey);
+            entry.put("domain_key",   domainKey);
+            entry.put("columns",      columns);
+            entry.put("entity_key",   slugify(
+                    (String) analysis.getOrDefault("entityName", tableName)));
+            entry.putAll(analysis);
+            return entry;
 
-            } catch (Exception e) {
-                log.warn("Analysis failed for table {}: {}", tableName, e.getMessage());
-                Map<String, Object> errorEntry = new LinkedHashMap<>();
-                errorEntry.put("table_name",  tableName);
-                errorEntry.put("error",        e.getMessage());
-                errorEntry.put("entity_key",   slugify(tableName));
-                errorEntry.put("entityName",   toTitleCase(tableName));
-                errorEntry.put("purpose",      "");
-                errorEntry.put("suggestedQuestions", List.of());
-                errorEntry.put("vocabularySuggestions", List.of());
-                results.add(errorEntry);
-            }
+        } catch (Exception e) {
+            log.warn("Analysis failed for table {}: {}", tableName, e.getMessage());
+            Map<String, Object> errorEntry = new LinkedHashMap<>();
+            errorEntry.put("table_name",  tableName);
+            errorEntry.put("error",        e.getMessage());
+            errorEntry.put("entity_key",   slugify(tableName));
+            errorEntry.put("entityName",   toTitleCase(tableName));
+            errorEntry.put("purpose",      "");
+            errorEntry.put("suggestedQuestions", List.of());
+            errorEntry.put("vocabularySuggestions", List.of());
+            return errorEntry;
+        }
+    }
+
+    // ── Analyse — async job (V040) ──────────────────────────────────────────────
+
+    /**
+     * Starts an async analysis job and returns its id immediately — the actual
+     * per-table AI calls run in the background with bounded concurrency (see
+     * {@link #runAnalysisJob}). A double-submit of the identical request within
+     * 10 minutes reattaches to the existing job instead of starting a new one.
+     */
+    public String startAnalysisJob(String connectionKey, String schemaName,
+                                    String domainKey, List<String> tableNames) {
+        String tenantSchema = TenantContext.getSchema();
+        String requestHash  = hashRequest(connectionKey, schemaName, domainKey, tableNames);
+
+        Optional<OnboardingAnalysisJob> recent =
+                jobRepository.findRecentByHash(tenantSchema, requestHash, Duration.ofMinutes(10));
+        if (recent.isPresent()) {
+            return recent.get().id();
         }
 
-        return results;
+        String jobId = Keys.uniqueKey("onbjob");
+        jobRepository.insertJob(new OnboardingAnalysisJob(
+                jobId, tenantSchema, connectionKey, schemaName, domainKey, tableNames,
+                "RUNNING", "{}", 0, tableNames.size(), requestHash, null, null, null));
+
+        CompletableFuture.runAsync(() -> runAnalysisJob(
+                jobId, tenantSchema, connectionKey, schemaName, domainKey, tableNames),
+                onboardingJobExecutor);
+
+        return jobId;
+    }
+
+    public Optional<OnboardingAnalysisJob> getJob(String jobId) {
+        return jobRepository.findById(jobId);
+    }
+
+    /** The poll/reattach view: job status plus every table result written so far. */
+    @SuppressWarnings("unchecked")
+    public Optional<Map<String, Object>> getJobView(String jobId) {
+        return jobRepository.findById(jobId).map(job -> {
+            List<Object> tables;
+            try {
+                Map<String, Object> resultsByTable =
+                        objectMapper.readValue(job.resultsJson(), new TypeReference<>() {});
+                tables = new ArrayList<>(resultsByTable.values());
+            } catch (Exception e) {
+                tables = List.of();
+            }
+            Map<String, Object> view = new LinkedHashMap<>();
+            view.put("jobId",       job.id());
+            view.put("status",      job.status());
+            view.put("tablesDone",  job.tablesDone());
+            view.put("tablesTotal", job.tablesTotal());
+            view.put("tables",      tables);
+            return view;
+        });
+    }
+
+    /**
+     * Runs every table in {@code tableNames} through {@link #analyzeOneTable},
+     * bounded to {@code tableConcurrencyPerJob} concurrent tables, publishing
+     * progress events via {@link ReasoningEventBus} (using {@code jobId} as the
+     * run key — the bus is generic, not chat-specific) and writing each result
+     * into the job row as soon as that table finishes.
+     *
+     * <p>{@link TenantContext} is a plain {@code ThreadLocal} and does not
+     * propagate across thread boundaries — every worker thread below sets and
+     * clears it independently, not just the dispatching thread, or every DB
+     * call a table's analysis makes (schema describe, candidate lookup, the
+     * job-result write) would silently run against the wrong tenant schema.
+     */
+    private void runAnalysisJob(String jobId, String tenantSchema, String connectionKey,
+                                 String schemaName, String domainKey, List<String> tableNames) {
+        TenantContext.set(tenantSchema);
+        try {
+            eventBus.publish(jobId, "job_started", Map.of("tablesTotal", tableNames.size()));
+
+            Semaphore laneLimit = new Semaphore(Math.max(1, tableConcurrencyPerJob));
+            List<CompletableFuture<Void>> futures = tableNames.stream()
+                    .map(tableName -> CompletableFuture.runAsync(() -> {
+                        try {
+                            laneLimit.acquire();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        TenantContext.set(tenantSchema);
+                        try {
+                            eventBus.publish(jobId, "table_started", Map.of("table", tableName));
+                            Map<String, Object> result =
+                                    analyzeOneTable(connectionKey, schemaName, domainKey, tableName);
+                            jobRepository.updateTableResult(jobId, tableName, result);
+                            eventBus.publish(jobId,
+                                    result.containsKey("error") ? "table_failed" : "table_completed",
+                                    Map.of("table", tableName));
+                        } finally {
+                            TenantContext.clear();
+                            laneLimit.release();
+                        }
+                    }, onboardingJobExecutor))
+                    .collect(Collectors.toList());
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            jobRepository.markComplete(jobId);
+            eventBus.publish(jobId, "job_complete", Map.of());
+            eventBus.complete(jobId);
+        } catch (Exception e) {
+            log.error("Onboarding analysis job '{}' failed: {}", jobId, e.getMessage());
+            jobRepository.markFailed(jobId);
+            eventBus.publish(jobId, "job_failed", Map.of("error", String.valueOf(e.getMessage())));
+            eventBus.complete(jobId);
+        } finally {
+            TenantContext.clear();
+        }
+    }
+
+    private static String hashRequest(String connectionKey, String schemaName,
+                                       String domainKey, List<String> tableNames) {
+        List<String> sorted = tableNames.stream().sorted().collect(Collectors.toList());
+        String raw = connectionKey + "|" + schemaName + "|" + domainKey + "|" + String.join(",", sorted);
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(raw.hashCode());
+        }
     }
 
     // ── Apply ─────────────────────────────────────────────────────────────────
