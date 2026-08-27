@@ -134,7 +134,7 @@ public class IntegrationTemplateService {
         IndustryPack template = getTemplate(templateId);
 
         // Delegate core entity + vocab creation to existing pack infrastructure
-        var packResult = packService.applyPack(templateId, domainKey, appliedBy);
+        var packResult = packService.applyPack(templateId, domainKey, connectionKey, appliedBy);
 
         // Create the pre-built agent if defined
         String agentId = null;

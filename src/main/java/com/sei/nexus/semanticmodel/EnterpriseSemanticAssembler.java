@@ -84,6 +84,22 @@ public class EnterpriseSemanticAssembler {
         return project(enterpriseMap.findDataObjectsByDomainKeys(domainKeys));
     }
 
+    /**
+     * Concept-Scoped Metadata Narrowing (upstream Agent Brain context reduction, Stage 2):
+     * assembles the semantic model for an EXACT, already-resolved set of physical object keys —
+     * never a connection- or domain-wide scan. This is the targeted counterpart to {@link
+     * #assemble(List)}/{@link #assembleByDomains(List)}.
+     *
+     * <p>Selection primitive only, same as its siblings: which object keys to request — i.e.
+     * resolving an LLM-selected concept_key to the Business Entities/physical objects bound to
+     * it — is a business-reasoning decision owned by {@code AgentBrain} (via a dedicated
+     * concept-resolution component), never this class. This method only projects the requested
+     * object keys; it has no awareness of Packs, concepts, or Business Entities at all.
+     */
+    public SemanticModel assembleByObjectKeys(List<String> objectKeys) {
+        return project(enterpriseMap.findDataObjectsByKeys(objectKeys));
+    }
+
     /** Projects Enterprise Map objects into the canonical semantic model. */
     private SemanticModel project(List<DataObject> objects) {
         List<BusinessObject> businessObjects = new ArrayList<>();

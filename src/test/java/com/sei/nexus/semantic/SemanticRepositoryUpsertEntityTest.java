@@ -45,10 +45,10 @@ class SemanticRepositoryUpsertEntityTest {
 
     @Test
     void otherEditableFieldsStillOverwriteUnconditionally() throws Exception {
-        // Only primary_object_key gets the preservation guard. Every other editable
-        // field must still take EXCLUDED's value outright — this fix is scoped to the
-        // one field with a documented, real corruption incident, not a blanket
-        // "preserve everything on omission" change.
+        // Only primary_object_key and group_label get the preservation guard. Every
+        // other editable field must still take EXCLUDED's value outright — this fix
+        // is scoped to fields with a documented reason to preserve on omission, not a
+        // blanket "preserve everything" change.
         String sql = upsertEntitySql();
         assertTrue(sql.contains("domain_key           = EXCLUDED.domain_key"));
         assertTrue(sql.contains("entity_name          = EXCLUDED.entity_name"));
@@ -57,5 +57,38 @@ class SemanticRepositoryUpsertEntityTest {
         assertTrue(sql.contains("investigation_hints  = EXCLUDED.investigation_hints"));
         assertTrue(sql.contains("status               = EXCLUDED.status"));
         assertTrue(sql.contains("entity_type          = EXCLUDED.entity_type"));
+    }
+
+    /**
+     * Grouping Foundation Fix — the same COALESCE discipline as primary_object_key,
+     * for the same reason: a partial update that omits the analyzed category (e.g. a
+     * re-registration pass, or a manual Semantic Layer edit that only touches other
+     * fields) must not silently erase a group_label an onboarding analysis already set.
+     */
+    @Test
+    void groupLabelIsPreservedOnConflictViaCoalesce() throws Exception {
+        String sql = upsertEntitySql();
+        assertTrue(
+                sql.contains("group_label          = COALESCE(EXCLUDED.group_label, nexus_business_entity.group_label)"),
+                "UPSERT_ENTITY must COALESCE group_label against the existing row on conflict, "
+                        + "not overwrite it with EXCLUDED.group_label unconditionally. Actual SQL:\n" + sql);
+    }
+
+    /**
+     * Global Pack Foundation — same COALESCE discipline as primary_object_key/
+     * group_label, for the new pack_key/concept_key reference to a canonical Global
+     * Business Concept: no current caller populates these (this task adds only the
+     * plumbing), but the same "an omission must never erase" rule applies once a
+     * future mapping step starts setting them.
+     */
+    @Test
+    void packKeyAndConceptKeyArePreservedOnConflictViaCoalesce() throws Exception {
+        String sql = upsertEntitySql();
+        assertTrue(
+                sql.contains("pack_key             = COALESCE(EXCLUDED.pack_key, nexus_business_entity.pack_key)"),
+                "UPSERT_ENTITY must COALESCE pack_key against the existing row on conflict. Actual SQL:\n" + sql);
+        assertTrue(
+                sql.contains("concept_key          = COALESCE(EXCLUDED.concept_key, nexus_business_entity.concept_key)"),
+                "UPSERT_ENTITY must COALESCE concept_key against the existing row on conflict. Actual SQL:\n" + sql);
     }
 }

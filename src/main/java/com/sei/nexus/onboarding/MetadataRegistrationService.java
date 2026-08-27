@@ -1,6 +1,9 @@
 package com.sei.nexus.onboarding;
 
+import com.sei.nexus.connection.NexusConnection;
 import com.sei.nexus.enterprise.EnterpriseMapService;
+import com.sei.nexus.pack.IndustryPackRepository;
+import com.sei.nexus.pack.TenantPack;
 import com.sei.nexus.semantic.BusinessEntity;
 import com.sei.nexus.semantic.EntityCandidateService;
 import com.sei.nexus.semantic.RelationshipDiscoveryService;
@@ -56,26 +59,34 @@ public class MetadataRegistrationService {
     private final RelationshipDiscoveryService relationshipDiscovery;
     private final EntityCandidateService       entityCandidates;
     private final com.sei.nexus.enterprise.BusinessValueRepository businessValues;
+    // Connection-Scoped Industry Pack Semantic Assignment: pack_key is derived from the
+    // connection's active Industry Pack — never from the LLM, never from table names. Nullable
+    // exactly like businessValues above (see the null-guard at resolveActivePackKey): tests that
+    // don't care about pack assignment keep using the 4-arg constructor unchanged.
+    private final IndustryPackRepository packRepository;
 
     @org.springframework.beans.factory.annotation.Autowired
     public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
                                         SemanticService semanticService,
                                         RelationshipDiscoveryService relationshipDiscovery,
                                         EntityCandidateService entityCandidates,
-                                        com.sei.nexus.enterprise.BusinessValueRepository businessValues) {
+                                        com.sei.nexus.enterprise.BusinessValueRepository businessValues,
+                                        IndustryPackRepository packRepository) {
         this.enterpriseMapService  = enterpriseMapService;
         this.semanticService       = semanticService;
         this.relationshipDiscovery = relationshipDiscovery;
         this.entityCandidates      = entityCandidates;
         this.businessValues        = businessValues;
+        this.packRepository        = packRepository;
     }
 
-    /** Backward-compatible convenience (tests): no Business Value persistence (⇒ step 5 is a no-op). */
+    /** Backward-compatible convenience (tests): no Business Value persistence (⇒ step 5 is a
+     *  no-op) and no pack lookup (⇒ pack_key is never populated — see resolveActivePackKey). */
     public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
                                         SemanticService semanticService,
                                         RelationshipDiscoveryService relationshipDiscovery,
                                         EntityCandidateService entityCandidates) {
-        this(enterpriseMapService, semanticService, relationshipDiscovery, entityCandidates, null);
+        this(enterpriseMapService, semanticService, relationshipDiscovery, entityCandidates, null, null);
     }
 
     /** Per-batch outcome record: counts plus per-step failure descriptions. */
@@ -110,6 +121,31 @@ public class MetadataRegistrationService {
         int vocabCreated    = 0;
         List<String> failures = new ArrayList<>();
 
+        // Optimization B (onboarding performance investigation): every entity in
+        // this batch shares the same connection (connectionKey is batch-level, not
+        // per-entity), so resolve it once here instead of once per entity inside
+        // EnterpriseMapService.createOrUpdateObject. Any resolution failure is
+        // captured and replayed per-entity below with the exact failure message
+        // the old per-call lookup would have produced, so behavior is unchanged.
+        NexusConnection connection = null;
+        Exception connectionError  = null;
+        if (connectionKey != null && !connectionKey.isBlank()) {
+            try {
+                connection = enterpriseMapService.resolveConnection(connectionKey);
+            } catch (Exception e) {
+                connectionError = e;
+            }
+        }
+
+        // Connection-Scoped Industry Pack Semantic Assignment: pack_key is resolved once per
+        // batch (same "resolve once, not once per entity" shape as the connection lookup above)
+        // from the connection's ACTIVE Industry Pack assignment — never from the LLM, never
+        // guessed from table names. No active pack (or no packRepository, e.g. the 4-arg test
+        // constructor) simply leaves this null, which then makes the pack_key write below a
+        // no-op for every entity in the batch — byte-identical to today's behavior.
+        String activePackKey = resolveActivePackKey(connectionKey);
+
+        long applyStart = System.currentTimeMillis();
         for (Map<String, Object> entity : entities) {
             if (!Boolean.TRUE.equals(entity.get("approved"))) continue;
 
@@ -126,6 +162,11 @@ public class MetadataRegistrationService {
             //    bindings, and graph table labels, so creating it silently would
             //    reproduce the Discover-path defect.
             String objectKey;
+            if (connectionError != null) {
+                log.warn("Failed to register data object for {}: {}", tableName, connectionError.getMessage());
+                failures.add("data object " + tableName + ": " + connectionError.getMessage());
+                continue;
+            }
             try {
                 Map<String, Object> objBody = new LinkedHashMap<>();
                 objBody.put("domainKey",     domainKey);
@@ -142,8 +183,17 @@ public class MetadataRegistrationService {
                 putStrIfPresent(objBody, "usageGuidance",     entity.get("usageGuidance"));
                 putStrIfPresent(objBody, "filterGuidance",    entity.get("filterGuidance"));
                 putStrIfPresent(objBody, "avoidGuidance",     entity.get("avoidGuidance"));
+                // Optimization A: the Analyze phase already fetched this table's live
+                // schema (describeTable) — carry it through so Apply doesn't fetch it
+                // again. Absent for callers that never analyzed (e.g. Discover-from-DB),
+                // which fall back to a live describeTable() call unchanged.
+                if (entity.get("columns") != null) {
+                    objBody.put("columns", entity.get("columns"));
+                }
 
-                var dataObj = enterpriseMapService.createOrUpdateObject(objBody, userEmail);
+                var dataObj = connection != null
+                        ? enterpriseMapService.createOrUpdateObject(objBody, userEmail, connection)
+                        : enterpriseMapService.createOrUpdateObject(objBody, userEmail);
                 objectKey = dataObj.objectKey();
                 objectsCreated++;
             } catch (Exception e) {
@@ -174,6 +224,28 @@ public class MetadataRegistrationService {
                 entityBody.put("domainKey",          domainKey);
                 entityBody.put("status",             "ACTIVE");
                 entityBody.put("primaryObjectKey",   objectKey);
+                // Grouping Foundation Fix: the AI-generated category from the shared
+                // onboarding analysis (analyzeTableBatch) — identical regardless of
+                // whether this table was AI-recommended or added via Browse All, since
+                // both pass through that one analysis step. Absent ⇒ omitted here, so
+                // SemanticService/SemanticRepository's existing COALESCE preserves
+                // whatever group_label (if any) the entity already has.
+                putStrIfPresent(entityBody, "groupLabel", entity.get("category"));
+                // Connection-Scoped Industry Pack Semantic Assignment:
+                //   pack_key    — always the connection's active pack; never absent because of
+                //                 what the caller supplied, only because there is no active pack.
+                //   concept_key — the LLM's own validated decision from BusinessObjectBatchAnalyzer
+                //                 (see its "conceptResolution" handling), carried through the
+                //                 draft/review step when the caller supplies it. Never assigned
+                //                 here, never inferred from table names — Java only relays and
+                //                 persists a value the model already produced and this pipeline's
+                //                 caller already validated at analysis time.
+                // Both use putStrIfPresent, so an absent/blank value is simply omitted — the
+                // existing UPSERT_ENTITY COALESCE then preserves whatever value (if any) the
+                // entity already has. Neither field can ever be erased by an analysis that didn't
+                // resolve one.
+                putStrIfPresent(entityBody, "packKey", activePackKey);
+                putStrIfPresent(entityBody, "conceptKey", entity.get("conceptKey"));
                 semanticService.createOrUpdateEntity(entityBody, userEmail);
                 entitiesCreated++;
             } catch (Exception e) {
@@ -209,11 +281,13 @@ public class MetadataRegistrationService {
             //    Physical values are referenced by (value_domain_key, physical_value); none are stored here.
             persistBusinessValues(entity, userEmail, failures);
         }
+        log.info("onboarding.performance stage=apply elapsedMs={}", System.currentTimeMillis() - applyStart);
 
         // 4. Relationship discovery — once per batch, after all entities exist,
         //    so the table→entity index it consumes is complete.
         int relationships = 0;
         if (connectionKey != null && !connectionKey.isBlank()) {
+            long relStart = System.currentTimeMillis();
             try {
                 String schema = schemaName != null && !schemaName.isBlank() ? schemaName : "public";
                 relationships = relationshipDiscovery.discoverAndPersist(connectionKey, schema, domainKey);
@@ -221,6 +295,9 @@ public class MetadataRegistrationService {
             } catch (Exception e) {
                 log.warn("Relationship auto-discovery failed (non-fatal): {}", e.getMessage());
                 failures.add("relationship discovery: " + e.getMessage());
+            } finally {
+                log.info("onboarding.performance stage=relationships elapsedMs={}",
+                        System.currentTimeMillis() - relStart);
             }
         }
 
@@ -274,12 +351,11 @@ public class MetadataRegistrationService {
                 failures.add("entity reuse for " + tableName + " rejected: confidence "
                         + confidence + " below " + REUSE_CONFIDENCE_THRESHOLD);
             } else {
-                String rejection = validateReuse(domainKey, objectKey, tableName, selectedKey);
-                if (rejection == null) {
-                    BusinessEntity existing = entityCandidates.findEntity(selectedKey).orElseThrow();
-                    return new EntitySelection(selectedKey, existing.entityName(), true);
+                ReuseValidation validation = validateReuse(domainKey, objectKey, tableName, selectedKey);
+                if (validation.rejectionReason() == null) {
+                    return new EntitySelection(selectedKey, validation.entity().entityName(), true);
                 }
-                failures.add("entity reuse for " + tableName + " rejected: " + rejection);
+                failures.add("entity reuse for " + tableName + " rejected: " + validation.rejectionReason());
             }
         }
 
@@ -301,23 +377,33 @@ public class MetadataRegistrationService {
         return new EntitySelection(key, null, false);
     }
 
-    /** Integrity checks for an AI-selected reuse key; returns a rejection reason or null. */
-    private String validateReuse(String domainKey, String objectKey, String tableName, String selectedKey) {
+    /** Outcome of {@link #validateReuse}: the entity fetched during validation (so the
+     *  caller never re-fetches it), plus a rejection reason when validation fails. */
+    private record ReuseValidation(BusinessEntity entity, String rejectionReason) {
+        static ReuseValidation ok(BusinessEntity entity)   { return new ReuseValidation(entity, null); }
+        static ReuseValidation rejected(String reason)     { return new ReuseValidation(null, reason); }
+    }
+
+    /** Integrity checks for an AI-selected reuse key; the entity looked up here is
+     *  handed back so the caller (selectEntity) never re-queries it (Optimization C). */
+    private ReuseValidation validateReuse(String domainKey, String objectKey, String tableName, String selectedKey) {
         boolean offered = entityCandidates.retrieve(domainKey, tableName).stream()
                 .anyMatch(c -> c.entityKey().equals(selectedKey));
-        if (!offered) return "'" + selectedKey + "' was not in the offered candidate set";
+        if (!offered) return ReuseValidation.rejected("'" + selectedKey + "' was not in the offered candidate set");
 
         var existing = entityCandidates.findEntity(selectedKey);
-        if (existing.isEmpty()) return "'" + selectedKey + "' does not exist";
-        if ("ARCHIVED".equalsIgnoreCase(existing.get().status())) return "'" + selectedKey + "' is archived";
+        if (existing.isEmpty()) return ReuseValidation.rejected("'" + selectedKey + "' does not exist");
+        if ("ARCHIVED".equalsIgnoreCase(existing.get().status())) {
+            return ReuseValidation.rejected("'" + selectedKey + "' is archived");
+        }
         if (domainKey != null && !domainKey.equals(existing.get().domainKey())) {
-            return "'" + selectedKey + "' belongs to domain " + existing.get().domainKey();
+            return ReuseValidation.rejected("'" + selectedKey + "' belongs to domain " + existing.get().domainKey());
         }
         String binding = existing.get().primaryObjectKey();
         if (binding != null && !binding.isBlank() && !binding.equals(objectKey)) {
-            return "'" + selectedKey + "' is already bound to " + binding + " — refusing to rebind";
+            return ReuseValidation.rejected("'" + selectedKey + "' is already bound to " + binding + " — refusing to rebind");
         }
-        return null;
+        return ReuseValidation.ok(existing.get());
     }
 
     private static double parseConfidence(Object value) {
@@ -417,6 +503,25 @@ public class MetadataRegistrationService {
 
     private static void putStrIfPresent(Map<String, Object> body, String key, Object value) {
         if (value != null && !value.toString().isBlank()) body.put(key, value.toString());
+    }
+
+    /**
+     * Connection-Scoped Industry Pack Semantic Assignment: the connection's ACTIVE Industry Pack
+     * key, or {@code null} when there isn't one (no assignment, lookup failure, or this instance
+     * was built without a {@link IndustryPackRepository} — the 4-arg test convenience
+     * constructor). Mirrors {@link #businessValues}'s null-guard exactly: absence is a normal,
+     * fully-supported state, never an error.
+     */
+    private String resolveActivePackKey(String connectionKey) {
+        if (packRepository == null || connectionKey == null || connectionKey.isBlank()) return null;
+        try {
+            return packRepository.findActivePackForConnection(connectionKey)
+                    .map(TenantPack::packKey)
+                    .orElse(null);
+        } catch (Exception e) {
+            log.debug("Could not resolve active pack for connection '{}': {}", connectionKey, e.getMessage());
+            return null;
+        }
     }
 
     private static String strOrDefault(Object value, String def) {

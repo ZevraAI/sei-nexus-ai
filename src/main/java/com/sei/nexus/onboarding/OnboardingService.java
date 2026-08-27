@@ -61,9 +61,22 @@ public class OnboardingService {
     private final OnboardingAnalysisJobRepository jobRepository;
     private final ReasoningEventBus        eventBus;
     private final Executor                 onboardingJobExecutor;
+    // Multi-Table Analysis Hardening: the shared batched Business Object analysis mechanism,
+    // also used by EnterpriseMapService.analyzeForOnboarding() (Discover from DB) — neither
+    // service calls the other; both call this.
+    private final com.sei.nexus.prompt.BusinessObjectBatchAnalyzer batchAnalyzer;
 
-    @Value("${nexus.onboarding.table-concurrency:4}")
-    private int tableConcurrencyPerJob;
+    // How many tables go into ONE AI call — the dominant lever against rate
+    // limits, since a 15-17 table onboarding otherwise makes 15-17 separate
+    // calls (see analyzeTableBatch). Mirrors recommendTables()'s existing
+    // "many tables, one call" shape.
+    @Value("${nexus.onboarding.batch-size:4}")
+    private int batchSize;
+
+    // How many BATCHES run concurrently per job — lower than the old
+    // per-table concurrency default, since each unit of work is heavier now.
+    @Value("${nexus.onboarding.batch-concurrency:2}")
+    private int batchConcurrency;
 
     public OnboardingService(TenantSettingsRepository settings,
                               ConnectionRepository connectionRepository,
@@ -80,7 +93,8 @@ public class OnboardingService {
                               com.sei.nexus.pack.IndustryPackService industryPackService,
                               OnboardingAnalysisJobRepository jobRepository,
                               ReasoningEventBus eventBus,
-                              @Qualifier("onboardingJobExecutor") Executor onboardingJobExecutor) {
+                              @Qualifier("onboardingJobExecutor") Executor onboardingJobExecutor,
+                              com.sei.nexus.prompt.BusinessObjectBatchAnalyzer batchAnalyzer) {
         this.settings              = settings;
         this.connectionRepository  = connectionRepository;
         this.dynamicSqlService     = dynamicSqlService;
@@ -97,6 +111,7 @@ public class OnboardingService {
         this.jobRepository         = jobRepository;
         this.eventBus              = eventBus;
         this.onboardingJobExecutor = onboardingJobExecutor;
+        this.batchAnalyzer         = batchAnalyzer;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -233,10 +248,25 @@ public class OnboardingService {
      * @return map containing {@code recommended} list, {@code total_tables} count,
      *         and {@code cached} flag indicating whether the result came from cache.
      */
-    @SuppressWarnings("unchecked")
+    // Coalesces concurrent identical recommend calls onto one real AI call — the
+    // cache below is only populated *after* the call completes, so without this,
+    // two requests for the same connection/schema arriving close together (a
+    // frontend double-fire, a double-click, two open tabs) both miss the cache
+    // and both hit the AI. One lock object per distinct (connectionKey,
+    // schemaName) pair; the set of these is small and long-lived in practice.
+    private final java.util.concurrent.ConcurrentHashMap<String, Object> recommendLocks =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     public Map<String, Object> recommendTables(String connectionKey, String schemaName) {
         String cacheKey = "onboarding_recommend_" + connectionKey + "_" + schemaName;
+        Object lock = recommendLocks.computeIfAbsent(cacheKey, k -> new Object());
+        synchronized (lock) {
+            return recommendTablesLocked(connectionKey, schemaName, cacheKey);
+        }
+    }
 
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> recommendTablesLocked(String connectionKey, String schemaName, String cacheKey) {
         // Return cached result if available — avoids re-running the AI call on
         // every wizard render. Cache is invalidated when a new connection is added.
         Optional<String> cached = settings.get(cacheKey);
@@ -358,120 +388,145 @@ public class OnboardingService {
     /**
      * Synchronous, sequential analysis of a table set — kept for anything that
      * still wants the plain blocking shape (e.g. tests). {@link #startAnalysisJob}
-     * is the path the wizard actually uses; it runs the same per-table logic
-     * ({@link #analyzeOneTable}) with bounded concurrency instead of this loop.
+     * is the path the wizard actually uses; it runs the same batched logic
+     * ({@link #analyzeTableBatch}) with bounded concurrency instead of this loop.
      */
     public List<Map<String, Object>> analyzeTables(String connectionKey,
                                                      String schemaName,
                                                      String domainKey,
                                                      List<String> tableNames) {
-        return tableNames.stream()
-                .map(tableName -> analyzeOneTable(connectionKey, schemaName, domainKey, tableName))
-                .collect(Collectors.toList());
+        List<Map<String, Object>> results = new ArrayList<>();
+        for (List<String> batch : partition(tableNames, Math.max(1, batchSize))) {
+            Map<String, Map<String, Object>> byTable =
+                    analyzeTableBatch(connectionKey, schemaName, domainKey, batch);
+            for (String tableName : batch) results.add(byTable.get(tableName));
+        }
+        return results;
     }
 
     /**
-     * Reads one table's live schema and asks the AI to produce: entity name,
-     * purpose, investigation hints, vocabulary terms, and 3 suggested
-     * investigative questions a business analyst might ask. On any failure
-     * (including AI rate-limiting) degrades gracefully to a stub entry rather
-     * than throwing — a slow/failing table must never abort the whole batch.
+     * Reads a GROUP of tables' live schemas and asks the AI to analyse all of
+     * them in a single call — the same "many tables, one call" shape
+     * {@link #recommendTables} already uses, applied here to cut a 15-17 table
+     * onboarding run from 15-17 separate AI calls down to a handful, which is
+     * the dominant lever against provider rate limits (a Semaphore only caps
+     * concurrency, not call volume). On a whole-call failure (including
+     * exhausted 429 retries), every table in the batch degrades to the same
+     * stub shape the old single-table path used — a batch must never abort
+     * the job, and a batch failure must never look different from a table
+     * failure to the frontend. On a partial/malformed response, only the
+     * missing table(s) get stubbed.
      */
-    private Map<String, Object> analyzeOneTable(String connectionKey, String schemaName,
-                                                  String domainKey, String tableName) {
-        try {
-            List<Map<String, Object>> columns =
-                    dynamicSqlService.describeTable(connectionKey, schemaName, tableName);
+    // Onboarding's one caller-specific addition to the shared contract — wizard-bootstrap-only,
+    // not a canonical Business Object field (see BusinessObjectAnalysisContract's own javadoc).
+    private static final String SUGGESTED_QUESTIONS_FIELD_SCHEMA = """
+              "suggestedQuestions": [
+                "Plain-English question a manager might ask about this data",
+                "Another operational question",
+                "A third question focused on anomalies or performance"
+              ]""";
+    private static final String SUGGESTED_QUESTIONS_RULE =
+            "- suggestedQuestions must be 3 natural-language questions, industry-agnostic.";
 
-            String schemaText = buildSchemaText(schemaName, tableName, columns);
+    /**
+     * Reads a GROUP of tables' live schemas and asks the AI to analyse all of
+     * them in a single call — via the shared {@link com.sei.nexus.prompt.BusinessObjectBatchAnalyzer},
+     * also used by {@code EnterpriseMapService.analyzeForOnboarding()} (Discover from DB) — the
+     * same "many tables, one call" shape {@link #recommendTables} already uses, applied here to
+     * cut a 15-17 table onboarding run from 15-17 separate AI calls down to a handful, which is
+     * the dominant lever against provider rate limits (a Semaphore only caps
+     * concurrency, not call volume). On a whole-call failure (including
+     * exhausted 429 retries), every table in the batch degrades to the same
+     * stub shape the old single-table path used — a batch must never abort
+     * the job, and a batch failure must never look different from a table
+     * failure to the frontend. On a partial/malformed response, only the
+     * missing table(s) get stubbed.
+     */
+    private Map<String, Map<String, Object>> analyzeTableBatch(String connectionKey, String schemaName,
+                                                                 String domainKey, List<String> tableNames) {
+        Map<String, Map<String, Object>> analyzed = batchAnalyzer.analyzeBatch(
+                connectionKey, schemaName, domainKey, tableNames,
+                SUGGESTED_QUESTIONS_FIELD_SCHEMA, SUGGESTED_QUESTIONS_RULE);
 
-            // PRO-22 tier 1/2: offer existing-entity candidates so the AI can
-            // reuse instead of minting a drifted duplicate. Zero prompt cost
-            // when no candidates exist (both blocks render empty).
-            var candidates = entityCandidates.retrieve(domainKey, tableName);
-
-            String systemPrompt = """
-                    You are an enterprise data analyst onboarding a new database into an
-                    operational intelligence platform. Analyse the table schema and respond
-                    with valid JSON only — no prose, no markdown fences.
-
-                    Required JSON structure:
-                    {
-                      "entityName": "Human-readable singular noun, e.g. Order",
-                      "purpose": "One sentence describing what this table stores",
-                      "operationalMeaning": "Two sentences on how this table is used operationally",
-                      "investigationHints": "SQL hint a business analyst would use, e.g. SELECT ... FROM ... WHERE status='X'",
-                      "vocabularySuggestions": [
-                        { "term": "business term", "definition": "plain-English definition", "sqlEquivalent": "WHERE clause or expression" }
-                      ],
-                      "suggestedQuestions": [
-                        "Plain-English question a manager might ask about this data",
-                        "Another operational question",
-                        "A third question focused on anomalies or performance"
-                      ],
-                      "readinessScore": 0.0
-                    }
-
-                    Rules:
-                    - suggestedQuestions must be 3 natural-language questions, industry-agnostic.
-                    - vocabularySuggestions: 2-4 key business terms from this table.
-                    - readinessScore: 0.0-1.0 reflecting how well the schema reveals intent.
-                    """ + entityCandidates.resolutionContract(candidates);
-
-            String userMessage = "Domain: " + domainKey + "\n" + schemaText
-                    + entityCandidates.renderPromptBlock(candidates);
-            String analysisJson = aiClient.chatWithJson(
-                    List.of(ChatMessage.user(userMessage)), systemPrompt);
-
-            Map<String, Object> analysis = parseJson(analysisJson);
+        Map<String, Map<String, Object>> results = new LinkedHashMap<>();
+        for (String tableName : tableNames) {
+            Map<String, Object> analysis = analyzed.get(tableName);
+            // Onboarding's own wrapper fields — its historical snake_case shape, plus
+            // entity_key and the suggestedQuestions default. Not part of the shared contract.
             Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("table_name",   tableName);
-            entry.put("schema_name",  schemaName);
+            entry.put("table_name",     tableName);
+            entry.put("schema_name",    schemaName);
             entry.put("connection_key", connectionKey);
-            entry.put("domain_key",   domainKey);
-            entry.put("columns",      columns);
-            entry.put("entity_key",   slugify(
+            entry.put("domain_key",     domainKey);
+            entry.put("entity_key",     slugify(
                     (String) analysis.getOrDefault("entityName", tableName)));
             entry.putAll(analysis);
-            return entry;
-
-        } catch (Exception e) {
-            log.warn("Analysis failed for table {}: {}", tableName, e.getMessage());
-            Map<String, Object> errorEntry = new LinkedHashMap<>();
-            errorEntry.put("table_name",  tableName);
-            errorEntry.put("error",        e.getMessage());
-            errorEntry.put("entity_key",   slugify(tableName));
-            errorEntry.put("entityName",   toTitleCase(tableName));
-            errorEntry.put("purpose",      "");
-            errorEntry.put("suggestedQuestions", List.of());
-            errorEntry.put("vocabularySuggestions", List.of());
-            return errorEntry;
+            if (!(entry.get("suggestedQuestions") instanceof List)) {
+                entry.put("suggestedQuestions", List.of()); // Onboarding-only field, not canonical
+            }
+            results.put(tableName, entry);
         }
+        return results;
+    }
+
+    private static <T> List<List<T>> partition(List<T> items, int size) {
+        List<List<T>> batches = new ArrayList<>();
+        for (int i = 0; i < items.size(); i += size) {
+            batches.add(items.subList(i, Math.min(i + size, items.size())));
+        }
+        return batches;
     }
 
     // ── Analyse — async job (V040) ──────────────────────────────────────────────
+
+    // Serializes the check-then-insert in startAnalysisJob (below) so two
+    // requests arriving milliseconds apart can't both see "no recent job" and
+    // both start a real job — see that method's javadoc for the incident this
+    // closes. One lock object for the whole JVM: job starts are rare (once per
+    // onboarding attempt) and the guarded section is a single SELECT + INSERT,
+    // so cross-tenant contention is not a practical concern.
+    private final Object jobStartLock = new Object();
 
     /**
      * Starts an async analysis job and returns its id immediately — the actual
      * per-table AI calls run in the background with bounded concurrency (see
      * {@link #runAnalysisJob}). A double-submit of the identical request within
      * 10 minutes reattaches to the existing job instead of starting a new one.
+     *
+     * <p>The reattach check and the job insert are deliberately serialized
+     * (below): without it, two requests for the identical params arriving
+     * close together — a frontend double-fire, a double-click, two open tabs —
+     * can both pass "no recent job found" before either has inserted its row,
+     * each then starting its own real job. Confirmed live: two full analysis
+     * jobs ran concurrently against the same table set, doubling AI-call
+     * volume and triggering cascading OpenAI rate-limit failures across both.
      */
     public String startAnalysisJob(String connectionKey, String schemaName,
                                     String domainKey, List<String> tableNames) {
+        // Multi-Table Analysis Hardening: the backend is the authority on the selection limit —
+        // frontend UI enforcement (StepSelectTables' Browse All) is a UX convenience only and
+        // must never be the only guard, since a request can always bypass client-side checks.
+        if (tableNames.size() > com.sei.nexus.prompt.BusinessObjectAnalysisContract.MAX_SELECTED_TABLES) {
+            throw new com.sei.nexus.common.NexusException(org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "Too many tables selected: " + tableNames.size() + " (maximum "
+                            + com.sei.nexus.prompt.BusinessObjectAnalysisContract.MAX_SELECTED_TABLES + ")");
+        }
         String tenantSchema = TenantContext.getSchema();
         String requestHash  = hashRequest(connectionKey, schemaName, domainKey, tableNames);
 
-        Optional<OnboardingAnalysisJob> recent =
-                jobRepository.findRecentByHash(tenantSchema, requestHash, Duration.ofMinutes(10));
-        if (recent.isPresent()) {
-            return recent.get().id();
-        }
+        String jobId;
+        synchronized (jobStartLock) {
+            Optional<OnboardingAnalysisJob> recent =
+                    jobRepository.findRecentByHash(tenantSchema, requestHash, Duration.ofMinutes(10));
+            if (recent.isPresent()) {
+                return recent.get().id();
+            }
 
-        String jobId = Keys.uniqueKey("onbjob");
-        jobRepository.insertJob(new OnboardingAnalysisJob(
-                jobId, tenantSchema, connectionKey, schemaName, domainKey, tableNames,
-                "RUNNING", "{}", 0, tableNames.size(), requestHash, null, null, null));
+            jobId = Keys.uniqueKey("onbjob");
+            jobRepository.insertJob(new OnboardingAnalysisJob(
+                    jobId, tenantSchema, connectionKey, schemaName, domainKey, tableNames,
+                    "RUNNING", "{}", 0, tableNames.size(), requestHash, null, null, null));
+        }
 
         CompletableFuture.runAsync(() -> runAnalysisJob(
                 jobId, tenantSchema, connectionKey, schemaName, domainKey, tableNames),
@@ -507,27 +562,32 @@ public class OnboardingService {
     }
 
     /**
-     * Runs every table in {@code tableNames} through {@link #analyzeOneTable},
-     * bounded to {@code tableConcurrencyPerJob} concurrent tables, publishing
-     * progress events via {@link ReasoningEventBus} (using {@code jobId} as the
-     * run key — the bus is generic, not chat-specific) and writing each result
-     * into the job row as soon as that table finishes.
+     * Runs every table in {@code tableNames} through {@link #analyzeTableBatch},
+     * grouped into batches of {@code batchSize} tables per AI call, bounded to
+     * {@code batchConcurrency} concurrent batches, publishing progress events
+     * via {@link ReasoningEventBus} (using {@code jobId} as the run key — the
+     * bus is generic, not chat-specific) and writing each table's result into
+     * the job row as soon as its batch finishes. The DB schema, SSE event
+     * vocabulary, and per-table result shape are all identical to the old
+     * one-call-per-table version — only the AI-call granularity underneath
+     * changed, so nothing downstream (job polling, the frontend) needed to change.
      *
      * <p>{@link TenantContext} is a plain {@code ThreadLocal} and does not
      * propagate across thread boundaries — every worker thread below sets and
      * clears it independently, not just the dispatching thread, or every DB
-     * call a table's analysis makes (schema describe, candidate lookup, the
-     * job-result write) would silently run against the wrong tenant schema.
+     * call a batch's analysis makes (schema describe, candidate lookup, the
+     * job-result writes) would silently run against the wrong tenant schema.
      */
     private void runAnalysisJob(String jobId, String tenantSchema, String connectionKey,
                                  String schemaName, String domainKey, List<String> tableNames) {
+        long analyzeStart = System.currentTimeMillis();
         TenantContext.set(tenantSchema);
         try {
             eventBus.publish(jobId, "job_started", Map.of("tablesTotal", tableNames.size()));
 
-            Semaphore laneLimit = new Semaphore(Math.max(1, tableConcurrencyPerJob));
-            List<CompletableFuture<Void>> futures = tableNames.stream()
-                    .map(tableName -> CompletableFuture.runAsync(() -> {
+            Semaphore laneLimit = new Semaphore(Math.max(1, batchConcurrency));
+            List<CompletableFuture<Void>> futures = partition(tableNames, Math.max(1, batchSize)).stream()
+                    .map(batch -> CompletableFuture.runAsync(() -> {
                         try {
                             laneLimit.acquire();
                         } catch (InterruptedException ie) {
@@ -536,13 +596,18 @@ public class OnboardingService {
                         }
                         TenantContext.set(tenantSchema);
                         try {
-                            eventBus.publish(jobId, "table_started", Map.of("table", tableName));
-                            Map<String, Object> result =
-                                    analyzeOneTable(connectionKey, schemaName, domainKey, tableName);
-                            jobRepository.updateTableResult(jobId, tableName, result);
-                            eventBus.publish(jobId,
-                                    result.containsKey("error") ? "table_failed" : "table_completed",
-                                    Map.of("table", tableName));
+                            for (String tableName : batch) {
+                                eventBus.publish(jobId, "table_started", Map.of("table", tableName));
+                            }
+                            Map<String, Map<String, Object>> results =
+                                    analyzeTableBatch(connectionKey, schemaName, domainKey, batch);
+                            for (String tableName : batch) {
+                                Map<String, Object> result = results.get(tableName);
+                                jobRepository.updateTableResult(jobId, tableName, result);
+                                eventBus.publish(jobId,
+                                        result.containsKey("error") ? "table_failed" : "table_completed",
+                                        Map.of("table", tableName));
+                            }
                         } finally {
                             TenantContext.clear();
                             laneLimit.release();
@@ -562,6 +627,8 @@ public class OnboardingService {
             eventBus.complete(jobId);
         } finally {
             TenantContext.clear();
+            log.info("onboarding.performance stage=analyze elapsedMs={}",
+                    System.currentTimeMillis() - analyzeStart);
         }
     }
 

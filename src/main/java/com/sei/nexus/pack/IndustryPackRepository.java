@@ -76,12 +76,21 @@ public class IndustryPackRepository {
 
     public void saveTenantPack(TenantPack tp) {
         String mappingJson = toJson(tp.entityMapping());
+        // Global Pack Foundation: connection_key is additive; ON CONFLICT stays keyed on
+        // pack_key alone (the existing, unchanged invariant — one row per pack per tenant
+        // schema) — this task does not change that upsert semantics, only adds the column.
+        // The separate partial unique index on (connection_key) WHERE status='ACTIVE'
+        // (V041) enforces the new "one active pack per connection" invariant independently.
         jdbc.update("""
                 INSERT INTO nexus_tenant_pack
-                    (pack_key, pack_version, display_name, status,
+                    (pack_key, connection_key, pack_version, display_name, status,
                      mapping_json, coverage_score, applied_at, applied_by)
-                VALUES (?,?,?,?,?::jsonb,?,NOW(),?)
+                VALUES (?,?,?,?,?,?::jsonb,?,NOW(),?)
                 ON CONFLICT (pack_key) DO UPDATE SET
+                    -- Same COALESCE discipline as group_label/primary_object_key elsewhere in
+                    -- this codebase: an update that omits connection_key must never silently
+                    -- erase one a prior call already set.
+                    connection_key = COALESCE(EXCLUDED.connection_key, nexus_tenant_pack.connection_key),
                     pack_version   = EXCLUDED.pack_version,
                     display_name   = EXCLUDED.display_name,
                     status         = EXCLUDED.status,
@@ -89,7 +98,7 @@ public class IndustryPackRepository {
                     coverage_score = EXCLUDED.coverage_score,
                     applied_by     = EXCLUDED.applied_by
                 """,
-                tp.packKey(), tp.packVersion(), tp.displayName(), tp.status(),
+                tp.packKey(), tp.connectionKey(), tp.packVersion(), tp.displayName(), tp.status(),
                 mappingJson, tp.coverageScore(), tp.appliedBy());
     }
 
@@ -99,14 +108,39 @@ public class IndustryPackRepository {
                 tenantPackMapper());
     }
 
+    /**
+     * Industry Pack Removal Lifecycle fix: this is applyPack's "already applied" guard — it
+     * MUST filter by {@code status = 'ACTIVE'}, exactly like {@link #findAppliedPacks()} and
+     * {@link #findActivePackForConnection(String)} already do. Before this fix it selected any
+     * row regardless of status, so once {@link #disableTenantPack(String)} set a row to
+     * {@code DISABLED} (the row survives — {@code nexus_tenant_pack} has {@code UNIQUE(pack_key)},
+     * so it is never deleted), this method still found it and re-applying the same pack to any
+     * connection kept failing with "already applied" forever. This was the exact, sole root
+     * cause — confirmed by tracing every caller ({@link IndustryPackService#applyPack} is the
+     * only one) and the SQL itself, not assumed.
+     */
     public Optional<TenantPack> findAppliedPack(String packKey) {
         List<TenantPack> rows = jdbc.query(
-                "SELECT * FROM nexus_tenant_pack WHERE pack_key = ?", tenantPackMapper(), packKey);
+                "SELECT * FROM nexus_tenant_pack WHERE pack_key = ? AND status = 'ACTIVE'",
+                tenantPackMapper(), packKey);
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }
 
     public void disableTenantPack(String packKey) {
         jdbc.update("UPDATE nexus_tenant_pack SET status = 'DISABLED' WHERE pack_key = ?", packKey);
+    }
+
+    /**
+     * Global Concept Resolution (Phase 1, read-only): the single ACTIVE pack assignment for
+     * one connection, if any — enforced at the database level by the partial unique index
+     * added alongside {@code connection_key} (V041), so at most one row can ever match.
+     * Purely additive; no existing caller uses this method.
+     */
+    public Optional<TenantPack> findActivePackForConnection(String connectionKey) {
+        List<TenantPack> rows = jdbc.query(
+                "SELECT * FROM nexus_tenant_pack WHERE connection_key = ? AND status = 'ACTIVE'",
+                tenantPackMapper(), connectionKey);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -125,6 +159,7 @@ public class IndustryPackRepository {
             Timestamp ts = rs.getTimestamp("applied_at");
             return new TenantPack(
                     rs.getString("pack_key"),
+                    rs.getString("connection_key"),
                     rs.getString("pack_version"),
                     rs.getString("display_name"),
                     rs.getString("status"),

@@ -31,7 +31,14 @@ public record IndustryPack(
         String                   icon,             // short display abbreviation e.g. "SN"
         String                   tagline,          // one-line pitch
         List<String>             whatYouCanAsk,    // example questions shown in the UI
-        PackAgentDefinition      agentDefinition   // pre-built agent created on apply
+        PackAgentDefinition      agentDefinition,  // pre-built agent created on apply
+        // Global Pack Foundation: the canonical Industry → Group → Global Business Concept
+        // hierarchy for this pack. Additive — null for every pack file authored before this
+        // change (Jackson binds a missing JSON property to null for a reference type); the
+        // flat `entities` field above remains fully populated and unchanged for every existing
+        // pack, and PackEntityMapper's matching logic still iterates `entities`, not `groups`.
+        // Nothing in this codebase consumes `groups` yet — see Global Pack Foundation task scope.
+        List<PackGroup>          groups
 ) {
     /** True when this pack is a system integration template rather than a generic industry pack. */
     public boolean isIntegration() {

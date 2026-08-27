@@ -7,6 +7,8 @@ import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.connection.ConnectionRepository;
+import com.sei.nexus.connection.NexusConnection;
+import com.sei.nexus.prompt.BusinessObjectAnalysisContract;
 import com.sei.nexus.sql.DynamicSqlService;
 import com.sei.nexus.sql.SqlSafetyService;
 import org.slf4j.Logger;
@@ -59,6 +61,10 @@ public class EnterpriseMapService {
     private final AzureOpenAiClient aiClient;
     private final ObjectMapper objectMapper;
     private final com.sei.nexus.semantic.EntityCandidateService entityCandidates;
+    // Multi-Table Analysis Hardening: the shared batched Business Object analysis mechanism,
+    // also used by OnboardingService.analyzeTableBatch() — neither service calls the other;
+    // both call this.
+    private final com.sei.nexus.prompt.BusinessObjectBatchAnalyzer batchAnalyzer;
 
     public EnterpriseMapService(EnterpriseMapRepository repository,
                                  ConnectionRepository connectionRepository,
@@ -66,7 +72,8 @@ public class EnterpriseMapService {
                                  SqlSafetyService sqlSafetyService,
                                  AzureOpenAiClient aiClient,
                                  ObjectMapper objectMapper,
-                                 com.sei.nexus.semantic.EntityCandidateService entityCandidates) {
+                                 com.sei.nexus.semantic.EntityCandidateService entityCandidates,
+                                 com.sei.nexus.prompt.BusinessObjectBatchAnalyzer batchAnalyzer) {
         this.repository = repository;
         this.connectionRepository = connectionRepository;
         this.dynamicSqlService = dynamicSqlService;
@@ -74,6 +81,7 @@ public class EnterpriseMapService {
         this.aiClient = aiClient;
         this.objectMapper = objectMapper;
         this.entityCandidates = entityCandidates;
+        this.batchAnalyzer = batchAnalyzer;
     }
 
     // -------------------------------------------------------------------------
@@ -82,18 +90,31 @@ public class EnterpriseMapService {
 
     @Transactional
     public DataObject createOrUpdateObject(Map<String, Object> request, String userEmail) {
+        String connectionKey = required(request, "connectionKey");
+        NexusConnection connection = resolveConnection(connectionKey);
+        return createOrUpdateObject(request, userEmail, connection);
+    }
+
+    /**
+     * Same as {@link #createOrUpdateObject(Map, String)}, but for a caller that has
+     * already resolved (and validated the existence of) the connection — e.g.
+     * {@code MetadataRegistrationService.register()}, which processes many entities
+     * against the identical {@code connectionKey} in one request and would otherwise
+     * re-fetch the same connection row twice per entity (once here, once again inside
+     * the allow-list check this method used to do independently). Behavior — including
+     * the allow-list check and every exception this method can throw — is identical
+     * to the single-arg overload; only the redundant re-fetch is removed.
+     */
+    @Transactional
+    public DataObject createOrUpdateObject(Map<String, Object> request, String userEmail,
+                                            NexusConnection connection) {
         String domainKey     = required(request, "domainKey");
         String connectionKey = required(request, "connectionKey");
         String schemaName    = required(request, "schemaName");
         String tableName     = required(request, "tableName");
 
-        // Validate connection exists
-        connectionRepository.findByKey(connectionKey)
-                .orElseThrow(() -> new NexusException(HttpStatus.BAD_REQUEST,
-                        "Connection not found: " + connectionKey));
-
         // Validate table is on connection allow-list
-        validateTableAllowed(connectionKey, schemaName, tableName);
+        validateTableAllowed(connection, schemaName, tableName);
 
         String objectKey = Keys.key(domainKey + "-" + connectionKey + "-" + tableName);
 
@@ -176,6 +197,15 @@ public class EnterpriseMapService {
     // Analyze tables for onboarding
     // -------------------------------------------------------------------------
 
+    // Multi-Table Analysis Hardening: same batch size Onboarding uses (shared config key —
+    // intentional; both flows now run the identical batched analysis mechanism and face the
+    // same rate-limit/workload considerations, so one shared value is correct, not two
+    // independently-tunable ones). Discover runs its batches sequentially, not concurrently —
+    // it stays synchronous (no job/SSE), and it typically covers far fewer tables per request
+    // than Onboarding, so added concurrency here isn't demonstrated to be needed (Step 5).
+    @org.springframework.beans.factory.annotation.Value("${nexus.onboarding.batch-size:4}")
+    private int discoverBatchSize = 4;
+
     public Map<String, Object> analyzeForOnboarding(Map<String, Object> request) {
         String domainKey     = required(request, "domainKey");
         String connectionKey = required(request, "connectionKey");
@@ -186,6 +216,13 @@ public class EnterpriseMapService {
         if (tableNames == null || tableNames.isEmpty()) {
             throw new NexusException(HttpStatus.BAD_REQUEST, "tableNames is required");
         }
+        // The backend is the authority on the selection limit — frontend UI enforcement is a
+        // UX convenience only and must never be the only guard.
+        if (tableNames.size() > BusinessObjectAnalysisContract.MAX_SELECTED_TABLES) {
+            throw new NexusException(HttpStatus.BAD_REQUEST,
+                    "Too many tables selected: " + tableNames.size() + " (maximum "
+                            + BusinessObjectAnalysisContract.MAX_SELECTED_TABLES + ")");
+        }
 
         connectionRepository.findByKey(connectionKey)
                 .orElseThrow(() -> new NexusException(HttpStatus.BAD_REQUEST,
@@ -193,62 +230,24 @@ public class EnterpriseMapService {
 
         List<Map<String, Object>> tableDrafts = new ArrayList<>();
 
-        for (String tableName : tableNames) {
-            try {
-                List<Map<String, Object>> schemaInfo = dynamicSqlService.describeTable(
-                        connectionKey, schemaName, tableName);
+        // Multi-Table Analysis Hardening: batched via the shared BusinessObjectBatchAnalyzer —
+        // previously one AI call PER table (N tables ⇒ N calls); now ceil(N/batchSize) calls,
+        // run sequentially (no concurrency — Discover stays synchronous, Step 5's "no
+        // uncontrolled parallel LLM calls").
+        for (int i = 0; i < tableNames.size(); i += Math.max(1, discoverBatchSize)) {
+            List<String> batch = tableNames.subList(i, Math.min(i + Math.max(1, discoverBatchSize), tableNames.size()));
+            Map<String, Map<String, Object>> analyzed =
+                    batchAnalyzer.analyzeBatch(connectionKey, schemaName, domainKey, batch);
 
-                String schemaText = buildSchemaText(schemaName, tableName, schemaInfo);
-
-                // PRO-22 tier 1/2: offer existing-entity candidates so the AI can
-                // reuse instead of minting a drifted duplicate. Zero prompt cost
-                // when no candidates exist (both blocks render empty).
-                var candidates = entityCandidates.retrieve(domainKey, tableName);
-
-                String systemPrompt = """
-                        You are an enterprise data analyst helping onboard a new data source to SEI Nexus.
-                        Analyze the table schema and provide a structured understanding of the data object.
-
-                        Respond with valid JSON only matching this structure:
-                        {
-                          "entityName": "...",
-                          "businessName": "...",
-                          "purpose": "...",
-                          "identifierColumns": ["..."],
-                          "statusColumns": ["..."],
-                          "exceptionColumns": ["..."],
-                          "safeFilterColumns": ["..."],
-                          "usageGuidance": "...",
-                          "filterGuidance": "...",
-                          "avoidGuidance": "...",
-                          "lifecycleStates": ["..."],
-                          "vocabularySuggestions": [{"term": "...", "definition": "..."}],
-                          "relationshipHints": ["..."],
-                          "readinessScore": 0.0
-                        }
-                        """ + entityCandidates.resolutionContract(candidates);
-
-                String userMessage = "Domain: " + domainKey + "\nTable schema:\n" + schemaText
-                        + entityCandidates.renderPromptBlock(candidates);
-                String analysisJson = aiClient.chatWithJson(
-                        List.of(ChatMessage.user(userMessage)), systemPrompt);
-
-                Map<String, Object> analysis = parseJson(analysisJson);
+            for (String tableName : batch) {
+                Map<String, Object> analysis = analyzed.get(tableName);
                 Map<String, Object> draft = new LinkedHashMap<>();
                 draft.put("tableName", tableName);
                 draft.put("schemaName", schemaName);
                 draft.put("connectionKey", connectionKey);
                 draft.put("domainKey", domainKey);
-                draft.put("columns", schemaInfo);
-                draft.putAll(analysis);
+                draft.putAll(analysis); // includes "columns" (from batchAnalyzer) and "error" on failure
                 tableDrafts.add(draft);
-
-            } catch (Exception e) {
-                log.warn("Failed to analyze table {}.{}: {}", schemaName, tableName, e.getMessage());
-                Map<String, Object> errorDraft = new LinkedHashMap<>();
-                errorDraft.put("tableName", tableName);
-                errorDraft.put("error", e.getMessage());
-                tableDrafts.add(errorDraft);
             }
         }
 
@@ -411,16 +410,49 @@ public class EnterpriseMapService {
     // Private helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Optimization A (onboarding performance investigation): if the caller's
+     * request already carries the exact raw shape {@link DynamicSqlService#describeTable}
+     * produces (a non-empty list of column maps), reuse it instead of describing
+     * the table again against the live source. Returns {@code null} — not an
+     * empty list — when nothing usable is present, so the caller can tell
+     * "reuse this" apart from "there is nothing to reuse" and fall back to the
+     * live describeTable() call exactly as before.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> precomputedColumns(Map<String, Object> request) {
+        Object raw = request.get("columns");
+        if (!(raw instanceof List<?> list) || list.isEmpty()) {
+            return null;
+        }
+        for (Object entry : list) {
+            if (!(entry instanceof Map)) {
+                // Not the shape describeTable() produces — don't guess, fall back live.
+                return null;
+            }
+        }
+        return (List<Map<String, Object>>) (List<?>) list;
+    }
+
     private List<DataColumn> scanAndSaveColumns(String objectKey, String connectionKey,
                                                  String schemaName, String tableName,
                                                  Map<String, Object> request,
                                                  boolean preserveOverrides) {
-        List<Map<String, Object>> schemaInfo;
-        try {
-            schemaInfo = dynamicSqlService.describeTable(connectionKey, schemaName, tableName);
-        } catch (Exception e) {
-            log.warn("Failed to describe table {}.{}: {}", schemaName, tableName, e.getMessage());
-            return List.of();
+        // Optimization A (onboarding performance investigation): the Analyze phase
+        // of onboarding already ran describeTable() for this exact table and the
+        // approved payload carries that result forward under "columns" — reuse it
+        // instead of describing the table a second time against the live source.
+        // Any other caller (a manual rescan, a request without this field) simply
+        // doesn't have "columns" in its request map and falls through to the
+        // original live describeTable() call unchanged.
+        List<Map<String, Object>> schemaInfo = precomputedColumns(request);
+        if (schemaInfo == null) {
+            try {
+                schemaInfo = dynamicSqlService.describeTable(connectionKey, schemaName, tableName);
+            } catch (Exception e) {
+                log.warn("Failed to describe table {}.{}: {}", schemaName, tableName, e.getMessage());
+                return List.of();
+            }
         }
 
         // Explicit column role overrides from request
@@ -732,24 +764,35 @@ public class EnterpriseMapService {
         }
     }
 
-    private void validateTableAllowed(String connectionKey, String schemaName, String tableName) {
-        connectionRepository.findByKey(connectionKey).ifPresent(conn -> {
-            String allowedTables = conn.allowedTables();
-            if (allowedTables != null && !allowedTables.isBlank()) {
-                String qualified = schemaName + "." + tableName;
-                boolean allowed = false;
-                for (String entry : allowedTables.split(",")) {
-                    if (entry.trim().equalsIgnoreCase(qualified) || entry.trim().equals("*")) {
-                        allowed = true;
-                        break;
-                    }
-                }
-                if (!allowed) {
-                    throw new NexusException(HttpStatus.FORBIDDEN,
-                            "Table " + qualified + " is not on the allow-list for connection " + connectionKey);
+    /**
+     * Resolves and validates a connection exists — the same check
+     * {@code createOrUpdateObject} always performed inline. Exposed so a caller
+     * processing many tables against one connection (e.g. the registration
+     * pipeline) can resolve it once and reuse it, instead of every downstream
+     * call re-fetching the identical row.
+     */
+    public NexusConnection resolveConnection(String connectionKey) {
+        return connectionRepository.findByKey(connectionKey)
+                .orElseThrow(() -> new NexusException(HttpStatus.BAD_REQUEST,
+                        "Connection not found: " + connectionKey));
+    }
+
+    private void validateTableAllowed(NexusConnection conn, String schemaName, String tableName) {
+        String allowedTables = conn.allowedTables();
+        if (allowedTables != null && !allowedTables.isBlank()) {
+            String qualified = schemaName + "." + tableName;
+            boolean allowed = false;
+            for (String entry : allowedTables.split(",")) {
+                if (entry.trim().equalsIgnoreCase(qualified) || entry.trim().equals("*")) {
+                    allowed = true;
+                    break;
                 }
             }
-        });
+            if (!allowed) {
+                throw new NexusException(HttpStatus.FORBIDDEN,
+                        "Table " + qualified + " is not on the allow-list for connection " + conn.connectionKey());
+            }
+        }
     }
 
     private String buildSchemaText(String schemaName, String tableName,
