@@ -12,5 +12,10 @@ public record ReasoningStep(
         String outcome,
         Double confidenceDelta,
         String executionKey,
-        Instant executedAt
+        Instant executedAt,
+        // Persisted so a step's actual SUFFICIENT/NEED_MORE_DATA/DEAD_END verdict and rationale
+        // are observable after the fact — the columns already existed in nexus_reasoning_step
+        // but were never populated by any writer.
+        String evaluatorDecision,
+        String evaluatorRationale
 ) {}

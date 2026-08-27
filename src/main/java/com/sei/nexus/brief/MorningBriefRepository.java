@@ -109,14 +109,15 @@ public class MorningBriefRepository {
         return (rs, i) -> new MorningBrief(
                 rs.getString("id"),
                 rs.getString("tenant_schema"),
-                rs.getDate("brief_date").toLocalDate(),
+                rs.getDate("brief_date") != null ? rs.getDate("brief_date").toLocalDate() : null,
                 rs.getString("status"),
                 rs.getString("headline"),
                 rs.getString("sections_json"),
                 toStringList(rs.getArray("agents_used")),
                 rs.getTimestamp("generated_at") != null
                         ? rs.getTimestamp("generated_at").toInstant() : null,
-                rs.getTimestamp("created_at").toInstant());
+                rs.getTimestamp("created_at") != null
+                        ? rs.getTimestamp("created_at").toInstant() : null);
     }
 
     private RowMapper<MorningBriefConfig> configMapper() {
@@ -127,7 +128,8 @@ public class MorningBriefRepository {
                 rs.getBoolean("enabled"),
                 rs.getString("email_to"),
                 toStringList(rs.getArray("brief_agent_ids")),
-                rs.getTimestamp("updated_at").toInstant());
+                rs.getTimestamp("updated_at") != null
+                        ? rs.getTimestamp("updated_at").toInstant() : null);
     }
 
     private List<String> toStringList(Array arr) {

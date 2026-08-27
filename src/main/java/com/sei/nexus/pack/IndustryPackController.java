@@ -67,31 +67,43 @@ public class IndustryPackController {
 
     /**
      * Dry-run: shows what would be created without making any changes.
-     * Body: { "domainKey": "..." } — optional, defaults to first available domain.
+     * Body: { "domainKey": "...", "connectionKey": "..." } — domainKey optional (defaults to
+     * first available domain); connectionKey optional. Connection-Scoped Industry Pack
+     * Assignment: when connectionKey is supplied, the preview is scoped to that connection's
+     * tables only — the same scope {@code /apply} itself uses. When omitted, preview remains
+     * domain-wide (backward compatible) — see {@link IndustryPackService#previewPack(String, String, String)}.
      */
     @PostMapping("/{packKey}/preview")
     public ResponseEntity<Map<String, Object>> previewPack(
             @PathVariable String packKey,
             @RequestBody(required = false) Map<String, Object> body) {
-        String domainKey = body != null ? (String) body.get("domainKey") : null;
-        PackPreview preview = packService.previewPack(packKey, domainKey);
+        String domainKey     = body != null ? (String) body.get("domainKey") : null;
+        String connectionKey = body != null ? (String) body.get("connectionKey") : null;
+        PackPreview preview = packService.previewPack(packKey, domainKey, connectionKey);
         return ResponseEntity.ok(toPreviewMap(preview));
     }
 
     /**
-     * Apply a pack to the current tenant.
-     * Body: { "domainKey": "..." } — required.
+     * Apply a pack to one connection.
+     * Body: { "domainKey": "...", "connectionKey": "..." } — both required. Connection-Scoped
+     * Industry Pack Assignment: {@code connectionKey} is now the scoping key for both which
+     * physical tables are considered and how the assignment is persisted — see
+     * {@link IndustryPackService#applyPack}.
      */
     @PostMapping("/{packKey}/apply")
     public ResponseEntity<Map<String, Object>> applyPack(
             @PathVariable String packKey,
             @RequestBody Map<String, Object> body) {
-        String userEmail  = currentUserEmail();
-        String domainKey  = body != null ? (String) body.get("domainKey") : null;
+        String userEmail     = currentUserEmail();
+        String domainKey     = body != null ? (String) body.get("domainKey") : null;
+        String connectionKey = body != null ? (String) body.get("connectionKey") : null;
         if (domainKey == null || domainKey.isBlank()) {
             throw new NexusException(HttpStatus.BAD_REQUEST, "domainKey is required");
         }
-        PackApplicationResult result = packService.applyPack(packKey, domainKey, userEmail);
+        if (connectionKey == null || connectionKey.isBlank()) {
+            throw new NexusException(HttpStatus.BAD_REQUEST, "connectionKey is required");
+        }
+        PackApplicationResult result = packService.applyPack(packKey, domainKey, connectionKey, userEmail);
         return ResponseEntity.status(HttpStatus.CREATED).body(toApplicationResultMap(result));
     }
 
@@ -148,6 +160,7 @@ public class IndustryPackController {
     private Map<String, Object> toTenantPackMap(TenantPack tp) {
         var m = new LinkedHashMap<String, Object>();
         m.put("pack_key",       tp.packKey());
+        m.put("connection_key", tp.connectionKey());
         m.put("pack_version",   tp.packVersion());
         m.put("display_name",   tp.displayName());
         m.put("status",         tp.status());
@@ -181,6 +194,8 @@ public class IndustryPackController {
         m.put("coverage_score",         r.coverageScore());
         m.put("entity_mapping",         r.entityMapping());
         m.put("entities_unmatched",     r.entitiesUnmatched());
+        m.put("entities_classified",    r.entitiesClassified());
+        m.put("entities_unresolved",    r.entitiesUnresolved());
         return m;
     }
 

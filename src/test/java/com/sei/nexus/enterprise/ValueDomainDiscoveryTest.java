@@ -71,10 +71,12 @@ class ValueDomainDiscoveryTest {
         Map<String, List<String>> distinctValues = Map.of();
         final List<String> probedColumns = new ArrayList<>();
         int enumCalls = 0;
+        int describeTableCalls = 0;
 
         FakeDynamicSql() { super(null); }
 
         @Override public List<Map<String, Object>> describeTable(String c, String s, String t) {
+            describeTableCalls++;
             return describeResult;
         }
         @Override public Map<String, List<String>> listEnumDomains(String c, String s) {
@@ -116,7 +118,7 @@ class ValueDomainDiscoveryTest {
         repository = new FakeRepository();
         dynamicSql = new FakeDynamicSql();
         service = new EnterpriseMapService(repository, new FakeConnectionRepository(),
-                dynamicSql, new SqlSafetyService(), null, new ObjectMapper(), null);
+                dynamicSql, new SqlSafetyService(), null, new ObjectMapper(), null, null);
     }
 
     // ── discovery ────────────────────────────────────────────────────────────
@@ -187,6 +189,81 @@ class ValueDomainDiscoveryTest {
         assertEquals("store_status", saved.udtName());
         assertEquals("vdom-old",     saved.valueDomainKey(),
                 "existing domain link must survive a scan that discovered nothing");
+    }
+
+    // ── Optimization A (onboarding performance investigation) ────────────────
+    // Apply reuses the schema Analyze already fetched instead of describing the
+    // table again against the live source.
+
+    @Test
+    void precomputedColumnsAreReusedWithoutCallingDescribeTableAgain() {
+        // describeResult deliberately left empty — if the live describeTable() path
+        // were hit, no columns would be scanned/saved at all, so this also proves
+        // the precomputed columns (not a fallback) are what actually got used.
+        List<Map<String, Object>> precomputed = List.of(
+                Map.of("column_name", "status", "data_type", "USER-DEFINED",
+                       "is_nullable", "NO", "udt_name", "store_status"),
+                Map.of("column_name", "store_name", "data_type", "character varying",
+                       "is_nullable", "NO", "udt_name", "varchar"));
+        dynamicSql.enumResult = Map.of("store_status",
+                List.of("open", "temporarily_closed", "seasonal", "under_construction", "closed"));
+
+        service.createOrUpdateObject(new java.util.HashMap<>(Map.of(
+                "domainKey", "PLATFORM", "connectionKey", "conn-1",
+                "schemaName", "retail_core", "tableName", "stores",
+                "columns", precomputed)), "user@x.com");
+
+        assertEquals(0, dynamicSql.describeTableCalls,
+                "the Analyze phase already fetched this table's schema — Apply must not re-describe it");
+        assertEquals(2, repository.savedColumns.size(), "both precomputed columns were scanned/saved");
+        DataColumn statusCol = repository.savedColumns.stream()
+                .filter(c -> c.columnName().equals("status")).findFirst().orElseThrow();
+        assertEquals("store_status", statusCol.udtName());
+        assertEquals("vdom-123", statusCol.valueDomainKey(),
+                "value-domain discovery still runs normally over the reused columns");
+    }
+
+    @Test
+    void absentColumnsFallBackToLiveDescribeTable() {
+        // No "columns" in the request (e.g. Discover-from-DB, or an old caller) —
+        // must behave exactly as before: a live describeTable() call.
+        dynamicSql.describeResult = List.of(textCol("city"));
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin", "Dallas"));
+
+        service.createOrUpdateObject(new java.util.HashMap<>(Map.of(
+                "domainKey", "PLATFORM", "connectionKey", "conn-1",
+                "schemaName", "retail_core", "tableName", "stores",
+                "safeFilterColumns", "city")), "user@x.com");
+
+        assertEquals(1, dynamicSql.describeTableCalls);
+        assertEquals(1, repository.savedColumns.size());
+    }
+
+    @Test
+    void emptyColumnsListAlsoFallsBackToLiveDescribeTable() {
+        // An empty "columns" list is treated the same as absent — never mistaken
+        // for "the table genuinely has zero columns".
+        dynamicSql.describeResult = List.of(textCol("city"));
+
+        service.createOrUpdateObject(new java.util.HashMap<>(Map.of(
+                "domainKey", "PLATFORM", "connectionKey", "conn-1",
+                "schemaName", "retail_core", "tableName", "stores",
+                "columns", List.of())), "user@x.com");
+
+        assertEquals(1, dynamicSql.describeTableCalls);
+    }
+
+    @Test
+    void rescanAlwaysFetchesFreshSchemaEvenThoughCreateOrUpdatePrefersPrecomputed() {
+        // scanObject() (manual rescan) always passes Map.of() for request — it must
+        // keep re-describing the table fresh, never silently reusing stale data.
+        repository.object = storesObject();
+        dynamicSql.describeResult = List.of(textCol("city"));
+        dynamicSql.distinctValues = Map.of("city", List.of("Austin"));
+
+        service.scanObject(OBJ_KEY);
+
+        assertEquals(1, dynamicSql.describeTableCalls, "rescan must always hit the live source");
     }
 
     // ── OBSERVED value-domain discovery (PRO-24) ─────────────────────────────

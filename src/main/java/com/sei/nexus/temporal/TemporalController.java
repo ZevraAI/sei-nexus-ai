@@ -14,14 +14,11 @@ public class TemporalController {
 
     private final TemporalRepository temporalRepository;
     private final BaselineService baselineService;
-    private final AnomalyDetector anomalyDetector;
 
     public TemporalController(TemporalRepository temporalRepository,
-                               BaselineService baselineService,
-                               AnomalyDetector anomalyDetector) {
+                               BaselineService baselineService) {
         this.temporalRepository = temporalRepository;
         this.baselineService = baselineService;
-        this.anomalyDetector = anomalyDetector;
     }
 
     /** GET /temporal/baselines?domainKey= */
@@ -46,16 +43,21 @@ public class TemporalController {
         OperationalBaseline baseline = temporalRepository.findBaselineByKey(baselineKey)
                 .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
                         "Baseline not found: " + baselineKey));
-        anomalyDetector.checkBaseline(baseline);
+        baselineService.refreshBaseline(baseline);
         return ResponseEntity.ok(Map.of("baseline_key", baselineKey, "status", "refreshed"));
     }
 
     /** GET /temporal/anomalies?domainKey=&status= */
     @GetMapping("/anomalies")
     public ResponseEntity<List<AnomalyEvent>> listAnomalies(
-            @RequestParam String domainKey,
-            @RequestParam(defaultValue = "OPEN") String status) {
-        return ResponseEntity.ok(temporalRepository.findAnomaliesByDomain(domainKey, status));
+            @RequestParam(required = false) String domainKey,
+            @RequestParam(required = false) String status) {
+        if (domainKey == null || domainKey.isBlank()) {
+            // Homepage call: recent anomalies across every domain; null status → all statuses.
+            return ResponseEntity.ok(temporalRepository.findRecentAnomaliesAllDomains(status, 50));
+        }
+        String s = (status == null || status.isBlank()) ? "OPEN" : status;
+        return ResponseEntity.ok(temporalRepository.findAnomaliesByDomain(domainKey, s));
     }
 
     /** GET /temporal/anomalies/{anomalyKey} */

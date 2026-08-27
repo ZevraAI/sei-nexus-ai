@@ -15,32 +15,56 @@ import java.util.Optional;
 @Repository
 public class SemanticRepository {
 
+    // Foundation Fix #2: primary_object_key uses COALESCE on conflict, not a
+    // bare EXCLUDED overwrite. A partial update (e.g. the Semantic Layer
+    // entity-edit form, which has no primary_object_key field) omits the key
+    // from its request body, so SemanticService.createOrUpdateEntity passes
+    // null through here. Without the COALESCE, that null would silently wipe
+    // out a previously-correct binding on every such save — this is the exact
+    // corruption traced on the "region" entity in a real tenant. There is no
+    // code path anywhere that relies on omitted-primaryObjectKey meaning
+    // "explicitly unbind" (verified by search before this change), so
+    // preserving the existing value on omission is safe.
     private static final String UPSERT_ENTITY = """
             INSERT INTO nexus_business_entity
                 (entity_key, domain_key, entity_name, description, primary_object_key,
-                 operational_meaning, investigation_hints, status, created_by, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                 entity_type, group_label, pack_key, concept_key)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (entity_key) DO UPDATE SET
                 domain_key           = EXCLUDED.domain_key,
                 entity_name          = EXCLUDED.entity_name,
                 description          = EXCLUDED.description,
-                primary_object_key   = EXCLUDED.primary_object_key,
+                primary_object_key   = COALESCE(EXCLUDED.primary_object_key, nexus_business_entity.primary_object_key),
                 operational_meaning  = EXCLUDED.operational_meaning,
                 investigation_hints  = EXCLUDED.investigation_hints,
                 status               = EXCLUDED.status,
-                updated_at           = NOW()
+                updated_at           = NOW(),
+                entity_type          = EXCLUDED.entity_type,
+                -- Grouping Foundation Fix: same COALESCE discipline as primary_object_key
+                -- above (Foundation Fix #2) — a partial update that omits the analyzed
+                -- category (e.g. a manual Semantic Layer edit with no group field) must
+                -- never silently erase a group_label an onboarding analysis already set.
+                group_label          = COALESCE(EXCLUDED.group_label, nexus_business_entity.group_label),
+                -- Global Pack Foundation: identical COALESCE discipline — nothing in this
+                -- codebase populates these yet (no automatic mapping in this task), but an
+                -- omitted value must never erase a reference a future mapping step set.
+                pack_key             = COALESCE(EXCLUDED.pack_key, nexus_business_entity.pack_key),
+                concept_key          = COALESCE(EXCLUDED.concept_key, nexus_business_entity.concept_key)
             """;
 
     private static final String FIND_ENTITY_BY_KEY = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type, group_label, pack_key, concept_key
               FROM nexus_business_entity
              WHERE entity_key = ?
             """;
 
     private static final String FIND_ENTITIES_BY_DOMAIN = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type, group_label, pack_key, concept_key
               FROM nexus_business_entity
              WHERE domain_key = ? AND status != 'ARCHIVED'
              ORDER BY entity_name
@@ -51,7 +75,8 @@ public class SemanticRepository {
     // curated concept; later rows are the drift duplicates.
     private static final String FIND_ACTIVE_BY_PRIMARY_OBJECT = """
             SELECT entity_key, domain_key, entity_name, description, primary_object_key,
-                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type, group_label, pack_key, concept_key
               FROM nexus_business_entity
              WHERE primary_object_key = ? AND status = 'ACTIVE'
              ORDER BY created_at ASC
@@ -80,6 +105,62 @@ public class SemanticRepository {
     private static final String ARCHIVE_ENTITY = """
             UPDATE nexus_business_entity SET status = 'ARCHIVED', updated_at = NOW()
              WHERE entity_key = ?
+            """;
+
+    // Fix Remove Pack State + Pack Vocabulary Duplication: clears ONLY the Pack-specific
+    // semantic association (pack_key, concept_key) — every other column, including status,
+    // is untouched, so the Business Entity itself is never archived/deleted by Remove Pack.
+    // Connection-scoped via the existing primary_object_key -> nexus_data_object.connection_key
+    // relationship (no new connection-mapping column) — combined with the pack_key match, this
+    // can only ever touch entities that are BOTH bound to this connection's own physical objects
+    // AND currently associated with the pack being removed, never a sibling connection's rows.
+    private static final String CLEAR_PACK_ASSOCIATION_FOR_CONNECTION = """
+            UPDATE nexus_business_entity
+               SET pack_key = NULL, concept_key = NULL, updated_at = NOW()
+             WHERE pack_key = ?
+               AND primary_object_key IN (
+                   SELECT object_key FROM nexus_data_object WHERE connection_key = ?
+               )
+            """;
+
+    // Make Apply Pack Perform LLM Concept Classification: status-only-style update touching
+    // ONLY concept_key — never entity_name/description/etc. (unlike UPSERT_ENTITY, this never
+    // risks clobbering unrelated fields with a partial body). Deliberately allows writing NULL:
+    // an object the LLM genuinely could not resolve against this pack must be able to clear a
+    // stale concept_key from a previous classification pass, not silently keep it.
+    private static final String SET_CONCEPT_KEY = """
+            UPDATE nexus_business_entity SET concept_key = ?, updated_at = NOW()
+             WHERE entity_key = ?
+            """;
+
+    // Fix Apply Pack Association Regression: the counterpart of
+    // CLEAR_PACK_ASSOCIATION_FOR_CONNECTION above — sets ONLY pack_key on every EXISTING Business
+    // Entity bound to this connection's physical objects. Never touches concept_key (that remains
+    // exclusively the LLM's, via BusinessObjectBatchAnalyzer/MetadataRegistrationService), never
+    // creates a row (a plain UPDATE cannot match a nonexistent one), and never touches entity_key,
+    // primary_object_key, status, or any other business metadata.
+    private static final String ASSOCIATE_PACK_KEY_FOR_CONNECTION = """
+            UPDATE nexus_business_entity
+               SET pack_key = ?, updated_at = NOW()
+             WHERE primary_object_key IN (
+                   SELECT object_key FROM nexus_data_object WHERE connection_key = ?
+               )
+            """;
+
+    private static final String FIND_TERM_BY_KEY = """
+            SELECT term_key, domain_key, entity_key, term, definition, sql_equivalent,
+                   examples, status, created_at, updated_at
+              FROM nexus_operational_vocabulary
+             WHERE term_key = ?
+            """;
+
+    // Industry Pack Removal Lifecycle: status-only, exactly like ARCHIVE_ENTITY above — touches
+    // no other column, so it can never corrupt a term's domain_key/definition/etc. the way a
+    // full UPSERT_TERM re-submission would if the caller didn't have every original field on
+    // hand (Remove Pack does not).
+    private static final String DEACTIVATE_TERM = """
+            UPDATE nexus_operational_vocabulary SET status = 'INACTIVE', updated_at = NOW()
+             WHERE term_key = ?
             """;
 
     private static final String INSERT_LIFECYCLE_STATE = """
@@ -196,7 +277,8 @@ public class SemanticRepository {
             e.entityKey(), e.domainKey(), e.entityName(), e.description(), e.primaryObjectKey(),
             e.operationalMeaning(), e.investigationHints(), e.status(), e.createdBy(),
             toTimestamp(e.createdAt() != null ? e.createdAt() : Instant.now()),
-            toTimestamp(e.updatedAt() != null ? e.updatedAt() : Instant.now()));
+            toTimestamp(e.updatedAt() != null ? e.updatedAt() : Instant.now()),
+            e.entityType(), e.groupLabel(), e.packKey(), e.conceptKey());
     }
 
     public Optional<BusinessEntity> findEntityByKey(String key) {
@@ -212,6 +294,16 @@ public class SemanticRepository {
     public Optional<BusinessEntity> findActiveByPrimaryObjectKey(String objectKey) {
         List<BusinessEntity> rows = jdbc.query(FIND_ACTIVE_BY_PRIMARY_OBJECT, entityMapper(), objectKey);
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    /**
+     * Make Apply Pack Perform LLM Concept Classification: persists the LLM's own validated
+     * {@code conceptResolution} decision (from {@code BusinessObjectBatchAnalyzer}) onto an
+     * EXISTING entity — {@code conceptKey} may be {@code null} (the LLM found no confident
+     * match). Never touches any other column.
+     */
+    public void setConceptKey(String entityKey, String conceptKey) {
+        jdbc.update(SET_CONCEPT_KEY, conceptKey, entityKey);
     }
 
     /** A tier-1 selection candidate: identity + name + physical grounding, nothing more. */
@@ -241,6 +333,76 @@ public class SemanticRepository {
 
     public void archiveEntity(String entityKey) {
         jdbc.update(ARCHIVE_ENTITY, entityKey);
+    }
+
+    /**
+     * Fix Remove Pack State + Pack Vocabulary Duplication: clears {@code pack_key}/{@code
+     * concept_key} — nothing else — on every Business Entity that is (a) currently associated
+     * with {@code packKey} AND (b) bound (via {@code primary_object_key}) to a physical object
+     * belonging to {@code connectionKey}. Returns the number of rows affected. The entity row
+     * itself, its status, and every other field are untouched — this is not an archive/delete.
+     */
+    public int clearPackAssociationForConnection(String packKey, String connectionKey) {
+        return jdbc.update(CLEAR_PACK_ASSOCIATION_FOR_CONNECTION, packKey, connectionKey);
+    }
+
+    /**
+     * Fix Apply Pack Association Regression: stamps {@code pack_key} — and only {@code
+     * pack_key} — onto every EXISTING Business Entity bound to {@code connectionKey}'s physical
+     * objects. Returns the number of rows affected. Creates nothing; a table with no Business
+     * Entity yet is simply not matched by the WHERE clause and is left for Discover/Onboarding
+     * to register later, at which point {@code MetadataRegistrationService} picks up the same
+     * active pack independently.
+     */
+    public int associatePackKeyForConnection(String packKey, String connectionKey) {
+        return jdbc.update(ASSOCIATE_PACK_KEY_FOR_CONNECTION, packKey, connectionKey);
+    }
+
+    // Concept-Scoped Metadata Narrowing (upstream Agent Brain context reduction): the Stage 1
+    // "tenant concept catalog" candidate set — every DISTINCT, non-null concept_key already
+    // assigned (by the LLM, via Apply Pack classification or Discover/Onboarding — never by
+    // this query) to an ACTIVE Business Entity bound to this connection's physical objects.
+    // Reuses the exact same primary_object_key -> nexus_data_object.connection_key join already
+    // established by CLEAR_PACK_ASSOCIATION_FOR_CONNECTION/ASSOCIATE_PACK_KEY_FOR_CONNECTION —
+    // no new relationship, no new column. concept_key IS NOT NULL excludes entities the LLM has
+    // never classified (or classified as "no confident match") — they are simply not yet part of
+    // any tenant concept catalog, never guessed at here.
+    private static final String FIND_DISTINCT_CONCEPT_KEYS_FOR_CONNECTION = """
+            SELECT DISTINCT concept_key
+              FROM nexus_business_entity
+             WHERE status = 'ACTIVE'
+               AND concept_key IS NOT NULL
+               AND primary_object_key IN (
+                   SELECT object_key FROM nexus_data_object WHERE connection_key = ?
+               )
+             ORDER BY concept_key
+            """;
+
+    public List<String> findDistinctConceptKeysForConnection(String connectionKey) {
+        return jdbc.queryForList(FIND_DISTINCT_CONCEPT_KEYS_FOR_CONNECTION, String.class, connectionKey);
+    }
+
+    // Concept-Scoped Metadata Narrowing, Stage 2: the physical Business Entities bound to this
+    // connection whose concept_key is one of the LLM's already-validated Stage 1 selections (see
+    // BusinessObjectBatchAnalyzer#applyConceptResolution for the identical acceptance-boundary
+    // discipline this selection was validated under before ever reaching this query). Purely a
+    // retrieval — this method makes no relevance/ranking decision; it returns EVERY matching
+    // entity (a concept may legitimately bind to more than one physical object, e.g. two separate
+    // "sales-transaction" tables), never picks one arbitrarily.
+    public List<BusinessEntity> findEntitiesByConnectionAndConcepts(String connectionKey, List<String> conceptKeys) {
+        if (conceptKeys == null || conceptKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < conceptKeys.size(); i++) placeholders.append(i == 0 ? "?" : ", ?");
+        String sql = "SELECT entity_key, domain_key, entity_name, description, primary_object_key, "
+                + "operational_meaning, investigation_hints, status, created_by, created_at, updated_at, "
+                + "entity_type, group_label, pack_key, concept_key "
+                + "FROM nexus_business_entity "
+                + "WHERE status = 'ACTIVE' AND concept_key IN (" + placeholders + ") "
+                + "AND primary_object_key IN (SELECT object_key FROM nexus_data_object WHERE connection_key = ?) "
+                + "ORDER BY entity_name";
+        List<Object> params = new ArrayList<>(conceptKeys);
+        params.add(connectionKey);
+        return jdbc.query(sql, entityMapper(), params.toArray());
     }
 
     // -------------------------------------------------------------------------
@@ -288,6 +450,21 @@ public class SemanticRepository {
 
     public List<OperationalVocabulary> findTermsByDomain(String domainKey) {
         return jdbc.query(FIND_TERMS_BY_DOMAIN, termMapper(), domainKey);
+    }
+
+    /** Fix Remove Pack State + Pack Vocabulary Duplication: lookup used to make Apply Pack's
+     *  idempotent reuse/reactivation of existing Pack vocabulary explicit and observable (rather
+     *  than relying solely on the UPSERT's ON CONFLICT to be silently correct). */
+    public Optional<OperationalVocabulary> findTermByKey(String termKey) {
+        List<OperationalVocabulary> rows = jdbc.query(FIND_TERM_BY_KEY, termMapper(), termKey);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    /** Industry Pack Removal Lifecycle: status-only update, mirroring {@link #archiveEntity}
+     *  exactly — a no-op if {@code termKey} does not exist, which callers that only ever compute
+     *  a deterministic key (never look the row up first) rely on. */
+    public void deactivateTerm(String termKey) {
+        jdbc.update(DEACTIVATE_TERM, termKey);
     }
 
     public List<OperationalVocabulary> findTermsByEntity(String entityKey) {
@@ -407,7 +584,11 @@ public class SemanticRepository {
             rs.getString("status"),
             rs.getString("created_by"),
             toInstant(rs, "created_at"),
-            toInstant(rs, "updated_at"));
+            toInstant(rs, "updated_at"),
+            rs.getString("entity_type"),
+            rs.getString("group_label"),
+            rs.getString("pack_key"),
+            rs.getString("concept_key"));
     }
 
     private RowMapper<EntityLifecycleState> lifecycleMapper() {

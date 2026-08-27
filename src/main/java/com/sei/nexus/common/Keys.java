@@ -18,12 +18,15 @@ public final class Keys {
 
     /**
      * Generates a unique key from a base string by appending an 8-character random hex suffix.
+     *
+     * <p>Sourced from {@link UUID#randomUUID()} (same entropy source as {@link #runKey()}/
+     * {@link #conversationKey()}) — not {@code System.currentTimeMillis()} + {@code Math.random()}
+     * as this previously was, which collided in practice under rapid same-millisecond calls
+     * (observed directly in a test that fires several {@code uniqueKey(...)} calls back to back).
      */
     public static String uniqueKey(String base) {
         String k = key(base);
-        String suffix = Long.toHexString(System.currentTimeMillis()).substring(4)
-                + Integer.toHexString((int) (Math.random() * 0xFFFF));
-        return k + "-" + suffix.substring(0, Math.min(8, suffix.length()));
+        return k + "-" + uniqueSuffix().substring(0, 8);
     }
 
     /**

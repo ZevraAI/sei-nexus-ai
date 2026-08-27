@@ -17,11 +17,12 @@ import java.util.Map;
  *
  * <p>Flow:
  * <pre>
- *   GET  /onboarding/status    — check current step (wizard decides which screen to show)
- *   POST /onboarding/scan      — list tables from a connected database
- *   POST /onboarding/analyze   — AI analysis of selected tables
- *   POST /onboarding/apply     — bulk-save approved entities + vocabulary
- *   POST /onboarding/complete  — mark onboarding done, return suggested questions
+ *   GET  /onboarding/status              — check current step (wizard decides which screen to show)
+ *   POST /onboarding/scan                — list tables from a connected database
+ *   POST /onboarding/analyze             — starts an async AI-analysis job, returns jobId immediately
+ *   GET  /onboarding/analyze/{jobId}     — poll job status/results (also see OnboardingJobStreamController for SSE)
+ *   POST /onboarding/apply               — bulk-save approved entities + vocabulary
+ *   POST /onboarding/complete            — mark onboarding done, return suggested questions
  * </pre>
  */
 @RestController
@@ -113,8 +114,10 @@ public class OnboardingController {
 
     /**
      * POST /onboarding/analyze
-     * AI-analyzes selected tables and returns entity / vocabulary suggestions
-     * plus 3 suggested first questions per table.
+     * Starts an async analysis job for the selected tables and returns
+     * immediately — the wizard reattaches for progress/results via
+     * {@code GET /onboarding/analyze/{jobId}} and/or
+     * {@code GET /onboarding/analyze/{jobId}/stream} (SSE).
      *
      * <pre>
      * Request:
@@ -124,7 +127,7 @@ public class OnboardingController {
      *   "domainKey":     "PLATFORM",
      *   "tableNames":    ["orders", "customers", "products"]
      * }
-     * Response: { "tables": [...] }
+     * Response (202 Accepted): { "jobId": "onbjob-...", "status": "RUNNING", "tablesTotal": 3 }
      * </pre>
      */
     @PostMapping("/analyze")
@@ -140,10 +143,31 @@ public class OnboardingController {
                     "tableNames is required and must not be empty");
         }
 
-        List<Map<String, Object>> tables =
-                onboardingService.analyzeTables(connectionKey, schemaName, domainKey, tableNames);
+        String jobId = onboardingService.startAnalysisJob(connectionKey, schemaName, domainKey, tableNames);
+        OnboardingAnalysisJob job = onboardingService.getJob(jobId)
+                .orElseThrow(() -> new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Analysis job '" + jobId + "' was not persisted"));
 
-        return ResponseEntity.ok(Map.of("tables", tables));
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "jobId", jobId, "status", job.status(), "tablesTotal", job.tablesTotal()));
+    }
+
+    /**
+     * GET /onboarding/analyze/{jobId}
+     * Poll/reattach: current job status plus every table result written so far.
+     * Used both for polling and to seed state on page-refresh/reattach, before
+     * (or instead of) the SSE stream at {@code .../stream}.
+     *
+     * <pre>
+     * Response: { "jobId":..., "status":"RUNNING|COMPLETE|FAILED", "tablesDone":2,
+     *             "tablesTotal":3, "tables": [ ...same per-table shape as before... ] }
+     * </pre>
+     */
+    @GetMapping("/analyze/{jobId}")
+    public ResponseEntity<Map<String, Object>> analyzeStatus(@PathVariable String jobId) {
+        return onboardingService.getJobView(jobId)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     /**

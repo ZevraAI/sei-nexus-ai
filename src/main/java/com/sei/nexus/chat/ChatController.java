@@ -69,6 +69,11 @@ public class ChatController {
         String userEmail = currentUserEmail();
         String rating = (String) body.get("rating");
         String comment = (String) body.getOrDefault("comment", "");
+        // Business Concept Transparency: "Improve Zevra" feedback is scoped to a specific
+        // resolved concept rather than the whole answer — both optional, additive, and
+        // ignored by every existing caller that doesn't send them.
+        String concept  = (String) body.get("concept");
+        String category = (String) body.get("category");
 
         if (rating == null || rating.isBlank()) {
             throw new NexusException(HttpStatus.BAD_REQUEST, "rating is required");
@@ -82,8 +87,16 @@ public class ChatController {
 
         // Save evidence
         String evidenceKey = Keys.uniqueKey("ev");
-        runRepository.saveEvidence(evidenceKey, runKey, "FEEDBACK",
-                "{\"rating\":\"" + rating + "\",\"comment\":" + jsonString(comment) + "}");
+        StringBuilder evidenceJson = new StringBuilder()
+                .append("{\"rating\":\"").append(rating).append("\",\"comment\":").append(jsonString(comment));
+        if (concept != null && !concept.isBlank()) {
+            evidenceJson.append(",\"concept\":").append(jsonString(concept));
+        }
+        if (category != null && !category.isBlank()) {
+            evidenceJson.append(",\"category\":").append(jsonString(category));
+        }
+        evidenceJson.append("}");
+        runRepository.saveEvidence(evidenceKey, runKey, "FEEDBACK", evidenceJson.toString());
 
         // Positive feedback → reinforce any learned term mappings applied to this run
         if ("POSITIVE".equalsIgnoreCase(rating) || "THUMBS_UP".equalsIgnoreCase(rating)

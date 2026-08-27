@@ -29,8 +29,10 @@ class AgentBrainTest {
     static class FakeAssembler extends EnterpriseSemanticAssembler {
         final SemanticModel model;          // returned for the connection primitive
         SemanticModel domainModel;          // returned for the domain primitive, when set
+        SemanticModel objectKeysModel;      // returned for the concept-scoped primitive, when set
         List<String> seenKeys;
         List<String> seenDomainKeys;
+        List<String> seenObjectKeys;
         FakeAssembler(SemanticModel model) { super(null); this.model = model; }
         @Override public SemanticModel assemble(List<String> connectionKeys) {
             this.seenKeys = connectionKeys; return model;
@@ -38,6 +40,25 @@ class AgentBrainTest {
         @Override public SemanticModel assembleByDomains(List<String> domainKeys) {
             this.seenDomainKeys = domainKeys;
             return domainModel != null ? domainModel : model;
+        }
+        @Override public SemanticModel assembleByObjectKeys(List<String> objectKeys) {
+            this.seenObjectKeys = objectKeys;
+            return objectKeysModel != null ? objectKeysModel : model;
+        }
+    }
+
+    /** A fake concept resolver — scripts Stage 1/2's combined result directly, so AgentBrain's
+     *  own wiring (not the resolver's internals, covered by {@code
+     *  ConceptScopedMetadataResolverTest}) is what's under test here. */
+    static class FakeConceptResolver extends ConceptScopedMetadataResolver {
+        Map<String, java.util.Optional<List<String>>> resultByConnection = new java.util.HashMap<>();
+        List<String> seenConnectionKeys = new java.util.ArrayList<>();
+        String seenQuestion;
+        FakeConceptResolver() { super(null, null, null, null); }
+        @Override public java.util.Optional<List<String>> resolveObjectKeys(String connectionKey, String question) {
+            seenConnectionKeys.add(connectionKey);
+            seenQuestion = question;
+            return resultByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
         }
     }
 
@@ -275,6 +296,99 @@ class AgentBrainTest {
 
         assertEquals(List.of("conn-1"), assembler.seenKeys, "agents resolve by connection");
         assertNull(assembler.seenDomainKeys, "the domain primitive is never used for agents");
+        assertEquals(2, model.objects().size());
+    }
+
+    // ── Concept-Scoped Metadata Narrowing — AgentBrain wiring ────────────────────
+    // (Stage 1/2 mechanism itself is covered by ConceptScopedMetadataResolverTest; these prove
+    // AgentBrain's integration: it uses the resolver's result when present, falls back to the
+    // existing full assembly when absent, and the resulting SemanticModel/ResolvedBusinessModel
+    // reaches the caller through the exact same, unmodified downstream shape as before.)
+
+    // Item 15 — existing downstream flow receives the Stage 2 metadata exactly as before: the
+    // narrowed SemanticModel flows into ResolvedBusinessModel via the same fields/types any other
+    // assembly path already uses — no new downstream type, no reshaping.
+    @Test
+    void conceptScopedNarrowingFeedsTheSameResolvedBusinessModelShapeAsTheFullAssembly() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects()); // full-assembly fallback model
+        SemanticModel narrowed = new SemanticModel(
+                List.of(new BusinessObject("obj-inv", "Inventory", "",
+                        List.of(new BusinessAttribute("c-inv", "OnHandQty", AttributeRole.MEASURE)), List.of())),
+                Map.of("obj-inv", new PhysicalTable("conn-1", "public", "inventory_balances")),
+                Map.of("c-inv", new PhysicalColumn("conn-1", "public", "inventory_balances", "on_hand_qty")));
+        assembler.objectKeysModel = narrowed;
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how much stock do we have?");
+
+        assertEquals(List.of("obj-inv"), assembler.seenObjectKeys,
+                "AgentBrain must hand the resolver's selected object keys to the assembler's targeted primitive");
+        assertEquals(1, model.objects().size());
+        assertEquals("Inventory", model.objects().get(0).businessName());
+        assertEquals("inventory_balances", model.objectTargets().get("obj-inv").table());
+        assertEquals("on_hand_qty", model.attributeTargets().get("c-inv").column());
+        assertNull(assembler.seenKeys, "the full-assembly primitive must never be called once narrowing applies");
+    }
+
+    @Test
+    void conceptResolverReceivingTheQuestionMatchesWhatTheCallerAsked() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of()));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        brain.resolve(agent(List.of("conn-1")), "which stores are below reorder point");
+
+        assertEquals(List.of("conn-1"), conceptResolver.seenConnectionKeys);
+        assertEquals("which stores are below reorder point", conceptResolver.seenQuestion,
+                "AgentBrain must pass the real question through unmodified — it never rewrites or interprets it itself");
+    }
+
+    /** The LLM legitimately selecting zero concepts must yield an honest empty result, not a
+     *  fallback to the full unnarrowed surface — that would defeat the whole point of narrowing. */
+    @Test
+    void zeroSelectedConceptsYieldsAnEmptyModelRatherThanFallingBackToFullAssembly() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of()));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "what is the weather today?");
+
+        assertTrue(model.objects().isEmpty());
+        assertNull(assembler.seenKeys, "zero relevant concepts must not trigger the full-assembly fallback");
+        assertNull(assembler.seenObjectKeys, "assembleByObjectKeys need not even be called for an empty selection");
+    }
+
+    /** No active pack / no tenant concept catalog for this connection ⇒ Stage 1 does not apply ⇒
+     *  AgentBrain must fall back to exactly the pre-existing full assembly, unchanged. */
+    @Test
+    void noConceptResolverResultFallsBackToTheExistingFullAssembly() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // no entry for conn-1 ⇒ Optional.empty()
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how many orders");
+
+        assertEquals(List.of("conn-1"), assembler.seenKeys, "must fall back to the full connection-scoped assembly");
+        assertEquals(2, model.objects().size());
+        assertNull(assembler.seenObjectKeys, "the targeted primitive must never be called on fallback");
+    }
+
+    /** Every pre-existing test in this file constructs AgentBrain via the 2-arg constructor —
+     *  proving the feature is a complete no-op (byte-identical to before it existed) when no
+     *  concept resolver is wired at all, exactly like every other collaborator added this way in
+     *  this codebase (EnterpriseSemanticAssembler, BusinessObjectBatchAnalyzer). */
+    @Test
+    void twoArgConstructorNeverAttemptsConceptScopedNarrowing() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver()); // 2-arg — no conceptResolver
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how many orders");
+
+        assertEquals(List.of("conn-1"), assembler.seenKeys);
         assertEquals(2, model.objects().size());
     }
 }

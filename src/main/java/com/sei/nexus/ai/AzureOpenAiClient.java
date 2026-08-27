@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.usage.UsageService;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -13,10 +14,15 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class AzureOpenAiClient {
@@ -43,12 +49,45 @@ public class AzureOpenAiClient {
     @Value("${nexus.openai.embedding-model:text-embedding-ada-002}")
     private String embeddingModel;
 
+    // Global backpressure valve: this one client instance is shared by EVERY
+    // tenant (chat, onboarding, packs, semantic learning) — with no cap, one
+    // tenant's burst (e.g. onboarding 15 tables at once) can rate-limit-storm
+    // every other tenant's calls too. Caps concurrency, not rate — a token-
+    // bucket limiter would be the follow-up if 429s persist after this.
+    @Value("${nexus.openai.max-concurrent-calls:6}")
+    private int maxConcurrentCalls;
+
+    private Semaphore globalCallLimit;
+
+    // Adaptive rate awareness: OpenAI returns x-ratelimit-remaining-requests /
+    // x-ratelimit-reset-requests on EVERY response — success or 429, not just
+    // failures. Tracking this means the client paces itself proactively before
+    // ever hitting a 429, and self-adapts to whatever the account's real tier
+    // is instead of a guessed static number. Updated from every response;
+    // consulted before every subsequent attempt. Deliberately eventually-
+    // consistent (no locking beyond the AtomicReference) — worst case a couple
+    // of calls race past a slightly-stale reading, which the existing 429
+    // retry path already handles.
+    private static final Pattern RATELIMIT_DURATION =
+            Pattern.compile("(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+(?:\\.\\d+)?)s)?");
+
+    private record RateState(int remainingRequests, Instant resetAt) {
+        static RateState unknown() { return new RateState(Integer.MAX_VALUE, Instant.EPOCH); }
+    }
+
+    private final AtomicReference<RateState> rateState = new AtomicReference<>(RateState.unknown());
+
     public AzureOpenAiClient(ObjectMapper objectMapper, UsageService usageService) {
         this.objectMapper  = objectMapper;
         this.usageService  = usageService;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
+    }
+
+    @PostConstruct
+    void initThrottle() {
+        this.globalCallLimit = new Semaphore(Math.max(1, maxConcurrentCalls), true);
     }
 
     /**
@@ -319,10 +358,34 @@ public class AzureOpenAiClient {
         // (the API key is an Authorization header, never in the payload). No-op in normal runs.
         capturePayload(url, jsonBody);
 
+        // Global throttle: acquired before the retry loop begins, released only after it
+        // finally returns or throws — must wrap the whole retry+backoff sequence, not just
+        // the HTTP send, or a 429-storm still lets unlimited threads pile up mid-backoff,
+        // defeating the point of a concurrency cap.
+        try {
+            globalCallLimit.acquire();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "OpenAI call interrupted while waiting for capacity");
+        }
+        try {
+            return executeWithRetryLocked(url, jsonBody);
+        } finally {
+            globalCallLimit.release();
+        }
+    }
+
+    private String executeWithRetryLocked(String url, String jsonBody) {
         long backoffMs = INITIAL_BACKOFF_MS;
         Exception lastException = null;
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            // Proactive pacing: if the last response told us we're essentially out of
+            // budget for this window, wait for the provider's own reset time instead of
+            // racing in and guaranteeing a 429. A stale/unknown reading is a no-op.
+            waitForRateBudget();
+
             try {
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create(url))
@@ -332,8 +395,8 @@ public class AzureOpenAiClient {
                         .timeout(Duration.ofSeconds(60))
                         .build();
 
-                HttpResponse<String> response = httpClient.send(request,
-                        HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response = sendHttp(request);
+                updateRateState(response);
 
                 int statusCode = response.statusCode();
 
@@ -342,14 +405,24 @@ public class AzureOpenAiClient {
                 }
 
                 if (statusCode == 429) {
-                    // Rate limit — use a longer backoff than general errors (20s → 40s → 80s)
                     if (attempt < MAX_RETRIES - 1) {
-                        long rateLimitWait = RATE_LIMIT_BACKOFF_MS * (1L << attempt);
-                        Thread.sleep(rateLimitWait);
+                        Duration wait = retryWaitFor(response);
+                        if (wait == null) {
+                            // Neither Retry-After nor a rate-limit-reset header was usable —
+                            // fall back to the blind exponential ladder (20s → 40s → 80s).
+                            wait = Duration.ofMillis(RATE_LIMIT_BACKOFF_MS * (1L << attempt));
+                        }
+                        Thread.sleep(wait.toMillis());
                         continue;
                     }
+                    // Surface OpenAI's own reason (RPM vs TPM vs an account/project quota
+                    // cap look identical at the HTTP-status level but read very differently
+                    // in the error body) — previously discarded here, so every occurrence
+                    // logged as an undifferentiated "rate limit exceeded" with no way to
+                    // tell which budget was actually exhausted without dashboard access.
                     throw new NexusException(HttpStatus.TOO_MANY_REQUESTS,
-                            "OpenAI rate limit exceeded after " + MAX_RETRIES + " retries");
+                            "OpenAI rate limit exceeded after " + MAX_RETRIES + " retries: "
+                                    + summarizeErrorBody(response.body()));
                 }
 
                 String errorBody = response.body();
@@ -380,5 +453,100 @@ public class AzureOpenAiClient {
         String reason = lastException != null ? lastException.getMessage() : "unknown error";
         throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
                 "OpenAI call failed: " + reason);
+    }
+
+    /**
+     * Extracts OpenAI's own {@code error.type}/{@code error.code}/{@code error.message}
+     * from a 429 response body — this is what actually distinguishes "RPM exhausted",
+     * "TPM exhausted", and "insufficient_quota" (an account/project spend cap, not a
+     * transient rate window — retrying won't help), which are indistinguishable from
+     * the HTTP status code alone. No secrets in this body — it's OpenAI's own error
+     * description, never request/customer content. Falls back to a truncated raw body
+     * if it isn't the expected shape, so a format change never hides the error entirely.
+     */
+    private String summarizeErrorBody(String body) {
+        if (body == null || body.isBlank()) return "(no response body)";
+        try {
+            JsonNode error = objectMapper.readTree(body).path("error");
+            if (!error.isMissingNode()) {
+                String type    = error.path("type").asText(null);
+                String code    = error.path("code").asText(null);
+                String message = error.path("message").asText(null);
+                StringBuilder sb = new StringBuilder();
+                if (type != null)    sb.append("type=").append(type).append(' ');
+                if (code != null)    sb.append("code=").append(code).append(' ');
+                if (message != null) sb.append(message);
+                if (sb.length() > 0) return sb.toString().trim();
+            }
+        } catch (Exception ignored) {
+            // Not the expected shape — fall through to the raw-body fallback below.
+        }
+        return body.length() > 300 ? body.substring(0, 300) + "…" : body;
+    }
+
+    /** Overridable seam for tests — the real implementation just delegates to the JDK client. */
+    protected HttpResponse<String> sendHttp(HttpRequest request) throws Exception {
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    // ── Adaptive rate awareness ──────────────────────────────────────────────
+
+    /** Blocks until the previously-observed rate window resets, if we're known to be exhausted. */
+    private void waitForRateBudget() {
+        RateState state = rateState.get();
+        if (state.remainingRequests() > 1) return; // healthy budget, or unknown — don't block
+        Duration until = Duration.between(Instant.now(), state.resetAt());
+        if (until.isNegative() || until.isZero()) return; // reset already passed
+        try {
+            Thread.sleep(until.toMillis());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Updates the shared rate state from whatever headers this response actually carries. */
+    private void updateRateState(HttpResponse<String> response) {
+        Integer remaining = firstHeaderInt(response, "x-ratelimit-remaining-requests");
+        Duration resetIn  = firstHeaderDuration(response, "x-ratelimit-reset-requests");
+        if (remaining == null && resetIn == null) return; // nothing usable — leave prior state
+        int remainingValue = remaining != null ? remaining : rateState.get().remainingRequests();
+        Instant resetAt    = resetIn != null ? Instant.now().plus(resetIn) : rateState.get().resetAt();
+        rateState.set(new RateState(remainingValue, resetAt));
+    }
+
+    /** How long to wait before retrying a 429 — Retry-After first, then the rate-limit reset header. */
+    private Duration retryWaitFor(HttpResponse<String> response) {
+        Integer retryAfterSeconds = firstHeaderInt(response, "retry-after");
+        if (retryAfterSeconds != null) return Duration.ofSeconds(retryAfterSeconds);
+        return firstHeaderDuration(response, "x-ratelimit-reset-requests");
+    }
+
+    private Integer firstHeaderInt(HttpResponse<String> response, String name) {
+        return response.headers().firstValue(name)
+                .map(v -> { try { return Integer.parseInt(v.trim()); } catch (Exception e) { return null; } })
+                .orElse(null);
+    }
+
+    /** Parses OpenAI's rate-limit-reset duration format, e.g. "6m0s", "21s", "350ms". */
+    private Duration firstHeaderDuration(HttpResponse<String> response, String name) {
+        return response.headers().firstValue(name)
+                .map(this::parseRateLimitDuration)
+                .orElse(null);
+    }
+
+    private Duration parseRateLimitDuration(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            Matcher m = RATELIMIT_DURATION.matcher(value.trim());
+            if (!m.matches()) return null;
+            long hours   = m.group(1) != null ? Long.parseLong(m.group(1)) : 0;
+            long minutes = m.group(2) != null ? Long.parseLong(m.group(2)) : 0;
+            double secs  = m.group(3) != null ? Double.parseDouble(m.group(3)) : 0;
+            Duration d = Duration.ofHours(hours).plusMinutes(minutes)
+                    .plusMillis((long) (secs * 1000));
+            return d.isZero() ? null : d;
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

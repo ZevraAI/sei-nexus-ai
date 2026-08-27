@@ -2,72 +2,548 @@
   "pack_id": "retail-v1",
   "industry": "RETAIL",
   "display_name": "Retail & E-commerce",
-  "version": "1.0.0",
-  "description": "Semantic layer for retail stores, e-commerce, omnichannel, and consumer brands. Covers sales performance, inventory management, customer behaviour, and merchandising.",
+  "version": "2.0.0",
+  "description": "Generic, application-agnostic semantic layer for retail, e-commerce, omnichannel, POS, retail ERP, merchandising, supply-chain, and warehouse/distribution systems. Provides a canonical Retail business-concept taxonomy for LLM-driven classification of arbitrary tenant business objects — not a database schema and not tied to any specific application's table names.",
   "entities": [
     {
       "name": "Product",
-      "aliases": ["product", "sku", "item", "article", "variant"],
-      "table_patterns": ["product", "products", "item", "items", "sku", "skus", "article", "articles", "variant", "variants", "merchandise", "catalog"],
-      "key_column_patterns": ["product_id", "sku_id", "item_id", "article_id", "variant_id", "sku_code", "barcode", "upc", "ean"],
-      "description": "A sellable product or SKU in the assortment",
-      "operational_meaning": "Core entity for sales, inventory, margin, and assortment analytics"
+      "aliases": ["product", "item", "sku", "article", "variant", "product variant", "merchandise"],
+      "table_patterns": ["product", "products", "item", "items", "sku", "skus", "article", "articles", "variant", "variants", "merchandise", "catalog", "catalog_item"],
+      "key_column_patterns": ["product_id", "sku_id", "item_id", "article_id", "variant_id", "sku_code", "barcode", "upc", "ean", "gtin"],
+      "description": "A sellable product, item, SKU, or variant — the core retail merchandise unit describing WHAT is sold (name, description, identifiers, attributes). Does NOT represent how much of it exists at a location (see Inventory Balance), which specific production run/batch a unit came from (see Inventory Lot / Batch), what it currently costs to acquire (see Product Cost) or sells for (see Product Price), or its brand owner (see Brand). A row here answers 'what is this thing we sell,' never 'how many do we have' or 'what does it cost right now.'",
+      "operational_meaning": "Core master-data entity referenced by nearly every other retail concept — sales, inventory, procurement, and merchandising all key off Product.",
+      "concept_key": "product",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Brand",
+      "aliases": ["brand", "manufacturer", "label", "brand family"],
+      "table_patterns": ["brand", "brands", "manufacturer", "manufacturers", "label", "labels"],
+      "key_column_patterns": ["brand_id", "manufacturer_id", "brand_code"],
+      "description": "The brand or manufacturer label a product is marketed under. Distinct from Product (the sellable item itself, which BELONGS TO a brand) and from Supplier (the commercial partner who physically supplies goods to the retailer — a Supplier ships product, a Brand owns the marketing identity; the two are frequently different companies, e.g. a distributor supplying a name-brand item it does not own).",
+      "operational_meaning": "Used for brand-level performance, marketing attribution, and assortment analysis independent of any single SKU.",
+      "concept_key": "brand",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Product Category",
+      "aliases": ["category", "department", "classification", "product hierarchy", "merchandise hierarchy", "class", "subclass"],
+      "table_patterns": ["category", "categories", "department", "departments", "classification", "classifications", "hierarchy", "product_group", "merchandise_hierarchy"],
+      "key_column_patterns": ["category_id", "department_id", "class_id", "subclass_id", "category_code"],
+      "description": "A named grouping level in the hierarchical classification of products (department, class, subclass, or any other depth of the same hierarchy). Represents WHERE a product sits in the merchandising taxonomy — not a specific curated selling assortment for a channel or season (see Assortment) and not the product itself.",
+      "operational_meaning": "Used for category performance, space allocation, and buyer/category-manager responsibility reporting.",
+      "concept_key": "product-category",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Assortment",
+      "aliases": ["assortment", "assortment plan", "range", "selection"],
+      "table_patterns": ["assortment", "assortments", "assortment_plan", "range", "product_range"],
+      "key_column_patterns": ["assortment_id", "assortment_plan_id"],
+      "description": "A defined, curated set of products planned to be offered at a specific store, channel, cluster, or season. Distinct from Product Category (a permanent classification taxonomy) — an Assortment is a deliberate, often time-bound MERCHANDISING DECISION about which products to carry where, not a fixed hierarchy.",
+      "operational_meaning": "Used for assortment planning, localization, and space/range optimization by store cluster or channel.",
+      "concept_key": "assortment",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Product Attribute",
+      "aliases": ["attribute", "product attribute", "attribute value", "product characteristic"],
+      "table_patterns": ["attribute", "attributes", "product_attribute", "attribute_value", "product_characteristic"],
+      "key_column_patterns": ["attribute_id", "attribute_value_id"],
+      "description": "A describable characteristic of a product (color, size, material, fit) used to differentiate variants or drive faceted search/merchandising. Distinct from Product itself — an Attribute is metadata ABOUT a product, never the sellable unit or a standalone transaction.",
+      "operational_meaning": "Used for variant differentiation, faceted navigation, and attribute-level sales/returns analysis (e.g. size-curve or color performance).",
+      "concept_key": "product-attribute",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Product Cost",
+      "aliases": ["cost", "product cost", "standard cost", "landed cost", "unit cost"],
+      "table_patterns": ["product_cost", "cost", "costs", "landed_cost", "standard_cost"],
+      "key_column_patterns": ["cost_id", "unit_cost", "landed_cost"],
+      "description": "The internal acquisition/standard cost basis of a product (what it costs the retailer to obtain), used to compute margin. Distinct from Product Price (what a customer is charged) and from a Supplier Item's negotiated cost with one specific supplier (see Supplier Item) — Product Cost is the retailer's own internal costing record, not a supplier-facing agreement.",
+      "operational_meaning": "Used for margin calculation, inventory valuation, and profitability analysis.",
+      "concept_key": "product-cost",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Product Price",
+      "aliases": ["price", "product price", "price list", "price book", "list price", "selling price"],
+      "table_patterns": ["price", "prices", "price_list", "price_book", "product_price"],
+      "key_column_patterns": ["price_id", "list_price", "selling_price"],
+      "description": "The current or scheduled selling price of a product at a channel, location, or customer tier. Represents the STANDING price a customer would pay absent any temporary reduction — distinct from Markdown (a planned, ongoing clearance-driven price reduction) and from Promotion (a time-bound marketing campaign that may apply a discount on top of this price). Not itself a completed sale (see Sales Transaction).",
+      "operational_meaning": "Used for price management, channel/customer-tier pricing strategy, and margin planning.",
+      "concept_key": "product-price",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Markdown",
+      "aliases": ["markdown", "price reduction", "clearance price", "permanent markdown"],
+      "table_patterns": ["markdown", "markdowns", "price_reduction", "clearance"],
+      "key_column_patterns": ["markdown_id"],
+      "description": "A planned, merchandising-driven, typically permanent reduction to a product's standing price — usually to clear slow-moving or seasonal inventory. Distinct from Promotion (a marketing campaign with defined dates/rules that may be temporary and reversible) and from a POS-applied line-level discount on a single transaction (see Sales Transaction Line) — a Markdown changes the product's price going forward, it is not a one-time transactional adjustment.",
+      "operational_meaning": "Used for clearance strategy, sell-through analysis, and gross-margin impact of price reductions.",
+      "concept_key": "markdown",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Promotion",
+      "aliases": ["promotion", "promo", "campaign", "coupon", "offer", "promo code", "promotional discount"],
+      "table_patterns": ["promotion", "promotions", "promo", "campaign", "campaigns", "coupon", "coupons", "offer", "promo_code"],
+      "key_column_patterns": ["promotion_id", "promo_id", "campaign_id", "coupon_code"],
+      "description": "A defined, time-bound marketing offer or discount campaign (percentage off, BOGO, coupon code) that customers may qualify for at checkout. Represents the OFFER DEFINITION, not an individual customer's redemption of it (redemption is recorded on the Sales Transaction/Sales Transaction Line it was applied to) and not an ad-hoc, one-off price reduction a staff member manually applies at time of sale with no associated campaign (that is typically just a field on Sales Transaction Line, not a Promotion instance). Distinct from Markdown (a standing price change to the product itself, not tied to a campaign or customer action) and from Product Price (the price the promotion is applied ON TOP OF). A bare, undefined 'discount' amount or flag on another table's row is NOT sufficient evidence of a Promotion — only classify as Promotion when the table represents a defined, named offer/campaign with its own rules or dates.",
+      "operational_meaning": "Used for campaign performance, discount penetration, and promotional lift analysis.",
+      "concept_key": "promotion",
+      "status": "ACTIVE"
     },
     {
       "name": "Customer",
-      "aliases": ["customer", "shopper", "member", "account", "buyer"],
-      "table_patterns": ["customer", "customers", "shopper", "shoppers", "member", "members", "account", "accounts", "loyalty_member", "buyer"],
-      "key_column_patterns": ["customer_id", "shopper_id", "member_id", "account_id", "loyalty_number", "email"],
-      "description": "Individual or organisation that purchases products",
-      "operational_meaning": "Used for CLV, segmentation, churn, and personalisation analytics"
+      "aliases": ["customer", "customer account", "shopper", "member", "account", "buyer", "guest"],
+      "table_patterns": ["customer", "customers", "shopper", "shoppers", "member", "members", "account", "accounts", "buyer", "guest"],
+      "key_column_patterns": ["customer_id", "shopper_id", "member_id", "account_id", "email"],
+      "description": "An individual or organization that purchases products from the retailer — their identity and profile record. Distinct from Loyalty Membership (a specific program enrollment a customer may or may not have) and from Customer Segment (an analytical classification a customer is placed into) — Customer is the base identity those two attach to.",
+      "operational_meaning": "Used for CLV, order history, service, and personalization — the anchor identity for all customer-facing analytics.",
+      "concept_key": "customer",
+      "status": "ACTIVE"
     },
     {
-      "name": "Transaction",
-      "aliases": ["transaction", "sale", "order", "purchase", "receipt"],
-      "table_patterns": ["transaction", "transactions", "sale", "sales", "order", "orders", "purchase", "purchases", "receipt", "receipts", "invoice", "invoices", "pos_transaction"],
-      "key_column_patterns": ["transaction_id", "order_id", "sale_id", "receipt_id", "invoice_number", "order_number"],
-      "description": "A completed sales event or purchase",
-      "operational_meaning": "Primary source for revenue, basket analysis, and conversion metrics"
+      "name": "Loyalty Membership",
+      "aliases": ["loyalty member", "loyalty membership", "rewards member", "rewards account", "loyalty program enrollment", "loyalty tier"],
+      "table_patterns": ["loyalty_member", "loyalty_membership", "rewards_member", "rewards_account", "loyalty_program"],
+      "key_column_patterns": ["loyalty_id", "loyalty_number", "membership_id"],
+      "description": "A customer's enrollment in a loyalty/rewards program — tier, points balance, enrollment date. Distinct from Customer itself (the base identity); a Customer may exist with no Loyalty Membership, and the membership record tracks the PROGRAM RELATIONSHIP, not the person's core profile.",
+      "operational_meaning": "Used for loyalty tier analysis, points-liability tracking, and rewards-driven retention/engagement metrics.",
+      "concept_key": "loyalty-membership",
+      "status": "ACTIVE"
     },
     {
-      "name": "Store",
-      "aliases": ["store", "location", "branch", "outlet", "shop"],
-      "table_patterns": ["store", "stores", "location", "locations", "branch", "branches", "outlet", "outlets", "shop", "shops", "site"],
-      "key_column_patterns": ["store_id", "location_id", "branch_id", "outlet_id", "store_code"],
-      "description": "Physical retail location or selling channel",
-      "operational_meaning": "Used for store performance benchmarking, cluster analysis, and space planning"
+      "name": "Customer Segment",
+      "aliases": ["customer segment", "segment", "customer cohort", "customer classification"],
+      "table_patterns": ["customer_segment", "segment", "segments", "cohort", "customer_classification"],
+      "key_column_patterns": ["segment_id", "cohort_id"],
+      "description": "An analytical or marketing classification a customer is grouped into (e.g. VIP, at-risk, high-frequency) — a grouping label, not the customer's identity itself (see Customer) and not a program enrollment (see Loyalty Membership).",
+      "operational_meaning": "Used for targeted marketing, churn-risk analysis, and cohort-based reporting.",
+      "concept_key": "customer-segment",
+      "status": "ACTIVE"
     },
     {
-      "name": "Category",
-      "aliases": ["category", "department", "classification", "segment", "division"],
-      "table_patterns": ["category", "categories", "department", "departments", "classification", "classifications", "segment", "hierarchy", "product_group"],
-      "key_column_patterns": ["category_id", "department_id", "class_id", "subclass_id", "category_code"],
-      "description": "Hierarchical grouping of products for merchandising",
-      "operational_meaning": "Used for category performance, space allocation, and buyer responsibility"
+      "name": "Sales Transaction",
+      "aliases": ["sales transaction", "sale", "sales order", "customer order", "web order", "pos transaction", "invoice", "receipt"],
+      "table_patterns": ["sales_transaction", "sale", "sales", "order", "orders", "sales_order", "pos_transaction", "invoice", "invoices", "web_order"],
+      "key_column_patterns": ["transaction_id", "order_id", "sale_id", "invoice_number", "order_number"],
+      "description": "A completed or in-progress CUSTOMER-FACING commercial sale — a POS transaction, an e-commerce order, or any transaction where the retailer sells to an end customer. Does NOT represent a procurement commitment to a supplier (see Purchase Order — that is the retailer BUYING, not selling), a pre-purchase cart the customer has not yet committed to (see Shopping Cart), a reversal of a prior sale (see Return), or a physical goods movement (see Inventory Movement/Shipment/Goods Receipt). The defining test: money/commitment flows FROM the customer TO the retailer.",
+      "operational_meaning": "Primary source for revenue, basket analysis, and conversion metrics across every selling channel.",
+      "concept_key": "sales-transaction",
+      "status": "ACTIVE"
     },
     {
-      "name": "Inventory",
-      "aliases": ["inventory", "stock", "on_hand", "stock_level"],
-      "table_patterns": ["inventory", "stock", "stock_level", "on_hand", "inventory_position", "stock_balance", "wh_inventory"],
-      "key_column_patterns": ["inventory_id", "on_hand_qty", "available_qty", "stock_qty"],
-      "description": "Current quantity of a product available at a location",
-      "operational_meaning": "Used for stockout risk, over-stock identification, and replenishment decisions"
+      "name": "Sales Transaction Line",
+      "aliases": ["sales transaction line", "order line", "sale line", "invoice line", "line item"],
+      "table_patterns": ["sales_transaction_line", "order_line", "sale_line", "order_item", "invoice_line", "sales_line"],
+      "key_column_patterns": ["line_id", "line_number"],
+      "description": "One product-level line within a Sales Transaction — quantity, unit price, discount applied, and tax for a single product on a single sale. Exists only in relation to its parent Sales Transaction; never a standalone sale.",
+      "operational_meaning": "Used for product-level revenue attribution, basket composition, and discount/markdown impact analysis.",
+      "concept_key": "sales-transaction-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Shopping Cart",
+      "aliases": ["shopping cart", "basket", "cart", "abandoned cart"],
+      "table_patterns": ["cart", "carts", "shopping_cart", "basket"],
+      "key_column_patterns": ["cart_id", "basket_id"],
+      "description": "A customer's in-progress, not-yet-committed collection of items intended for purchase now — may be abandoned or may convert into a Sales Transaction. The defining distinction from Sales Transaction is COMMITMENT: a cart carries no binding financial obligation and no completed payment; a Sales Transaction does.",
+      "operational_meaning": "Used for cart-abandonment analysis, conversion-funnel metrics, and pre-purchase behavior.",
+      "concept_key": "shopping-cart",
+      "status": "ACTIVE"
     },
     {
       "name": "Return",
-      "aliases": ["return", "refund", "credit", "rma"],
-      "table_patterns": ["return", "returns", "refund", "refunds", "rma", "credit_note", "return_order", "exchange"],
-      "key_column_patterns": ["return_id", "rma_id", "refund_id", "return_number"],
-      "description": "Product returned by a customer for refund or exchange",
-      "operational_meaning": "Used for return rate, net revenue, and quality/fraud analysis"
+      "aliases": ["return", "rma", "return authorization", "exchange"],
+      "table_patterns": ["return", "returns", "rma", "return_order", "exchange", "exchanges"],
+      "key_column_patterns": ["return_id", "rma_id", "return_number"],
+      "description": "A customer-initiated reversal of a prior Sales Transaction — goods coming back from a customer, with a reason (defective, unwanted, wrong item). Distinct from Refund (the FINANCIAL reimbursement that results from a return, which may be tracked as its own record — see Refund), from Goods Receipt (physical receipt of goods FROM A SUPPLIER, not from a customer), and from Inventory Adjustment (a correction unrelated to any customer action).",
+      "operational_meaning": "Used for return-rate analysis, quality/fraud signals, and net-revenue reporting.",
+      "concept_key": "return",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Return Line",
+      "aliases": ["return line", "rma line", "return item"],
+      "table_patterns": ["return_line", "rma_line", "return_item"],
+      "key_column_patterns": ["return_line_id"],
+      "description": "One product-level line within a Return — the specific item, quantity, and condition being returned. Exists only in relation to its parent Return.",
+      "operational_meaning": "Used for product-level return-rate and defect-rate analysis.",
+      "concept_key": "return-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Refund",
+      "aliases": ["refund", "refund transaction", "credit note", "reimbursement"],
+      "table_patterns": ["refund", "refunds", "credit_note", "reimbursement"],
+      "key_column_patterns": ["refund_id", "credit_note_id"],
+      "description": "The financial reimbursement issued to a customer as a result of a Return — the amount, tender method, and settlement date. Distinct from Return itself (the physical/logical record of what came back and why) — a single Return may have zero, one, or a partial Refund, and some systems track them as entirely separate tables.",
+      "operational_meaning": "Used for cash-outflow tracking, net-revenue reconciliation, and refund-fraud monitoring.",
+      "concept_key": "refund",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Payment",
+      "aliases": ["payment", "tender", "payment method", "settlement", "gift card redemption"],
+      "table_patterns": ["payment", "payments", "tender", "tenders", "settlement"],
+      "key_column_patterns": ["payment_id", "tender_id"],
+      "description": "The settlement instrument and amount applied to a Sales Transaction or Refund (cash, card, wallet, gift card). Represents HOW money moved, not the sale or reimbursement itself and not a stored-value balance (see Gift Card).",
+      "operational_meaning": "Used for tender-mix analysis, payment-processing reconciliation, and fraud/chargeback monitoring.",
+      "concept_key": "payment",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Gift Card",
+      "aliases": ["gift card", "stored value", "stored value account", "gift card balance"],
+      "table_patterns": ["gift_card", "gift_cards", "stored_value", "stored_value_account"],
+      "key_column_patterns": ["gift_card_id", "gift_card_number"],
+      "description": "A stored-value instrument (physical or digital gift card) holding a balance that CAN LATER be used as a Payment tender. Distinct from Payment itself (the act of applying value to a transaction) — a Gift Card is the balance/instrument; using it is a Payment event.",
+      "operational_meaning": "Used for stored-value liability tracking, breakage analysis, and gift-card program performance.",
+      "concept_key": "gift-card",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Store",
+      "aliases": ["store", "retail store", "retail location", "shop", "outlet", "branch"],
+      "table_patterns": ["store", "stores", "shop", "shops", "outlet", "outlets", "branch", "branches", "retail_location"],
+      "key_column_patterns": ["store_id", "store_code", "location_id"],
+      "description": "A CUSTOMER-FACING retail selling location — a physical storefront or the storefront entity representing an online/virtual selling presence. Does NOT represent a non-selling storage/processing facility (see Warehouse) — the defining test is whether customers transact there, not whether it is a physical building. A distribution center that never sells directly to customers is a Warehouse, not a Store, even though both are physical facilities.",
+      "operational_meaning": "Used for store performance benchmarking, cluster analysis, and space planning.",
+      "concept_key": "store",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Region",
+      "aliases": ["region", "territory", "district", "area", "market"],
+      "table_patterns": ["region", "regions", "territory", "territories", "district", "districts", "area", "areas", "market"],
+      "key_column_patterns": ["region_id", "territory_id", "district_id"],
+      "description": "A geographic or organizational grouping of Stores (region, territory, district, or area — different organizations use these terms for the same grouping role at whatever hierarchy depth they operate). Distinct from Business Unit (a corporate/brand/legal grouping that may span multiple regions, not a geography) and from Store itself (the individual selling location being grouped).",
+      "operational_meaning": "Used for regional performance roll-ups, territory management, and geographic comparison.",
+      "concept_key": "region",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Store Target",
+      "aliases": ["store target", "store goal", "sales target", "performance target", "store budget"],
+      "table_patterns": ["store_target", "store_targets", "sales_target", "performance_target", "store_budget"],
+      "key_column_patterns": ["target_id"],
+      "description": "A performance goal or budget assigned to a Store for a specific Fiscal Period (sales target, traffic target, etc.). A PLANNING/GOAL record, not the Store entity itself and not an actual result (see Sales Transaction for actuals) — it exists to be compared AGAINST real performance, never as the performance itself.",
+      "operational_meaning": "Used for target-vs-actual performance comparison and store-level goal management.",
+      "concept_key": "store-target",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Business Unit",
+      "aliases": ["business unit", "organization", "division", "banner", "legal entity"],
+      "table_patterns": ["business_unit", "organization", "division", "banner", "legal_entity"],
+      "key_column_patterns": ["business_unit_id", "org_id", "division_id"],
+      "description": "A corporate, brand, or legal grouping above the store network (a banner, division, or legal entity in a multi-banner or multi-brand retailer). Distinct from Region (a GEOGRAPHIC grouping of stores) — a Business Unit may span many regions, or a single region may contain stores from multiple business units.",
+      "operational_meaning": "Used for consolidated financial reporting and cross-banner/cross-brand performance comparison.",
+      "concept_key": "business-unit",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Sales Channel",
+      "aliases": ["channel", "sales channel", "selling channel", "marketplace"],
+      "table_patterns": ["channel", "channels", "sales_channel", "marketplace"],
+      "key_column_patterns": ["channel_id", "channel_code"],
+      "description": "The medium or method through which a sale occurs (in-store POS, e-commerce web, mobile app, marketplace, kiosk, call center). Distinct from Store (a physical/virtual SELLING LOCATION) — a single Store may transact through multiple channels (e.g. in-store POS and an in-store kiosk), and an e-commerce channel may have no associated physical Store at all.",
+      "operational_meaning": "Used for omnichannel performance comparison and channel-mix analysis.",
+      "concept_key": "sales-channel",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Balance",
+      "aliases": ["inventory balance", "inventory", "stock level", "on hand", "stock balance", "inventory position"],
+      "table_patterns": ["inventory_balance", "inventory", "stock", "stock_level", "on_hand", "stock_balance", "inventory_position"],
+      "key_column_patterns": ["on_hand_qty", "available_qty", "stock_qty"],
+      "description": "The CURRENT SNAPSHOT quantity of a product available/on-hand at a location, at this moment in time. Does NOT represent an individual event that changed that quantity (see Inventory Movement), a correction to it (see Inventory Adjustment), or which specific production batch it belongs to (see Inventory Lot / Batch) — a Balance is the resulting number, not the event that produced it and not the traceability identity of the stock. The defining test: does this row represent 'how much exists right now,' or 'something that happened to change how much exists'? If the latter, it belongs to Movement, Adjustment, or Transfer instead.",
+      "operational_meaning": "Used for stockout risk, over-stock identification, and replenishment/allocation decisions.",
+      "concept_key": "inventory-balance",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Movement",
+      "aliases": ["inventory movement", "stock movement", "inventory transaction", "stock ledger", "inventory ledger"],
+      "table_patterns": ["inventory_movement", "inventory_transaction", "stock_movement", "stock_ledger", "inventory_ledger"],
+      "key_column_patterns": ["movement_id", "movement_type"],
+      "description": "An individual, immutable ledger entry recording ANY change to a product's quantity at a location (sale, receipt, transfer, adjustment) — a log/audit-trail row, not the resulting balance (see Inventory Balance). A generic catch-all for stock-quantity change events; a Sales Transaction, Goods Receipt, Inventory Transfer, or Inventory Adjustment may each generate one, but this concept is for a system's own internal, undifferentiated movement ledger, not for the higher-level business event that caused it (classify the business event as its own concept when the table clearly represents that specific event instead).",
+      "operational_meaning": "Used for stock-movement audit trails, reconciliation of balances, and shrinkage/variance investigation.",
+      "concept_key": "inventory-movement",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Adjustment",
+      "aliases": ["inventory adjustment", "stock adjustment", "inventory correction"],
+      "table_patterns": ["inventory_adjustment", "stock_adjustment", "inventory_correction"],
+      "key_column_patterns": ["adjustment_id", "adjustment_reason", "reason_code"],
+      "description": "A deliberate CORRECTION to inventory quantity — typically the result of a Stock Count variance, damage, theft/shrinkage write-off, or manual override — carrying a reason code and often an approval step. Distinct from a routine Inventory Movement (any quantity change, including normal sales/receipts) and from Inventory Transfer (moving existing, undisputed stock between locations, not correcting a discrepancy).",
+      "operational_meaning": "Used for shrinkage analysis, inventory-accuracy reporting, and loss-prevention investigation.",
+      "concept_key": "inventory-adjustment",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Adjustment Line",
+      "aliases": ["inventory adjustment line", "adjustment line"],
+      "table_patterns": ["inventory_adjustment_line", "adjustment_line"],
+      "key_column_patterns": ["adjustment_line_id"],
+      "description": "One product-level line within an Inventory Adjustment — the specific product, location, and quantity variance being corrected. Exists only in relation to its parent Inventory Adjustment.",
+      "operational_meaning": "Used for product-level shrinkage and variance analysis.",
+      "concept_key": "inventory-adjustment-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Stock Count",
+      "aliases": ["stock count", "cycle count", "physical inventory count", "inventory audit"],
+      "table_patterns": ["stock_count", "cycle_count", "physical_count", "inventory_count", "inventory_audit"],
+      "key_column_patterns": ["count_id"],
+      "description": "The record of a physical counting/audit EVENT — when a count happened, of what scope, and who performed it. Distinct from Inventory Adjustment (the resulting CORRECTION applied to the balance after a count finds a discrepancy) — a Stock Count is the act of counting, an Inventory Adjustment is what happens as a consequence of what was found.",
+      "operational_meaning": "Used for count-accuracy tracking, audit-cycle compliance, and shrinkage root-cause analysis.",
+      "concept_key": "stock-count",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Stock Count Line",
+      "aliases": ["stock count line", "count line", "cycle count line"],
+      "table_patterns": ["stock_count_line", "count_line", "cycle_count_line"],
+      "key_column_patterns": ["count_line_id"],
+      "description": "One product-level line within a Stock Count — the expected quantity, the counted quantity, and the variance for a single product. Exists only in relation to its parent Stock Count.",
+      "operational_meaning": "Used for product-level count-variance analysis.",
+      "concept_key": "stock-count-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Transfer",
+      "aliases": ["inventory transfer", "stock transfer", "transfer order", "inter-location transfer"],
+      "table_patterns": ["inventory_transfer", "stock_transfer", "transfer_order", "transfer"],
+      "key_column_patterns": ["transfer_id", "source_location_id", "destination_location_id"],
+      "description": "A movement of existing, undisputed stock from ONE of the retailer's own locations to ANOTHER (store-to-store, warehouse-to-store), typically with an in-transit status and no external carrier tracking. Distinct from Inventory Movement (a generic ledger row for any quantity change) by having explicit source AND destination locations; distinct from Shipment (goods in transit that are tracked via an EXTERNAL CARRIER, whether crossing outside the retailer's own network or between the retailer's own facilities using freight) — an internal store-to-warehouse move handled by the retailer's own transport with no carrier/tracking reference is a Transfer, not a Shipment; distinct from Inventory Adjustment (which corrects a discrepancy, not relocates verified stock).",
+      "operational_meaning": "Used for network stock-balancing, store replenishment via internal transfer, and in-transit inventory visibility.",
+      "concept_key": "inventory-transfer",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Reservation",
+      "aliases": ["inventory reservation", "stock hold", "allocation hold", "order hold"],
+      "table_patterns": ["inventory_reservation", "stock_hold", "reservation", "order_hold"],
+      "key_column_patterns": ["reservation_id"],
+      "description": "A hold placed on available stock for a specific order or customer BEFORE it is physically picked or shipped (e.g. buy-online-pickup-in-store, back-order holds). Reduces AVAILABLE quantity without changing ON-HAND quantity (see Inventory Balance). Distinct from Allocation (a store/channel-level planning decision made before goods even arrive) and from Inventory Transfer (an already-executing physical movement) — a Reservation is order-specific and typically short-lived.",
+      "operational_meaning": "Used for available-to-promise calculations and omnichannel order-sourcing (ship-from-store, BOPIS).",
+      "concept_key": "inventory-reservation",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Inventory Lot / Batch",
+      "aliases": ["lot", "batch", "inventory lot", "inventory batch", "manufacturing batch", "lot number", "batch number", "traceability lot"],
+      "table_patterns": ["lot", "lots", "batch", "batches", "inventory_lot", "inventory_batch", "manufacturing_batch", "lot_tracking"],
+      "key_column_patterns": ["lot_id", "lot_number", "batch_id", "batch_number", "expiry_date", "expiration_date", "manufacture_date"],
+      "description": "The traceable identity or grouping of a specific production run or receipt of a product — a lot number, batch number, or expiry/manufacture date used to track and trace units of the same Product produced or received together. Represents WHICH specific batch/lot a unit of inventory belongs to. Does NOT represent how much of the product exists (see Inventory Balance), an event that changed quantity (see Inventory Movement), or a correction to quantity (see Inventory Adjustment) — a Lot/Batch is an identity/grouping dimension those other concepts may be recorded AGAINST, not a quantity or event itself. Also distinct from Product (the general sellable item definition, which is not tied to any single production run) — many units of Inventory Balance/Movement for the same Product may exist across many different Lots/Batches simultaneously. Especially relevant to grocery, pharmacy, and other perishable or regulated retail environments that require expiry/recall traceability.",
+      "operational_meaning": "Used for traceability, recall management, expiry/shelf-life tracking, and regulatory compliance in grocery, pharmacy, and other perishable or regulated retail environments.",
+      "concept_key": "inventory-lot-batch",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Allocation",
+      "aliases": ["allocation", "allocation plan", "store allocation", "initial allocation"],
+      "table_patterns": ["allocation", "allocations", "allocation_plan", "store_allocation"],
+      "key_column_patterns": ["allocation_id"],
+      "description": "A planning decision of how much new or incoming stock to assign to a specific store or channel, typically made before or at receipt of goods. Distinct from Inventory Transfer (moving stock that ALREADY exists at one location to another) and from Inventory Reservation (a hold against a specific customer order, not a store-level planning decision).",
+      "operational_meaning": "Used for new-product launch planning, seasonal buy distribution, and store-cluster allocation strategy.",
+      "concept_key": "allocation",
+      "status": "ACTIVE"
     },
     {
       "name": "Supplier",
-      "aliases": ["supplier", "vendor", "manufacturer"],
-      "table_patterns": ["supplier", "suppliers", "vendor", "vendors", "manufacturer", "manufacturers"],
+      "aliases": ["supplier", "vendor", "manufacturer supplier"],
+      "table_patterns": ["supplier", "suppliers", "vendor", "vendors"],
       "key_column_patterns": ["supplier_id", "vendor_id", "supplier_code", "vendor_code"],
-      "description": "Entity that supplies products to the retailer",
-      "operational_meaning": "Used for supplier fill rates, lead times, terms, and compliance"
+      "description": "The external business partner the retailer buys goods FROM. Represents the commercial counterparty for procurement — distinct from Brand (the marketing/ownership identity a product is sold UNDER, which is often a different company than whoever physically supplies it) and from Customer (who the retailer sells TO, the opposite direction of trade).",
+      "operational_meaning": "Used for supplier fill rates, lead times, contract terms, and procurement compliance.",
+      "concept_key": "supplier",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Supplier Contract",
+      "aliases": ["supplier contract", "vendor contract", "purchasing agreement", "supplier agreement"],
+      "table_patterns": ["supplier_contract", "vendor_contract", "purchasing_agreement", "supplier_agreement"],
+      "key_column_patterns": ["contract_id", "contract_number"],
+      "description": "A negotiated commercial agreement with a Supplier — pricing terms, volume commitments, contract duration. Represents the AGREEMENT itself, not any single order placed under it (see Purchase Order) and not a per-product price/lead-time entry (see Supplier Item).",
+      "operational_meaning": "Used for pricing-compliance verification, contract-renewal management, and supplier-relationship terms tracking.",
+      "concept_key": "supplier-contract",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Supplier Item",
+      "aliases": ["supplier item", "vendor item", "supplier catalog", "vendor catalog", "supplier sku"],
+      "table_patterns": ["supplier_item", "vendor_item", "supplier_catalog", "vendor_catalog"],
+      "key_column_patterns": ["supplier_item_id", "supplier_sku"],
+      "description": "A supplier-specific catalog entry linking one of the retailer's Products to one Supplier's own item code, cost, and lead time. Distinct from Product (the retailer's own internal item record, which may be sourced from multiple suppliers) and from Supplier Contract (the overall commercial agreement, not a per-item linkage).",
+      "operational_meaning": "Used for multi-sourcing decisions, supplier cost comparison, and lead-time planning per product.",
+      "concept_key": "supplier-item",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Supplier Invoice",
+      "aliases": ["supplier invoice", "vendor invoice", "purchase invoice", "vendor bill"],
+      "table_patterns": ["supplier_invoice", "vendor_invoice", "purchase_invoice", "vendor_bill"],
+      "key_column_patterns": ["invoice_id", "invoice_number"],
+      "description": "The financial billing document a Supplier issues for goods delivered — the amount claimed, due date, and payment status. Distinct from Purchase Order (the ORDER/commitment placed before delivery) and from Goods Receipt (the PHYSICAL confirmation of what arrived) — an invoice may not match either exactly, which is precisely why retailers reconcile all three (a classic three-way match).",
+      "operational_meaning": "Used for accounts-payable processing, three-way-match reconciliation (PO vs receipt vs invoice), and supplier payment scheduling.",
+      "concept_key": "supplier-invoice",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Purchase Requisition",
+      "aliases": ["purchase requisition", "requisition", "purchase request", "buy request"],
+      "table_patterns": ["purchase_requisition", "requisition", "requisitions", "purchase_request"],
+      "key_column_patterns": ["requisition_id", "requisition_number"],
+      "description": "An INTERNAL request or approval to purchase something, raised BEFORE it becomes a formal, supplier-committed Purchase Order. May not yet specify a supplier, price, or delivery date. Distinct from Purchase Order (the externally binding commitment that results once a requisition is approved and a supplier is selected).",
+      "operational_meaning": "Used for internal spend-approval workflows and pre-procurement demand aggregation.",
+      "concept_key": "purchase-requisition",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Purchase Order",
+      "aliases": ["purchase order", "po", "po header", "purchase document", "procurement order", "order header"],
+      "table_patterns": ["purchase_order", "purchase_orders", "po", "po_header", "purchase_document", "procurement_order", "order_header"],
+      "key_column_patterns": ["po_id", "po_number", "purchase_order_id"],
+      "description": "A procurement commitment/request from the retailer TO A SUPPLIER for goods or services — the RETAILER IS THE BUYER here. Does NOT represent a customer-facing sale (see Sales Transaction — there the retailer is the SELLER, the opposite direction of trade), the physical receipt of the goods once they arrive (see Goods Receipt), goods still in transit toward the retailer (see Shipment), the supplier's bill for them (see Supplier Invoice), or an internal pre-approval before a supplier is committed (see Purchase Requisition). The defining test: does money/commitment flow FROM the retailer TO an external supplier? If instead it flows FROM a customer TO the retailer, it is a Sales Transaction, never a Purchase Order — the words 'order' and 'purchase' alone must never be used to decide this; the DIRECTION of the commercial relationship is what matters.",
+      "operational_meaning": "Used for procurement spend tracking, supplier commitment management, and open-order/on-order reporting.",
+      "concept_key": "purchase-order",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Purchase Order Line",
+      "aliases": ["purchase order line", "po line", "order line item"],
+      "table_patterns": ["purchase_order_line", "po_line", "purchase_order_item"],
+      "key_column_patterns": ["po_line_id", "line_number"],
+      "description": "One product-level line within a Purchase Order — the specific product, quantity, and unit cost ordered from the supplier. Exists only in relation to its parent Purchase Order.",
+      "operational_meaning": "Used for line-level order-fulfillment tracking and product-level procurement spend.",
+      "concept_key": "purchase-order-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Goods Receipt",
+      "aliases": ["goods receipt", "receiving", "receipt", "goods received note", "receiving confirmation"],
+      "table_patterns": ["goods_receipt", "receiving", "receipt", "receipts", "goods_received_note", "grn"],
+      "key_column_patterns": ["receipt_id", "receipt_number"],
+      "description": "Acknowledgement that goods PHYSICALLY ARRIVED at the receiving location (warehouse or store) FROM A SUPPLIER, against a Purchase Order — what actually arrived, condition/inspection outcome, and any discrepancy versus what was ordered. The defining semantic property is ARRIVAL: the goods are already on-site and have been received, accepted, or inspected. Does NOT represent goods still in transit, or an advance notice issued before physical arrival (see Shipment — an ASN/inbound delivery/advance ship notice is NOT a Goods Receipt; it only becomes one once the goods actually arrive and are acknowledged). Distinct from Purchase Order (the earlier commitment/order, not the physical arrival), from Supplier Invoice (the supplier's bill, a financial claim not a physical confirmation), and from Inventory Movement (a generic ledger entry — a Goods Receipt is the specific, PO-linked business event that typically triggers one). Never a customer-facing event — the word 'receipt' alone must never be used to infer a customer sale (see Sales Transaction).",
+      "operational_meaning": "Used for on-time/in-full delivery performance, receiving discrepancy investigation, and three-way-match reconciliation.",
+      "concept_key": "goods-receipt",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Goods Receipt Line",
+      "aliases": ["goods receipt line", "receiving line", "receipt line"],
+      "table_patterns": ["goods_receipt_line", "receiving_line", "receipt_line"],
+      "key_column_patterns": ["receipt_line_id"],
+      "description": "One product-level line within a Goods Receipt — the specific product, quantity received, and inspection/condition outcome. Exists only in relation to its parent Goods Receipt.",
+      "operational_meaning": "Used for product-level receiving-discrepancy and inspection-outcome analysis.",
+      "concept_key": "goods-receipt-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Shipment",
+      "aliases": ["shipment", "shipping", "outbound shipment", "inbound shipment", "carrier shipment", "tracking", "asn", "advance ship notice", "inbound delivery"],
+      "table_patterns": ["shipment", "shipments", "shipping", "outbound_shipment", "inbound_shipment", "asn", "inbound_delivery"],
+      "key_column_patterns": ["shipment_id", "tracking_number", "carrier_id"],
+      "description": "Goods physically moving between an origin and a destination, tracked via a carrier and/or tracking reference, that have NOT YET arrived at their destination — a supplier shipping toward the retailer (inbound, including an advance ship notice / ASN / inbound delivery issued before physical receipt), the retailer shipping to a customer (outbound e-commerce fulfillment), or goods moving between the retailer's own facilities via an external freight carrier. The defining semantic property is TRANSIT: goods are in motion or expected, not yet received or accepted. The moment goods physically arrive and are accepted/inspected at a retailer-operated destination, that event becomes a Goods Receipt instead — a Shipment record and its resulting Goods Receipt commonly coexist as two separate rows for two different stages of the same physical movement; a table representing the in-transit/expected stage is a Shipment, one representing the arrived/inspected stage is a Goods Receipt. Distinct from Inventory Transfer (an internal move between the retailer's own locations using its own transport, with no external carrier/tracking reference).",
+      "operational_meaning": "Used for delivery-performance tracking, carrier-cost analysis, in-transit visibility, and customer/supplier delivery-promise monitoring.",
+      "concept_key": "shipment",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Shipment Line",
+      "aliases": ["shipment line", "shipping line", "delivery line"],
+      "table_patterns": ["shipment_line", "shipping_line", "delivery_line"],
+      "key_column_patterns": ["shipment_line_id"],
+      "description": "One product-level line within a Shipment — the specific product and quantity being shipped. Exists only in relation to its parent Shipment.",
+      "operational_meaning": "Used for product-level delivery-performance and freight-cost analysis.",
+      "concept_key": "shipment-line",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Supplier Performance",
+      "aliases": ["supplier performance", "vendor scorecard", "supplier scorecard", "vendor performance"],
+      "table_patterns": ["supplier_performance", "vendor_scorecard", "supplier_scorecard"],
+      "key_column_patterns": ["scorecard_id"],
+      "description": "A stored evaluation record scoring a Supplier's performance (on-time rate, fill rate, quality) over a period. Distinct from the underlying Purchase Order/Goods Receipt records it may be computed from — this concept is only for a system that stores the SCORECARD itself as its own object, not a live calculation performed at query time.",
+      "operational_meaning": "Used for supplier scorecarding, sourcing decisions, and contract-renewal negotiations.",
+      "concept_key": "supplier-performance",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Warehouse",
+      "aliases": ["warehouse", "distribution center", "dc", "fulfillment center", "cross-dock facility"],
+      "table_patterns": ["warehouse", "warehouses", "distribution_center", "dc", "fulfillment_center", "cross_dock"],
+      "key_column_patterns": ["warehouse_id", "dc_id", "facility_id"],
+      "description": "A NON-CUSTOMER-FACING physical facility used to store, receive, process, or distribute inventory — a distribution center, fulfillment center, or cross-dock facility are all the same underlying role under different names. Does NOT represent a customer-facing selling location (see Store) even though both are physical facilities — the defining test is identical to Store's: does a customer ever transact here? A facility that only ships to stores or directly to customers, but where no customer ever shops or checks out, is a Warehouse, never a Store.",
+      "operational_meaning": "Used for network/capacity planning, distribution-cost analysis, and fulfillment-center performance.",
+      "concept_key": "warehouse",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Warehouse Location",
+      "aliases": ["warehouse location", "warehouse zone", "bin location", "aisle", "rack", "slot"],
+      "table_patterns": ["warehouse_location", "warehouse_zone", "bin_location", "bin", "aisle", "rack", "slot"],
+      "key_column_patterns": ["location_id", "zone_id", "bin_id"],
+      "description": "A specific sub-area WITHIN a Warehouse — a zone, aisle, rack, or bin used for put-away, picking, or storage organization. Distinct from Warehouse itself (the facility as a whole) — this concept is for internal facility-organization detail, not the facility's own identity/address record. Also distinct from Store (a customer-facing selling location) — the bare word 'location' alone is not sufficient evidence for this concept; it must specifically describe a sub-area inside a non-selling storage/distribution facility.",
+      "operational_meaning": "Used for pick-path optimization, put-away strategy, and warehouse capacity/slotting analysis.",
+      "concept_key": "warehouse-location",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Fulfillment",
+      "aliases": ["fulfillment", "order fulfillment", "pick", "pack", "picking", "packing", "fulfillment task"],
+      "table_patterns": ["fulfillment", "order_fulfillment", "pick", "picking", "pack", "packing", "fulfillment_task"],
+      "key_column_patterns": ["fulfillment_id", "pick_task_id"],
+      "description": "The internal warehouse-side work of preparing an order for dispatch — picking items from stock, packing them, and staging for carrier handoff. Covers the pick/pack/stage stages of order preparation as ONE concept, since they are sequential steps of a single internal workflow, not independent business objects with separate stable identities in most systems. Distinct from Shipment (the EXTERNAL, carrier-tracked movement that begins once Fulfillment work is complete and the goods leave the facility — Fulfillment covers work UP TO carrier handoff, Shipment covers movement FROM that handoff onward) and from Sales Transaction/Purchase Order (Fulfillment records the PHYSICAL execution of an already-placed order, not the commercial sale/purchase itself).",
+      "operational_meaning": "Used for warehouse labor/productivity analysis, order-cycle-time tracking, and fulfillment SLA compliance.",
+      "concept_key": "fulfillment",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Demand Forecast",
+      "aliases": ["demand forecast", "forecast", "sales forecast", "demand plan"],
+      "table_patterns": ["demand_forecast", "forecast", "forecasts", "sales_forecast", "demand_plan"],
+      "key_column_patterns": ["forecast_id"],
+      "description": "A stored, forward-looking prediction of expected sales/demand for a product at a location over a future period. Represents a PREDICTION, not an actual historical result (see Sales Transaction for actuals) and not a specific reorder recommendation or commitment (see Purchase Order/Allocation, which may be generated FROM a forecast but are distinct downstream objects).",
+      "operational_meaning": "Used for demand planning, replenishment sizing, and inventory-investment decisions.",
+      "concept_key": "demand-forecast",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Fiscal Period",
+      "aliases": ["fiscal period", "fiscal calendar", "accounting period", "retail calendar", "reporting period"],
+      "table_patterns": ["fiscal_period", "fiscal_calendar", "accounting_period", "retail_calendar", "reporting_period"],
+      "key_column_patterns": ["period_id", "fiscal_period_id", "period_code"],
+      "description": "A defined accounting/reporting time window (week, period, quarter, fiscal year) used to bucket financial and operational reporting. A reference/calendar concept, not a transaction or event itself — other concepts (Sales Transaction, Store Target, Demand Forecast) reference a Fiscal Period, they do not represent one.",
+      "operational_meaning": "Used to align all financial and operational reporting to the retailer's own fiscal calendar rather than the standard calendar.",
+      "concept_key": "fiscal-period",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Tax",
+      "aliases": ["tax", "tax rate", "tax jurisdiction", "sales tax", "vat"],
+      "table_patterns": ["tax", "taxes", "tax_rate", "tax_jurisdiction", "vat"],
+      "key_column_patterns": ["tax_id", "tax_rate", "jurisdiction_id"],
+      "description": "A tax rate, rule, or jurisdiction applied to a sale (sales tax, VAT). Represents the RATE/RULE (or a computed tax amount tied to a transaction), never the Sales Transaction itself.",
+      "operational_meaning": "Used for tax-compliance reporting and jurisdiction-based tax-liability calculation.",
+      "concept_key": "tax",
+      "status": "ACTIVE"
+    },
+    {
+      "name": "Employee",
+      "aliases": ["employee", "associate", "staff", "store associate", "worker"],
+      "table_patterns": ["employee", "employees", "associate", "associates", "staff", "worker", "workers"],
+      "key_column_patterns": ["employee_id", "associate_id", "staff_id"],
+      "description": "The retailer's own internal staff member (store associate, warehouse worker, buyer). Represents INTERNAL personnel — distinct from Customer (who buys FROM the retailer) and from Supplier (an external partner who sells TO the retailer); an Employee works FOR the retailer.",
+      "operational_meaning": "Used for scheduling, sales attribution/commission, and workforce-productivity analysis.",
+      "concept_key": "employee",
+      "status": "ACTIVE"
     }
   ],
   "vocabulary": [
@@ -102,10 +578,10 @@
       "sql_hint": "expected_inventory - actual_inventory OR shrink_amount FROM inventory_adjustments WHERE reason_code = 'SHRINK'"
     },
     {
-      "term": "markdown",
-      "aliases": ["price reduction", "clearance", "promotion discount"],
-      "definition": "Permanent price reduction taken on a product to clear stock",
-      "sql_hint": "original_price - marked_down_price OR price_change_type = 'MARKDOWN'"
+      "term": "markdown rate",
+      "aliases": ["markdown %", "clearance discount", "price reduction rate"],
+      "definition": "Percentage price reduction taken on a product to clear stock",
+      "sql_hint": "(original_price - marked_down_price) / original_price * 100"
     },
     {
       "term": "conversion rate",
@@ -118,6 +594,18 @@
       "aliases": ["reorder", "restock", "auto-replenishment", "replen"],
       "definition": "Process of restocking a location when inventory falls below a trigger point",
       "sql_hint": "on_hand_qty <= reorder_point OR replenishment_needed = TRUE"
+    },
+    {
+      "term": "fill rate",
+      "aliases": ["order fill rate", "supplier fill rate", "OTIF"],
+      "definition": "Percentage of ordered quantity a supplier delivered on time and in full",
+      "sql_hint": "SUM(quantity_received) / SUM(quantity_ordered) * 100"
+    },
+    {
+      "term": "carrying cost",
+      "aliases": ["holding cost", "inventory carrying cost"],
+      "definition": "The cost of holding inventory over a period, including capital, storage, and obsolescence",
+      "sql_hint": "average_inventory_value * carrying_cost_rate"
     }
   ],
   "suggested_questions": [

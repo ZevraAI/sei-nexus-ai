@@ -37,16 +37,35 @@ public class ReasoningRepository {
             "started_at, concluded_at FROM nexus_reasoning_session " +
             "WHERE conversation_id = ? ORDER BY started_at DESC";
 
+    // Tenant-wide recent sessions (homepage activity feed — no single conversation).
+    private static final String FIND_RECENT_SESSIONS =
+            "SELECT session_key, run_key, conversation_id, agent_key, domain_key, " +
+            "initial_question, investigation_plan, status, conclusion, confidence_score, " +
+            "started_at, concluded_at FROM nexus_reasoning_session " +
+            "ORDER BY started_at DESC LIMIT ?";
+
+    // Tenant-wide recent findings across all domains (homepage). When status is null,
+    // all statuses are returned and the caller filters actionable vs observed.
+    private static final String FIND_RECENT_FINDINGS_ALL =
+            "SELECT finding_key, domain_key, agent_key, finding_type, title, description, " +
+            "evidence_summary, related_entity_keys, confidence, status, " +
+            "first_observed_at, last_confirmed_at, resolved_at " +
+            "FROM nexus_operational_finding " +
+            "WHERE (?::text IS NULL OR status = ?) " +
+            "ORDER BY last_confirmed_at DESC NULLS LAST LIMIT ?";
+
     // ── Step SQL ─────────────────────────────────────────────────────────────
     private static final String INSERT_STEP =
             "INSERT INTO nexus_reasoning_step " +
             "(step_key, session_key, step_no, step_type, instruction, evidence_used, " +
-            " outcome, confidence_delta, execution_key, executed_at) " +
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            " outcome, confidence_delta, execution_key, executed_at, " +
+            " evaluator_decision, evaluator_rationale) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     private static final String FIND_STEPS_BY_SESSION =
             "SELECT step_key, session_key, step_no, step_type, instruction, evidence_used, " +
-            "outcome, confidence_delta, execution_key, executed_at " +
+            "outcome, confidence_delta, execution_key, executed_at, " +
+            "evaluator_decision, evaluator_rationale " +
             "FROM nexus_reasoning_step WHERE session_key = ? ORDER BY step_no ASC";
 
     // ── Hypothesis SQL ───────────────────────────────────────────────────────
@@ -134,13 +153,19 @@ public class ReasoningRepository {
         return jdbc.query(FIND_SESSIONS_BY_CONVERSATION, sessionMapper(), conversationId);
     }
 
+    /** Recent sessions across the whole tenant (homepage — no conversation filter). */
+    public List<ReasoningSession> findRecentSessions(int limit) {
+        return jdbc.query(FIND_RECENT_SESSIONS, sessionMapper(), limit);
+    }
+
     // ── Steps ────────────────────────────────────────────────────────────────
 
     public void saveStep(ReasoningStep step) {
         jdbc.update(INSERT_STEP,
                 step.stepKey(), step.sessionKey(), step.stepNo(), step.stepType(),
                 step.instruction(), step.evidenceUsed(), step.outcome(),
-                step.confidenceDelta(), step.executionKey(), toTimestamp(step.executedAt()));
+                step.confidenceDelta(), step.executionKey(), toTimestamp(step.executedAt()),
+                step.evaluatorDecision(), step.evaluatorRationale());
     }
 
     public List<ReasoningStep> findStepsBySession(String sessionKey) {
@@ -179,6 +204,12 @@ public class ReasoningRepository {
 
     public void updateFindingStatus(String findingKey, String status, Instant resolvedAt) {
         jdbc.update(UPDATE_FINDING, status, toTimestamp(Instant.now()), toTimestamp(resolvedAt), findingKey);
+    }
+
+    /** Recent findings across all domains for the tenant (homepage). status null → all. */
+    public List<OperationalFinding> findRecentFindingsAllDomains(String status, int limit) {
+        String s = (status == null || status.isBlank() || "ALL".equalsIgnoreCase(status)) ? null : status;
+        return jdbc.query(FIND_RECENT_FINDINGS_ALL, findingMapper(), s, s, limit);
     }
 
     public List<OperationalFinding> findFindingsByDomain(String domainKey, String status) {
@@ -237,7 +268,9 @@ public class ReasoningRepository {
                     rs.getString("outcome"),
                     cd,
                     rs.getString("execution_key"),
-                    toInstant(rs, "executed_at"));
+                    toInstant(rs, "executed_at"),
+                    rs.getString("evaluator_decision"),
+                    rs.getString("evaluator_rationale"));
         };
     }
 

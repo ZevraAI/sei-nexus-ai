@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @Service
 public class SemanticService {
@@ -193,9 +194,87 @@ public class SemanticService {
                 str(body, "investigationHints",  "investigation_hints"),
                 str(body, "status") != null ? str(body, "status") : "ACTIVE",
                 userEmail,
-                now, now);
+                now, now,
+                null,
+                // Grouping Foundation Fix: the AI-generated category from the shared
+                // onboarding analysis (analyzeTableBatch), carried through
+                // MetadataRegistrationService unchanged. Omitted (e.g. a manual
+                // Semantic Layer edit) ⇒ null here, preserved via the repository's
+                // COALESCE — never erases a group an onboarding flow already set.
+                str(body, "groupLabel", "group_label"),
+                // Global Pack Foundation: no current caller (Onboarding, Discover, Pack apply,
+                // or the manual Semantic Layer edit) supplies these — this task adds only the
+                // plumbing, never a classification. Omitted ⇒ null here, preserved via the
+                // repository's COALESCE — never erases a reference a future mapping step set.
+                str(body, "packKey", "pack_key"),
+                str(body, "conceptKey", "concept_key"));
         repository.saveEntity(entity);
         return repository.findEntityByKey(entityKey).orElseThrow();
+    }
+
+    /** Thin pass-through — same layering as every other read method here (e.g. {@link
+     *  #buildSemanticContext}), just not previously needed by a caller outside {@code
+     *  SemanticController} (which calls {@link SemanticRepository} directly for this one). */
+    public Optional<BusinessEntity> findEntityByKey(String entityKey) {
+        return repository.findEntityByKey(entityKey);
+    }
+
+    /** Thin pass-through to the existing soft-delete ({@code status = 'ARCHIVED'}) — the same
+     *  operation the Semantic Layer UI's own "Archive" button already performs via {@link
+     *  SemanticRepository#archiveEntity}, exposed here so non-controller callers (Industry Pack
+     *  removal) don't need their own {@link SemanticRepository} dependency. */
+    public void archiveEntity(String entityKey) {
+        repository.archiveEntity(entityKey);
+    }
+
+    /** Thin pass-through — see {@link SemanticRepository#clearPackAssociationForConnection}.
+     *  Returns the number of Business Entities affected. */
+    public int clearPackAssociationForConnection(String packKey, String connectionKey) {
+        return repository.clearPackAssociationForConnection(packKey, connectionKey);
+    }
+
+    /** Thin pass-through — see {@link SemanticRepository#associatePackKeyForConnection}.
+     *  Returns the number of Business Entities affected. */
+    public int associatePackKeyForConnection(String packKey, String connectionKey) {
+        return repository.associatePackKeyForConnection(packKey, connectionKey);
+    }
+
+    /** Thin pass-through — PRO-22 tier-0 lookup, reused here to find the EXISTING entity (if
+     *  any) bound to a physical object, so Apply Pack's LLM classification step never creates
+     *  one — see {@link SemanticRepository#findActiveByPrimaryObjectKey}. */
+    public Optional<BusinessEntity> findActiveByPrimaryObjectKey(String objectKey) {
+        return repository.findActiveByPrimaryObjectKey(objectKey);
+    }
+
+    /** Thin pass-through — see {@link SemanticRepository#setConceptKey}. */
+    public void setConceptKey(String entityKey, String conceptKey) {
+        repository.setConceptKey(entityKey, conceptKey);
+    }
+
+    /** Thin pass-through — Concept-Scoped Metadata Narrowing Stage 1: see {@link
+     *  SemanticRepository#findDistinctConceptKeysForConnection}. */
+    public List<String> findDistinctConceptKeysForConnection(String connectionKey) {
+        return repository.findDistinctConceptKeysForConnection(connectionKey);
+    }
+
+    /** Thin pass-through — Concept-Scoped Metadata Narrowing Stage 2: see {@link
+     *  SemanticRepository#findEntitiesByConnectionAndConcepts}. */
+    public List<BusinessEntity> findEntitiesByConnectionAndConcepts(String connectionKey, List<String> conceptKeys) {
+        return repository.findEntitiesByConnectionAndConcepts(connectionKey, conceptKeys);
+    }
+
+    /** Thin pass-through to the existing soft-delete ({@code status = 'INACTIVE'}) — the same
+     *  operation the Semantic Layer UI's own vocabulary "Delete" action already performs (via a
+     *  full re-upsert on the frontend). This status-only variant is used by Industry Pack
+     *  removal, which does not have every original field on hand to safely re-upsert with. */
+    public void deactivateTerm(String termKey) {
+        repository.deactivateTerm(termKey);
+    }
+
+    /** Thin pass-through — used by Industry Pack apply to make idempotent vocabulary
+     *  reuse/reactivation explicit and observable. */
+    public Optional<OperationalVocabulary> findTermByKey(String termKey) {
+        return repository.findTermByKey(termKey);
     }
 
     public EntityLifecycleState addLifecycleState(String entityKey, Map<String, Object> body) {
