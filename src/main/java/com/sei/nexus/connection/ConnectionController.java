@@ -1,10 +1,14 @@
 package com.sei.nexus.connection;
 
+import com.sei.nexus.auth.UserAccount;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.common.NexusException;
+import com.sei.nexus.pack.IndustryPackRepository;
+import com.sei.nexus.pack.IndustryPackService;
 import com.sei.nexus.sql.DynamicSqlService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
@@ -25,13 +29,22 @@ public class ConnectionController {
     private final ConnectionRepository connectionRepository;
     private final ConnectionTestService connectionTestService;
     private final DynamicSqlService dynamicSqlService;
+    private final ConnectionService connectionService;
+    private final IndustryPackRepository packRepository;
+    private final IndustryPackService packService;
 
     public ConnectionController(ConnectionRepository connectionRepository,
                                  ConnectionTestService connectionTestService,
-                                 DynamicSqlService dynamicSqlService) {
+                                 DynamicSqlService dynamicSqlService,
+                                 ConnectionService connectionService,
+                                 IndustryPackRepository packRepository,
+                                 IndustryPackService packService) {
         this.connectionRepository = connectionRepository;
         this.connectionTestService = connectionTestService;
         this.dynamicSqlService = dynamicSqlService;
+        this.connectionService = connectionService;
+        this.packRepository = packRepository;
+        this.packService = packService;
     }
 
     /**
@@ -54,14 +67,35 @@ public class ConnectionController {
      *
      * <p>Request body fields:
      * connectionKey (optional), name, connectionType, usageDescription,
-     * jdbcUrl, instanceUrl, username, secret, allowedSchemas, allowedTables, readOnly</p>
+     * jdbcUrl, instanceUrl, username, secret, allowedSchemas, allowedTables, readOnly,
+     * <b>packKey</b> (required for a NEW connection only — see below), domainKey (optional,
+     * defaults to the tenant's PLATFORM domain).
+     *
+     * <p><b>Industry Pack Required At Connection Creation:</b> when this request creates a
+     * genuinely NEW connection (no {@code connectionKey} supplied, or one that does not already
+     * exist), {@code packKey} is required and validated — see {@link
+     * ConnectionService#createConnection}. Editing an EXISTING connection through this same
+     * upsert endpoint is completely unaffected: no Pack is required, none is touched, and the
+     * behavior is byte-identical to before this feature existed.
      */
     @PostMapping
     public ResponseEntity<NexusConnection> upsertConnection(
             @RequestBody Map<String, Object> body) {
 
-        String connectionKey = (String) body.getOrDefault("connectionKey",
-                Keys.uniqueKey("conn"));
+        Object requestedKey = body.get("connectionKey");
+        boolean isNewConnection = requestedKey == null || requestedKey.toString().isBlank()
+                || connectionRepository.findByKey(requestedKey.toString()).isEmpty();
+
+        NexusConnection saved = isNewConnection
+                ? connectionService.createConnection(body, currentUserEmail())
+                : upsertExisting(requestedKey.toString(), body);
+
+        return ResponseEntity.status(HttpStatus.OK).body(redactSecret(saved));
+    }
+
+    /** The pre-existing upsert path, unchanged — editing a connection that already exists never
+     *  requires or touches an Industry Pack. */
+    private NexusConnection upsertExisting(String connectionKey, Map<String, Object> body) {
         String name = requireString(body, "name");
         String connectionType = requireString(body, "connectionType");
 
@@ -98,12 +132,14 @@ public class ConnectionController {
 
         connectionRepository.save(conn);
 
-        // Return without the secret
-        NexusConnection saved = connectionRepository.findByKey(connectionKey)
-                .map(this::redactSecret)
+        return connectionRepository.findByKey(connectionKey)
                 .orElseThrow(() -> new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Save failed unexpectedly"));
+    }
 
-        return ResponseEntity.status(HttpStatus.OK).body(saved);
+    private String currentUserEmail() {
+        Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (principal instanceof UserAccount u) return u.email();
+        throw new NexusException(HttpStatus.UNAUTHORIZED, "Not authenticated");
     }
 
     /**
@@ -141,6 +177,17 @@ public class ConnectionController {
     /**
      * DELETE /connections/{connectionKey}
      * Deletes the connection — blocked if any data objects or agents reference it.
+     *
+     * <p>Industry Pack Required At Connection Creation: since every connection now always
+     * carries an ACTIVE Industry Pack from the moment it's created, deleting a connection must
+     * release that Pack too — otherwise the pack_key would remain permanently "already applied"
+     * tenant-wide (see {@code IndustryPackService#applyPack}'s own guard) with no connection left
+     * to remove it from, silently blocking that Pack from ever being applied again. This reuses
+     * the EXISTING {@link IndustryPackService#removePack} exactly as the Packs UI's own Remove
+     * action does — no Pack-removal logic is changed, only invoked from this new call site. Most
+     * relevant for the onboarding wizard's existing create → test → delete-on-failure flow, which
+     * would otherwise always leak an orphaned {@code nexus_tenant_pack} row now that Pack
+     * selection is mandatory at creation.
      */
     @DeleteMapping("/{connectionKey}")
     public ResponseEntity<Void> archiveConnection(@PathVariable String connectionKey) {
@@ -153,6 +200,9 @@ public class ConnectionController {
                     "Cannot delete connection '" + connectionKey + "' — it is still used by: " +
                     String.join(", ", dependents) + ". Remove those dependencies first or re-assign them to another connection.");
         }
+
+        packRepository.findActivePackForConnection(connectionKey).ifPresent(tenantPack ->
+                packService.removePack(tenantPack.packKey()));
 
         connectionRepository.archive(connectionKey);
         return ResponseEntity.noContent().build();
