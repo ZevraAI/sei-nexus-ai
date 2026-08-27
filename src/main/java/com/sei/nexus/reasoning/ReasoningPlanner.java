@@ -63,8 +63,37 @@ public class ReasoningPlanner {
             - Extract filter values from the attached file content when present.
             - RESOLUTIONS map the user's terms to this tenant's canonical names and values.
               Prefer them over your own interpretation of those terms.
-            - Literals filtered on columns with listed legal values MUST be copied exactly
-              from those lists or from the user's question — never invented.
+            - Every column's value domain in "Approved schema" is labeled either
+              [legal values: ...] or [observed values: ...]. These mean different things:
+                • [legal values: ...] is AUTHORITATIVE — the CLOSED, COMPLETE set of every
+                  value that column can ever physically hold (e.g. a database enum). Nothing
+                  outside this list is a valid literal for that column, ever.
+                • [observed values: ...] is a SAMPLE only — real values seen in the data,
+                  never a complete list. Do not treat it as exhaustive, and do not refuse a
+                  value merely because it is absent from an observed sample — this is a
+                  free-text-style column.
+            - Before filtering an authoritative (legal-values) column on a literal, reason
+              through these in order:
+                1. EXACT MATCH — the user's term names one of the legal values (allowing for
+                   case/whitespace differences only) → use that legal value exactly as listed.
+                2. BUSINESS-CONCEPT MATCH — the term is a business phrase rather than a literal
+                   value name (e.g. "open", "active", "in progress", "overdue"). Check whether
+                   the business entity/vocabulary definitions given in this context (if any)
+                   define that term as corresponding to one or more of the column's legal
+                   values. If they do, filter using those exact legal values (an IN (...) list
+                   when more than one applies), and state the mapping you used in "rationale".
+                3. NO DEFENSIBLE MATCH — the term matches no legal value and no business
+                   definition available to you supports a mapping to one or more legal values.
+                   You MUST NOT invent, guess, or substitute a legal-sounding value in this
+                   case, and you MUST NOT filter on the user's own literal term either — an
+                   authoritative column only ever accepts its own legal values. Instead of
+                   "sql", respond with "clarification_question" (see the response shape below)
+                   naming the term you could not resolve and listing the actual legal values so
+                   the user can choose one — do not generate any SQL for this step.
+              This three-step reasoning applies ONLY to columns with a listed "legal values"
+              domain. A column with only "observed values", or no listed domain at all, is
+              free text — use the tolerant-matching guidance below instead; do not require an
+              exact or defensible match for it.
             - When a filter literal resolves a user term to a stored value (e.g. the user
               said "TX" and you filter on 'Texas' from a legal-values list), declare it in
               "literal_bindings". Omit the field when there is nothing to declare.
@@ -84,6 +113,10 @@ public class ReasoningPlanner {
 
             Return JSON only (no markdown, no explanation):
             {"done":false,"description":"one-line goal","sql":"SELECT ...","connection_key":"...","object_keys":"key1,key2","rationale":"why this step advances the investigation","literal_bindings":[{"surface":"TX","column":"stores.state_province","value":"Texas"}]}
+
+            OR, when step 3 above applies — a term you cannot defensibly resolve against an
+            authoritative legal-values column:
+            {"done":false,"clarification_question":"one clear question naming the term you could not resolve and listing the actual legal values so the user can choose","rationale":"why no legal value or business definition matched"}
 
             OR if no further queries are needed:
             {"done":true}
@@ -112,6 +145,22 @@ public class ReasoningPlanner {
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 
             if (Boolean.TRUE.equals(parsed.get("done"))) return null;
+
+            // Semantic Reasoning Over Authoritative Value Domains: the planner's own, explicit
+            // way to decline generating SQL when a user's term cannot be defensibly resolved
+            // against an authoritative (legal-values) enum column — see the SYSTEM_PROMPT's
+            // "NO DEFENSIBLE MATCH" rule. Checked before "sql" so a response carrying both is
+            // still treated as a clarification (never silently falls through to executing SQL
+            // built on a term the planner itself flagged as unresolved).
+            String clarification = strOr(parsed, "clarification_question", "");
+            if (!clarification.isBlank()) {
+                return new StepPlan(
+                        strOr(parsed, "description", "Clarification needed"),
+                        null, null, "",
+                        strOr(parsed, "rationale", ""),
+                        List.of(),
+                        clarification.strip());
+            }
 
             String sql     = (String) parsed.get("sql");
             String connKey = (String) parsed.get("connection_key");
@@ -179,7 +228,14 @@ public class ReasoningPlanner {
      */
     public record LiteralBinding(String surface, String column, String value) {}
 
-    /** Immutable value object representing a planned SQL step. */
+    /**
+     * Immutable value object representing a planned step — either a SQL step, or (Semantic
+     * Reasoning Over Authoritative Value Domains) a declined step carrying {@code
+     * clarificationQuestion} instead: the planner determined the user's term cannot be
+     * defensibly resolved against an authoritative legal-values column, and no SQL should be
+     * generated for it. {@code sql}/{@code connectionKey} are {@code null} in that case —
+     * callers MUST check {@link #isClarification()} before attempting to execute {@code sql}.
+     */
     public record StepPlan(
             String description,
             String sql,
@@ -187,12 +243,25 @@ public class ReasoningPlanner {
             String objectKeys,
             String rationale,
             // Declared literal resolutions; empty when nothing was declared (PRO-33).
-            List<LiteralBinding> literalBindings
+            List<LiteralBinding> literalBindings,
+            // Non-null/non-blank ⇒ this step is a clarification request, not a SQL step (see
+            // class javadoc). Null for every pre-existing caller/constructor below.
+            String clarificationQuestion
     ) {
-        /** Pre-PRO-33 shape — no declared bindings. */
+        /** Pre-clarification shape — no clarification (PRO-33). */
+        public StepPlan(String description, String sql, String connectionKey,
+                        String objectKeys, String rationale, List<LiteralBinding> literalBindings) {
+            this(description, sql, connectionKey, objectKeys, rationale, literalBindings, null);
+        }
+
+        /** Pre-PRO-33 shape — no declared bindings, no clarification. */
         public StepPlan(String description, String sql, String connectionKey,
                         String objectKeys, String rationale) {
-            this(description, sql, connectionKey, objectKeys, rationale, List.of());
+            this(description, sql, connectionKey, objectKeys, rationale, List.of(), null);
+        }
+
+        public boolean isClarification() {
+            return clarificationQuestion != null && !clarificationQuestion.isBlank();
         }
     }
 }

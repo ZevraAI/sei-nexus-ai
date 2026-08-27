@@ -196,6 +196,66 @@ class ChatServiceHardeningTest {
         assertTrue(results.get(0).containsKey("rows"));
     }
 
+    // ── Semantic Reasoning Over Authoritative Value Domains ──────────────────────
+
+    @Test
+    void evidenceToExecResultsEmitsClarificationForADeclinedStepDistinctFromBlocked() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.add(1, "step", "", "", List.of(), null, "CLARIFICATION_NEEDED",
+                "'open' is not one of purchase_orders.status's legal values "
+                        + "(draft, submitted, acknowledged, partially_received, received, cancelled, closed).", 0L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("clarification"));
+        assertTrue(String.valueOf(results.get(0).get("question")).contains("draft"),
+                "the actual legal values must be preserved into the composer's context");
+        assertFalse(results.get(0).containsKey("blocked"),
+                "a semantic-reasoning decline must never be mislabeled as a governance block");
+        assertFalse(results.get(0).containsKey("error"));
+        assertFalse(results.get(0).containsKey("rows"));
+    }
+
+    @Test
+    void resultSystemPromptDistinguishesClarificationFromBlockedAndError() {
+        String clarification = ChatService.resultSystemPrompt(false, false, false, true, false);
+        String blocked       = ChatService.resultSystemPrompt(false, false, true, false, false);
+        String error         = ChatService.resultSystemPrompt(false, true, false, false, false);
+
+        assertNotEquals(clarification, blocked);
+        assertNotEquals(clarification, error);
+        assertTrue(clarification.toLowerCase().contains("clarif")
+                        || clarification.toLowerCase().contains("question"),
+                "the clarification prompt must instruct the composer to ask a question");
+        assertFalse(clarification.toLowerCase().contains("governance"),
+                "a semantic-reasoning decline is not a governance/policy denial");
+    }
+
+    @Test
+    void dataRowsStillWinOverClarificationWhenBothArePresent() {
+        // Precedence: real data from an earlier step must still answer the question even if a
+        // later step in the same investigation declined — same rule as error/blocked.
+        assertEquals(ChatService.resultSystemPrompt(true, false, false, false, false),
+                ChatService.resultSystemPrompt(true, false, false, true, false));
+    }
+
+    @Test
+    void fourArgResultSystemPromptOverloadIsUnchangedForExistingCallers() {
+        // The pre-existing 4-arg signature must remain byte-identical (anyClarification=false).
+        assertEquals(ChatService.resultSystemPrompt(false, false, true, false),
+                ChatService.resultSystemPrompt(false, false, true, false, false));
+        assertEquals(ChatService.resultFallbackMessage(false, false, true),
+                ChatService.resultFallbackMessage(false, false, true, false));
+    }
+
+    @Test
+    void clarificationFallbackMessageIsDistinctFromBlockedAndDoesNotClaimSuccess() {
+        String fallback = ChatService.resultFallbackMessage(false, false, false, true);
+        assertFalse(fallback.toLowerCase().contains("completed"));
+        assertFalse(fallback.toLowerCase().contains("blocked by data governance"));
+    }
+
     // ── Internal-error leakage ──────────────────────────────────────────────────
 
     @Test

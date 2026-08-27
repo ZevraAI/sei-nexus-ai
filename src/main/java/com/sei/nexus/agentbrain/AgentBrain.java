@@ -127,22 +127,46 @@ public class AgentBrain {
      * experience is grounded in, so it is derived here rather than in the assembler (a
      * selection primitive) or the Runtime (deterministic, and unaware of business scope).
      *
+     * <p><b>domain_keys vs. physical metadata retrieval (Concept-Scoped Metadata Narrowing —
+     * domain-key decoupling):</b> {@code domainKeys} is a namespace/partition key consumed
+     * independently by {@link BusinessLanguageResolver}, vocabulary/entity context, semantic
+     * learning, the knowledge graph, RAG, and provenance tagging — all of that is untouched and
+     * still driven by {@code domainKeys} exactly as before (see {@link #resolve}, which passes
+     * it to {@link #resolver} regardless of what this method does). It is NOT the criterion for
+     * <em>which physical objects/columns to retrieve</em> — that decision now belongs to {@link
+     * ConceptScopedMetadataResolver} whenever it can make it (an active Pack + a non-empty
+     * tenant concept catalog on every in-scope connection), independent of whether {@code
+     * domainKeys} happens to be empty or not. Concretely:
+     *
      * <ul>
-     *   <li><b>No business domains</b> (autonomous agents): the scope is the agent's
-     *       connections. Unchanged from Phase 2.</li>
-     *   <li><b>Business domains present</b> (conversational): the scope is those domains,
-     *       narrowed to the approved connections. Domain boundaries are preserved — an object
-     *       is never admitted merely because it shares a connection with an in-scope object.</li>
-     *   <li><b>Stale-connection fallback</b>: if narrowing would empty the scope, the domain
-     *       scope is kept. A stale connection key on the agent record must not silently blank
-     *       the surface — the same rule the conversational grounding has always applied.</li>
+     *   <li><b>Concept-scoped narrowing applies</b> (any scope — domain-free or domain-bearing):
+     *       {@link #conceptScopedModel} resolves the physical surface. {@code assembleByDomains}
+     *       is never called in this case.</li>
+     *   <li><b>Concept-scoped narrowing does not apply</b> (no resolver wired, no connections, no
+     *       active Pack on any in-scope connection, no tenant concept catalog yet, or any
+     *       failure — see {@link #conceptScopedModel}'s own fallback discipline): falls through
+     *       to exactly the pre-existing behavior —
+     *       <ul>
+     *         <li><b>No business domains</b> (autonomous agents): the scope is the agent's
+     *             connections. Unchanged from Phase 2.</li>
+     *         <li><b>Business domains present</b> (conversational): the scope is those domains,
+     *             narrowed to the approved connections. Domain boundaries are preserved — an
+     *             object is never admitted merely because it shares a connection with an
+     *             in-scope object.</li>
+     *         <li><b>Stale-connection fallback</b>: if narrowing would empty the scope, the
+     *             domain scope is kept. A stale connection key on the agent record must not
+     *             silently blank the surface — the same rule the conversational grounding has
+     *             always applied.</li>
+     *       </ul>
+     *   </li>
      * </ul>
      */
     private SemanticModel assembleBusinessScope(List<String> connectionKeys,
                                                 List<String> domainKeys, String question) {
+        Optional<SemanticModel> conceptScoped = conceptScopedModel(connectionKeys, question);
+        if (conceptScoped.isPresent()) return conceptScoped.get();
+
         if (domainKeys == null || domainKeys.isEmpty()) {
-            Optional<SemanticModel> conceptScoped = conceptScopedModel(connectionKeys, question);
-            if (conceptScoped.isPresent()) return conceptScoped.get();
             return assembler.assemble(connectionKeys);
         }
         SemanticModel byDomain = assembler.assembleByDomains(domainKeys);

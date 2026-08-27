@@ -160,6 +160,25 @@ public class ReasoningEngine {
                 break;
             }
 
+            // Semantic Reasoning Over Authoritative Value Domains: the planner declined to
+            // generate SQL because the user's term cannot be defensibly resolved against an
+            // authoritative legal-values column (see ReasoningPlanner's SYSTEM_PROMPT). Recorded
+            // as evidence — exactly like UNAPPROVED_OBJECTS/LITERAL_REJECTED below — so the
+            // existing composeAnswer pipeline turns it into a clarifying question for the user,
+            // rather than silently stopping with no explanation. No SQL is executed; nothing
+            // reaches GovernedSqlRuntime/Postgres for this step.
+            if (plan.isClarification()) {
+                log.info("Planner requests clarification at step {} for run '{}': {}",
+                        stepNo, runKey, plan.clarificationQuestion());
+                evidence.add(stepNo, plan.description(), "", "", List.of(), plan.rationale(),
+                        "CLARIFICATION_NEEDED", plan.clarificationQuestion(), 0L);
+                saveStep(sessionKey, stepNo, plan, "CLARIFICATION_NEEDED", plan.clarificationQuestion(),
+                        evidence, List.of(), null);
+                eventBus.publish(runKey, "step_blocked",
+                        Map.of("stepNo", stepNo, "reason", plan.clarificationQuestion()));
+                break;
+            }
+
             log.info("Reasoning step {}/{} for run '{}': {}", stepNo, MAX_STEPS, runKey, plan.description());
             eventBus.publish(runKey, "step_started", Map.of(
                     "stepNo",      stepNo,

@@ -129,10 +129,55 @@ class ReasoningPlannerPromptTest {
 
     @Test
     void preExistingLegalValueGuidanceIsUnchanged() throws Exception {
-        // Principle 6/Limitations: this specification must not touch enum-domain handling.
+        // Semantic Reasoning Over Authoritative Value Domains: the old wording here —
+        // "MUST be copied exactly from those lists OR FROM THE USER'S QUESTION" — was itself
+        // the root cause of a real production bug: it read as license to copy an out-of-domain
+        // word straight from the user's phrasing (e.g. "open") as a literal, satisfying "never
+        // invented" even when that word is not one of the column's actual legal values. That
+        // permissive escape hatch is deliberately superseded (not silently changed) by the new
+        // three-step legal-value reasoning block below — this is the one piece of "enum-domain
+        // handling" this specification is EXPECTED to touch. The rest of this guidance is
+        // unchanged.
         String p = systemPrompt();
-        assertTrue(p.contains("Literals filtered on columns with listed legal values MUST be copied exactly"));
+        assertFalse(p.contains("or from the user's question"),
+                "the permissive 'or from the user's question' escape hatch must be gone");
         assertTrue(p.contains("RESOLUTIONS map the user's terms to this tenant's canonical names and values"));
         assertTrue(p.contains("literal_bindings"));
+    }
+
+    // ── Semantic Reasoning Over Authoritative Value Domains ──────────────────────
+
+    @Test
+    void legalValuesAreDistinguishedFromObservedValuesAsAuthoritative() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("[legal values: ...] is AUTHORITATIVE"));
+        assertTrue(p.contains("CLOSED, COMPLETE set"));
+        assertTrue(p.contains("[observed values: ...] is a SAMPLE only"));
+        assertTrue(p.contains("never a complete list"));
+    }
+
+    @Test
+    void threeStepLegalValueReasoningIsPresent() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("EXACT MATCH"));
+        assertTrue(p.contains("BUSINESS-CONCEPT MATCH"));
+        assertTrue(p.contains("NO DEFENSIBLE MATCH"));
+        assertTrue(p.contains("business entity/vocabulary definitions given in this context"));
+        assertTrue(p.contains("You MUST NOT invent, guess, or substitute a legal-sounding value"));
+        assertTrue(p.contains("you MUST NOT filter on the user's own literal term either"));
+    }
+
+    @Test
+    void clarificationResponseShapeIsDocumented() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("\"clarification_question\""));
+        assertTrue(p.contains("step 3 above applies"));
+    }
+
+    @Test
+    void legalValueReasoningIsScopedOnlyToColumnsWithALegalValuesDomain() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("applies ONLY to columns with a listed \"legal values\""));
+        assertTrue(p.contains("free text — use the tolerant-matching guidance below instead"));
     }
 }

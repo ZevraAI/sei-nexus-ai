@@ -391,4 +391,188 @@ class AgentBrainTest {
         assertEquals(List.of("conn-1"), assembler.seenKeys);
         assertEquals(2, model.objects().size());
     }
+
+    // ── domain_keys != metadata-selection criteria (Concept-Scoped Metadata Narrowing —
+    // domain-key decoupling) ──────────────────────────────────────────────────────────────
+    //
+    // A domain-bearing conversational scope (domainKeys=['PLATFORM'], exactly what every
+    // onboarding-created agent has) must now ALSO reach concept-scoped narrowing when its
+    // connection has the prerequisites — previously it never could, because
+    // assembleBusinessScope only tried conceptScopedModel inside the domainKeys.isEmpty()
+    // branch. domainKeys itself must still reach BusinessLanguageResolver unchanged.
+
+    private static SemanticModel inventoryOnly() {
+        BusinessObject inv = new BusinessObject("obj-inv", "Inventory", "",
+                List.of(new BusinessAttribute("c-inv", "OnHandQty", AttributeRole.MEASURE)), List.of());
+        return new SemanticModel(
+                List.of(inv),
+                Map.of("obj-inv", new PhysicalTable("conn-1", "public", "inventory_balances")),
+                Map.of("c-inv", new PhysicalColumn("conn-1", "public", "inventory_balances", "on_hand_qty")));
+    }
+
+    // Test 1 — an agent with domainKeys=['PLATFORM'] DOES invoke concept-scoped selection.
+    @Test
+    void domainBearingScopeInvokesConceptScopedSelection() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        brain.resolve("agent-1", List.of("conn-1"), List.of("PLATFORM"), "how much stock do we have?");
+
+        assertEquals(List.of("conn-1"), conceptResolver.seenConnectionKeys,
+                "concept-scoped selection must be attempted even though domainKeys is non-empty");
+    }
+
+    // Test 2 — the caller receives the selected concept's objects/columns, not the entire
+    // PLATFORM domain (assembleByDomains must never be called when concept-scoping succeeds).
+    @Test
+    void domainBearingScopeReceivesSelectedConceptObjectsNotTheWholeDomain() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects()); // would be returned by assembleByDomains
+        assembler.objectKeysModel = inventoryOnly();               // returned by assembleByObjectKeys
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"),
+                List.of("PLATFORM"), "how much stock do we have?");
+
+        assertEquals(1, model.objects().size(), "must receive only the concept-selected object, not the whole domain");
+        assertEquals("Inventory", model.objects().get(0).businessName());
+        assertNull(assembler.seenDomainKeys, "assembleByDomains must never be called when concept-scoping succeeds");
+        assertEquals(List.of("obj-inv"), assembler.seenObjectKeys);
+    }
+
+    // Test 3 / 9 — BusinessLanguageResolver (and, by the same code path, every other independent
+    // domain_keys consumer downstream in ChatService) still receives PLATFORM unchanged, whether
+    // concept-scoping succeeds or falls back.
+    @Test
+    void businessLanguageResolverStillReceivesDomainKeysWhenConceptScopingSucceeds() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        FakeResolver blr = new FakeResolver();
+        AgentBrain brain = new AgentBrain(assembler, blr, conceptResolver);
+
+        brain.resolve("agent-1", List.of("conn-1"), List.of("PLATFORM"), "how much stock do we have?");
+
+        assertEquals(1, blr.calls, "BusinessLanguageResolver must still run for a domain-bearing scope");
+        assertEquals(List.of("PLATFORM"), blr.seenDomainKeys,
+                "domain_keys must reach BusinessLanguageResolver unchanged — it is not the metadata-selection criterion");
+    }
+
+    @Test
+    void businessLanguageResolverStillReceivesDomainKeysWhenConceptScopingFallsBack() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // no entry for conn-1 ⇒ Optional.empty()
+        FakeResolver blr = new FakeResolver();
+        AgentBrain brain = new AgentBrain(assembler, blr, conceptResolver);
+
+        brain.resolve("agent-1", List.of("conn-1"), List.of("PLATFORM"), "how many orders");
+
+        assertEquals(1, blr.calls, "BusinessLanguageResolver must still run even when concept-scoping is inapplicable");
+        assertEquals(List.of("PLATFORM"), blr.seenDomainKeys);
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
+                "the fallback assembly must still run exactly as before this change");
+    }
+
+    // Test 8 — existing fallback behavior remains fully intact when concept-scoping
+    // prerequisites are unavailable for a domain-bearing scope: assembleByDomains + connection
+    // narrowing runs exactly as it did before this change.
+    @Test
+    void domainBearingScopeFallsBackToAssembleByDomainsWhenConceptScopingIsInapplicable() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // declines for conn-1
+
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
+                "assembleByDomains must still be called exactly as before when concept-scoping does not apply");
+        assertEquals(2, model.objects().size());
+        assertNull(assembler.seenObjectKeys, "the concept-scoped primitive must never be called on fallback");
+    }
+
+    @Test
+    void noConceptResolverAtAllStillFallsBackToAssembleByDomainsForADomainBearingScope() {
+        // The exact pre-existing behavior for every tenant that hasn't wired a resolver at all —
+        // must remain byte-identical.
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver()); // 2-arg — no conceptResolver
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys);
+        assertEquals(2, model.objects().size());
+    }
+
+    // Test 5/6 — concept selection is performed entirely by the LLM (via the resolver); Java
+    // (AgentBrain) neither inspects the question nor adds/infers a concept — it only relays
+    // exactly the object keys the resolver returned, unchanged, for a domain-bearing scope too.
+    @Test
+    void javaRelaysTheResolversSelectionVerbatimForADomainBearingScopeNeverAddingOrInferring() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        brain.resolve("agent-1", List.of("conn-1"), List.of("PLATFORM"),
+                "totally unrelated question text with no keyword overlap with inventory at all");
+
+        assertEquals(List.of("obj-inv"), assembler.seenObjectKeys,
+                "AgentBrain must pass through exactly what the resolver selected, regardless of question wording");
+        assertEquals("totally unrelated question text with no keyword overlap with inventory at all",
+                conceptResolver.seenQuestion, "the raw question is relayed unmodified — AgentBrain never rewrites or matches it itself");
+    }
+
+    // Test 7 — connection isolation remains intact for a domain-bearing, multi-connection scope:
+    // if EVERY in-scope connection can be concept-scoped, narrowing applies across all of them;
+    // if the prerequisite is missing for ANY one connection, the whole thing falls back to the
+    // existing safe domain+connection-narrowing path — never a partial/mixed narrowing.
+    @Test
+    void multiConnectionDomainBearingScopeNarrowsOnlyWhenEveryConnectionQualifies() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        // conn-2 has no entry ⇒ Optional.empty() ⇒ concept-scoping is inapplicable for the pair.
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys,
+                "both connections must be attempted before deciding narrowing is inapplicable");
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
+                "one connection lacking prerequisites must fall the WHOLE scope back to assembleByDomains — never a partial narrowing");
+        assertNull(assembler.seenObjectKeys);
+    }
+
+    @Test
+    void multiConnectionDomainBearingScopeNarrowsAcrossAllConnectionsWhenBothQualify() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        SemanticModel combined = new SemanticModel(
+                List.of(new BusinessObject("obj-a", "A", "", List.of(), List.of()),
+                        new BusinessObject("obj-b", "B", "", List.of(), List.of())),
+                Map.of("obj-a", new PhysicalTable("conn-1", "public", "a"),
+                       "obj-b", new PhysicalTable("conn-2", "public", "b")),
+                Map.of());
+        assembler.objectKeysModel = combined;
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-a")));
+        conceptResolver.resultByConnection.put("conn-2", java.util.Optional.of(List.of("obj-b")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys);
+        assertEquals(List.of("obj-a", "obj-b"), assembler.seenObjectKeys,
+                "when every connection qualifies, narrowing applies across all of them together");
+        assertNull(assembler.seenDomainKeys, "assembleByDomains must not be called when every connection qualified");
+        assertEquals(2, model.objects().size());
+    }
 }

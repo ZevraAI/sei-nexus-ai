@@ -1052,9 +1052,10 @@ public class ChatService {
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
             StringBuilder ctx = new StringBuilder();
 
-            boolean anyRows    = false;
-            boolean anyError   = false;
-            boolean anyBlocked = false;
+            boolean anyRows          = false;
+            boolean anyError         = false;
+            boolean anyBlocked       = false;
+            boolean anyClarification = false;
 
             for (Map<String, Object> r : execResults) {
                 if (r.containsKey("rows")) {
@@ -1065,6 +1066,9 @@ public class ChatService {
                 } else if (r.containsKey("error")) {
                     ctx.append("Query error: ").append(r.get("error")).append("\n");
                     anyError = true;
+                } else if (r.containsKey("clarification")) {
+                    ctx.append("Clarification needed: ").append(r.get("question")).append("\n");
+                    anyClarification = true;
                 } else if (r.containsKey("blocked")) {
                     ctx.append("Query blocked: ").append(r.get("reason")).append("\n");
                     anyBlocked = true;
@@ -1090,12 +1094,12 @@ public class ChatService {
 
             String prompt = "Question: " + question + attachmentNote + "\n\nQuery results:\n" + ctx;
 
-            String systemPrompt = resultSystemPrompt(anyRows, anyError, anyBlocked,
+            String systemPrompt = resultSystemPrompt(anyRows, anyError, anyBlocked, anyClarification,
                     attachmentSummary != null && !attachmentSummary.isBlank());
 
             // Presentation policy (system prompt) and evidence context are chat's; only the
             // model call + failure handling are delegated to the shared composer.
-            String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked);
+            String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification);
             return nlComposer.compose(
                     NaturalLanguageComposer.CompositionRequest.text(prompt, systemPrompt, fallback));
     }
@@ -1225,20 +1229,70 @@ public class ChatService {
      * question even if a later step in the same investigation failed/was blocked). Only when
      * there is no data at all do failure and blocked need to be told apart from a query that
      * simply ran clean and matched nothing — a failure must never be presented as "no records".
+     *
+     * <p>Pre-clarification signature, preserved byte-for-byte for existing callers/tests —
+     * delegates to the 5-arg overload with {@code anyClarification=false}.
      */
     static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
                                       boolean hasAttachment) {
+        return resultSystemPrompt(anyRows, anyError, anyBlocked, false, hasAttachment);
+    }
+
+    /**
+     * Semantic Reasoning Over Authoritative Value Domains: same precedence as the 4-arg overload,
+     * with one addition — a step the planner explicitly declined (an unresolvable term against an
+     * authoritative value domain) is told apart from both a governance "blocked" outcome and a
+     * clean zero-row result, so the composed answer asks the clarifying question the planner
+     * raised instead of reporting "no records" or "blocked by policy".
+     */
+    static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                      boolean anyClarification, boolean hasAttachment) {
         if (anyRows) return DATA_ANSWER_SYSTEM_PROMPT;
         if (anyError) return failedQuerySystemPrompt();
+        if (anyClarification) return clarificationSystemPrompt();
         if (anyBlocked) return blockedQuerySystemPrompt();
         return zeroRowSystemPrompt(hasAttachment);
     }
 
+    /**
+     * The system prompt when the planner itself asked for clarification rather than generating
+     * SQL — distinct from a governance block (this is a semantic-reasoning outcome, not a policy
+     * denial) and from a failure (nothing was attempted, nothing failed). The clarifying question
+     * itself, including the actual legal values, is already in the "Clarification needed:" line
+     * of the query-results context — this system prompt tells the composer to relay it as a
+     * genuine question back to the user, not to answer on the term's behalf.
+     */
+    static String clarificationSystemPrompt() {
+        return """
+                You are Zevra, an enterprise operational intelligence AI.
+                The investigation could not proceed because one of the user's terms does not
+                match any of the actual, authoritative values for the column it would filter —
+                and no existing business definition in your context supports a confident mapping
+                to one of those values.
+                Ask the user a short, specific clarifying question: name the term you could not
+                resolve and list the actual legal values (from "Clarification needed:" above) so
+                they can pick one, or restate what they meant.
+                Do NOT guess which legal value the user probably meant. Do NOT generate or imply
+                any SQL or filter value yourself — this is a question back to the user, not an
+                answer.
+                Keep the response to 1-2 sentences.
+                """;
+    }
+
     /** The composer's last-resort fallback text (used only if the LLM call itself fails) —
-     *  same precedence and the same "never claim success on failure" rule as {@link #resultSystemPrompt}. */
+     *  same precedence and the same "never claim success on failure" rule as {@link #resultSystemPrompt}.
+     *  Pre-clarification signature, preserved for existing callers/tests. */
     static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked) {
+        return resultFallbackMessage(anyRows, anyError, anyBlocked, false);
+    }
+
+    /** Semantic Reasoning Over Authoritative Value Domains: adds the clarification fallback,
+     *  same precedence rule as the 4-arg overload. */
+    static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                         boolean anyClarification) {
         if (anyRows) return "Investigation completed. Results are shown in the table below.";
         if (anyError) return "The query could not be executed.";
+        if (anyClarification) return "One of the terms in your question doesn't match an available value — could you clarify?";
         if (anyBlocked) return "The request was blocked by data governance policy.";
         return "Investigation completed. No data returned.";
     }
@@ -1320,7 +1374,15 @@ public class ChatService {
         if (hasMemory) {
             sb.append("Knowledge memory chunks: ").append(memChunks.size()).append(" available\n");
         }
-        if (!semCtx.isBlank()) sb.append("Semantic layer: available\n");
+        // Semantic Reasoning Over Authoritative Value Domains: the tenant's curated business
+        // entity/vocabulary definitions (SemanticService.buildSemanticContext — already computed
+        // above as `semantic`, previously reduced to a bare "available" flag here and discarded)
+        // now reach the SQL-generating planner itself, so it has a real chance to resolve a
+        // business term (e.g. "open purchase orders") against an existing definition before
+        // deciding whether a literal is defensible — no new resolver, this reuses the exact
+        // existing entity/vocabulary text already used elsewhere in this class (answerFromMemory,
+        // composeAnswer).
+        if (!semCtx.isBlank()) sb.append(semCtx).append("\n");
         if (!findings.isEmpty()) sb.append("Prior findings: ").append(findings.size()).append("\n");
         if (!anomalyCtx.isBlank()) sb.append(anomalyCtx).append("\n");
         if (hasPrior) sb.append("Prior query result: available\n");
@@ -1482,6 +1544,13 @@ public class ChatService {
             } else if ("ERROR".equals(s.evaluatorDecision())) {
                 results.add(Map.of("step", s.stepNo(), "error",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step failed"));
+            } else if ("CLARIFICATION_NEEDED".equals(s.evaluatorDecision())) {
+                // Semantic Reasoning Over Authoritative Value Domains: the planner declined to
+                // generate SQL for a term it could not defensibly resolve — distinct from a
+                // governance "blocked" outcome, so composeAnswer can phrase it as a genuine
+                // clarifying question rather than a policy-denial message.
+                results.add(Map.of("step", s.stepNo(), "clarification", true, "question",
+                        s.evaluatorRationale() != null ? s.evaluatorRationale() : "Clarification needed"));
             } else if (s.evaluatorDecision() != null && s.evaluatorDecision().contains("BLOCK")) {
                 results.add(Map.of("step", s.stepNo(), "blocked", true, "reason",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step blocked"));
