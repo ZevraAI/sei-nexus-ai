@@ -80,6 +80,17 @@ public class EnterpriseMapRepository {
     }
 
     /**
+     * Global Concept Resolution (Phase 1, read-only): all non-archived data objects for one
+     * connection — the physical-object universe a connection-scoped resolver evaluates against.
+     * Purely additive; no existing caller uses this method.
+     */
+    public List<DataObject> findDataObjectsByConnection(String connectionKey) {
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE connection_key = ? AND scan_status != 'ARCHIVED' ORDER BY entity_name",
+                dataObjectMapper(), connectionKey);
+    }
+
+    /**
      * Returns all data objects whose connection_key appears in the agent's connection_keys list.
      * The agent's connection_keys column is a comma-separated string stored in nexus_agent.
      */
@@ -131,6 +142,26 @@ public class EnterpriseMapRepository {
                 "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
                         + "AND connection_key IN (" + placeholders + ") ORDER BY entity_name",
                 dataObjectMapper(), connectionKeys.toArray());
+    }
+
+    /**
+     * Concept-Scoped Metadata Narrowing, Stage 2: the exact, targeted set of physical data
+     * objects a Stage 1 concept selection resolved to (via {@code
+     * SemanticRepository#findEntitiesByConnectionAndConcepts}'s {@code primary_object_key}
+     * values) — never the whole connection's inventory. Mirrors {@link
+     * #findDataObjectsByConnectionKeys} exactly, just keyed by object_key instead of
+     * connection_key.
+     */
+    public List<DataObject> findDataObjectsByKeys(List<String> objectKeys) {
+        if (objectKeys == null || objectKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < objectKeys.size(); i++) {
+            placeholders.append(i == 0 ? "?" : ", ?");
+        }
+        return jdbc.query(
+                "SELECT * FROM nexus_data_object WHERE scan_status != 'ARCHIVED' "
+                        + "AND object_key IN (" + placeholders + ") ORDER BY entity_name",
+                dataObjectMapper(), objectKeys.toArray());
     }
 
     public void archiveDataObject(String objectKey) {

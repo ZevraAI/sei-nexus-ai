@@ -1,7 +1,10 @@
 package com.sei.nexus.onboarding;
 
+import com.sei.nexus.connection.NexusConnection;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapService;
+import com.sei.nexus.pack.IndustryPackRepository;
+import com.sei.nexus.pack.TenantPack;
 import com.sei.nexus.semantic.BusinessEntity;
 import com.sei.nexus.semantic.EntityCandidateService;
 import com.sei.nexus.semantic.OperationalVocabulary;
@@ -35,11 +38,29 @@ class MetadataRegistrationServiceTest {
     static class FakeEnterpriseMap extends EnterpriseMapService {
         final List<Map<String, Object>> objectRequests = new ArrayList<>();
         final Set<String> failTables = new HashSet<>();
+        int resolveConnectionCalls = 0;
 
-        FakeEnterpriseMap() { super(null, null, null, null, null, null, null); }
+        FakeEnterpriseMap() { super(null, null, null, null, null, null, null, null); }
+
+        // Optimization B: MetadataRegistrationService now resolves the connection
+        // once via this method instead of once per entity inside
+        // createOrUpdateObject — faked here rather than hitting the (null)
+        // connectionRepository the real implementation would use.
+        @Override
+        public NexusConnection resolveConnection(String connectionKey) {
+            resolveConnectionCalls++;
+            return new NexusConnection(connectionKey, connectionKey, "POSTGRES", "", "", "", "", "",
+                    "", "", true, null, null, null, "ACTIVE", Instant.now(), Instant.now());
+        }
 
         @Override
         public DataObject createOrUpdateObject(Map<String, Object> request, String userEmail) {
+            return createOrUpdateObject(request, userEmail, null);
+        }
+
+        @Override
+        public DataObject createOrUpdateObject(Map<String, Object> request, String userEmail,
+                                                NexusConnection connection) {
             objectRequests.add(request);
             String table = (String) request.get("tableName");
             if (failTables.contains(table)) {
@@ -90,6 +111,7 @@ class MetadataRegistrationServiceTest {
         final Map<String, BusinessEntity> boundByObjectKey = new HashMap<>();
         final Map<String, BusinessEntity> entitiesByKey    = new HashMap<>();
         List<Candidate> offered = List.of();
+        int findEntityCalls = 0;
 
         FakeCandidates() { super(null); }
 
@@ -97,10 +119,30 @@ class MetadataRegistrationServiceTest {
             return Optional.ofNullable(boundByObjectKey.get(objectKey));
         }
         @Override public Optional<BusinessEntity> findEntity(String entityKey) {
+            findEntityCalls++;
             return Optional.ofNullable(entitiesByKey.get(entityKey));
         }
         @Override public List<Candidate> retrieve(String domainKey, String tableName) {
             return offered;
+        }
+    }
+
+    /** Connection-Scoped Industry Pack Semantic Assignment: maps connectionKey -> the active
+     *  TenantPack, exactly the shape {@code IndustryPackRepository.findActivePackForConnection}
+     *  already returns in production. */
+    static class FakeIndustryPackRepository extends IndustryPackRepository {
+        final Map<String, TenantPack> activeByConnection = new HashMap<>();
+
+        FakeIndustryPackRepository() { super(null, new com.fasterxml.jackson.databind.ObjectMapper()); }
+
+        @Override
+        public Optional<TenantPack> findActivePackForConnection(String connectionKey) {
+            return Optional.ofNullable(activeByConnection.get(connectionKey));
+        }
+
+        void assign(String connectionKey, String packKey) {
+            activeByConnection.put(connectionKey, new TenantPack(packKey, connectionKey, "1.0.0",
+                    packKey, "ACTIVE", Map.of(), 1.0, null, "user@x.com"));
         }
     }
 
@@ -262,6 +304,87 @@ class MetadataRegistrationServiceTest {
         assertFalse(obj.containsKey("avoidGuidance"));
     }
 
+    // ── Grouping Foundation Fix: category → group_label ──────────────────────
+    // Every table passes through this one register() call regardless of whether it
+    // was AI-recommended or added via Browse All — there is no separate path to test.
+
+    @Test
+    void analyzedCategoryFlowsThroughAsGroupLabel() {
+        Map<String, Object> entity = storesEntity();
+        entity.put("category", "Operations");
+
+        service.register(request(entity), "user@x.com");
+
+        assertEquals("Operations", semantic.entityBodies.get(0).get("groupLabel"));
+    }
+
+    @Test
+    void missingCategoryOmitsGroupLabelRatherThanErasingIt() {
+        // No "category" key at all — mirrors a malformed/partial analysis result.
+        // Must be OMITTED from the entity body (not sent as ""), so the repository's
+        // COALESCE preserves any existing group_label instead of nulling it out.
+        service.register(request(storesEntity()), "user@x.com");
+
+        assertFalse(semantic.entityBodies.get(0).containsKey("groupLabel"),
+                "absent category must stay absent, never sent as a blank/erasing value");
+    }
+
+    @Test
+    void blankCategoryAlsoOmitsGroupLabel() {
+        Map<String, Object> entity = storesEntity();
+        entity.put("category", "   ");
+
+        service.register(request(entity), "user@x.com");
+
+        assertFalse(semantic.entityBodies.get(0).containsKey("groupLabel"));
+    }
+
+    @Test
+    void differentEntitiesInTheSameBatchCanHaveDifferentCategories() {
+        Map<String, Object> stores = storesEntity();
+        stores.put("category", "Operations");
+        Map<String, Object> suppliers = suppliersEntity();
+        suppliers.put("category", "Procurement");
+
+        service.register(request(stores, suppliers), "user@x.com");
+
+        assertEquals("Operations",  semantic.entityBodies.get(0).get("groupLabel"));
+        assertEquals("Procurement", semantic.entityBodies.get(1).get("groupLabel"));
+    }
+
+    /**
+     * Regression test for the real Discover-from-DB defect: {@code Semantic.jsx}'s own
+     * {@code saveApproved()} apply payload never read/forwarded {@code category} at all — a
+     * gap distinct from (and never fixed by) the Onboarding Wizard's {@code category} threading,
+     * since Discover has its own, separate frontend state. This exercises the EXACT request
+     * shape {@code Semantic.jsx} now sends after the fix (identical field names: tableName,
+     * entityKey, entityName, purpose, operationalMeaning, investigationHints, category,
+     * businessName, identifierColumns, vocabulary, entityResolution — see
+     * {@code Semantic.jsx}'s {@code saveApproved()}), proving the boundary that actually broke
+     * — not just the Onboarding-shaped payload the earlier grouping tests already covered.
+     */
+    @Test
+    void discoverShapedApplyPayloadCarriesCategoryThroughToGroupLabel() {
+        Map<String, Object> discoverEntity = new java.util.LinkedHashMap<>();
+        discoverEntity.put("approved", true);
+        discoverEntity.put("tableName", "suppliers");
+        discoverEntity.put("entityKey", "supplier");
+        discoverEntity.put("entityName", "Supplier");
+        discoverEntity.put("purpose", "External vendors");
+        discoverEntity.put("operationalMeaning", "");
+        discoverEntity.put("investigationHints", "");
+        discoverEntity.put("category", "Procurement"); // the field Semantic.jsx now forwards
+        discoverEntity.put("businessName", "Suppliers");
+        discoverEntity.put("identifierColumns", List.of("id", "code"));
+        discoverEntity.put("vocabulary", List.of());
+
+        service.register(request(discoverEntity), "user@x.com");
+
+        assertEquals("Procurement", semantic.entityBodies.get(0).get("groupLabel"),
+                "a Discover-shaped apply payload carrying category must reach groupLabel exactly "
+                        + "like an Onboarding-shaped one does");
+    }
+
     // ── defaults and edge behavior ───────────────────────────────────────────
 
     @Test
@@ -341,6 +464,10 @@ class MetadataRegistrationServiceTest {
         assertEquals("Supplier", body.get("entityName"), "existing name preserved on reuse");
         assertEquals("obj-vendors", body.get("primaryObjectKey"), "empty binding filled");
         assertTrue(result.failures().isEmpty());
+        // Optimization C: validateReuse() and selectEntity() used to each fetch the
+        // same entity independently (2 calls for one reuse decision) — now exactly 1.
+        assertEquals(1, candidates.findEntityCalls,
+                "the entity fetched during validation must be reused, not re-queried");
     }
 
     @Test
@@ -434,6 +561,36 @@ class MetadataRegistrationServiceTest {
         assertTrue(result.failures().isEmpty());
     }
 
+    // ── Optimization B (onboarding performance investigation) ───────────────
+
+    @Test
+    void connectionIsResolvedOnceForAMultiEntityApply() {
+        var result = service.register(request(storesEntity(), suppliersEntity()), "user@x.com");
+
+        assertEquals(1, enterpriseMap.resolveConnectionCalls,
+                "one connectionKey shared by every entity in the batch — resolve it once, not per entity");
+        assertEquals(2, result.objectsCreated(), "both entities still register normally");
+    }
+
+    @Test
+    void connectionResolutionFailureIsReportedPerEntityLikeBefore() {
+        var failing = new FakeEnterpriseMap() {
+            @Override public NexusConnection resolveConnection(String connectionKey) {
+                resolveConnectionCalls++;
+                throw new RuntimeException("Connection not found: " + connectionKey);
+            }
+        };
+        service = new MetadataRegistrationService(failing, semantic, discovery, candidates);
+
+        var result = service.register(request(storesEntity(), suppliersEntity()), "user@x.com");
+
+        assertEquals(1, failing.resolveConnectionCalls, "resolved once even though it fails");
+        assertEquals(0, result.objectsCreated());
+        assertEquals(2, result.failures().size(), "every entity in the batch still gets its own failure message");
+        assertTrue(result.failures().get(0).startsWith("data object stores: Connection not found"));
+        assertTrue(result.failures().get(1).startsWith("data object suppliers: Connection not found"));
+    }
+
     @Test
     void discoveryFailureIsNonFatalAndRecorded() {
         var failing = new FakeDiscovery() {
@@ -447,5 +604,69 @@ class MetadataRegistrationServiceTest {
 
         assertEquals(1, result.entitiesCreated(), "registration completed despite discovery failure");
         assertTrue(result.failures().stream().anyMatch(f -> f.startsWith("relationship discovery:")));
+    }
+
+    // ── Connection-Scoped Industry Pack Semantic Assignment ──────────────────────
+
+    @Test
+    void packKeyIsDerivedFromTheConnectionsActivePackNeverFromTheRequest() {
+        FakeIndustryPackRepository packRepository = new FakeIndustryPackRepository();
+        packRepository.assign("conn-1", "retail-v1");
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, packRepository);
+
+        service.register(request(storesEntity()), "user@x.com");
+
+        assertEquals(1, semantic.entityBodies.size());
+        assertEquals("retail-v1", semantic.entityBodies.get(0).get("packKey"),
+                "pack_key comes from the connection's active pack — never supplied by the request itself");
+    }
+
+    @Test
+    void noActivePackMeansNoPackKeyIsWritten() {
+        FakeIndustryPackRepository packRepository = new FakeIndustryPackRepository(); // nothing assigned
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, packRepository);
+
+        service.register(request(storesEntity()), "user@x.com");
+
+        assertFalse(semantic.entityBodies.get(0).containsKey("packKey"),
+                "no active pack for this connection -> packKey must be omitted, not written as null/blank");
+    }
+
+    @Test
+    void conceptKeyFlowsThroughWhenTheRequestSuppliesOne() {
+        // Simulates BusinessObjectBatchAnalyzer's validated conceptResolution having already
+        // flowed through the draft/review step into the entity the caller submits.
+        Map<String, Object> withConcept = new java.util.LinkedHashMap<>(storesEntity());
+        withConcept.put("conceptKey", "store");
+
+        service.register(request(withConcept), "user@x.com");
+
+        assertEquals("store", semantic.entityBodies.get(0).get("conceptKey"));
+    }
+
+    @Test
+    void absentConceptKeyIsOmittedNotNulled() {
+        service.register(request(storesEntity()), "user@x.com"); // no conceptKey in the request
+
+        assertFalse(semantic.entityBodies.get(0).containsKey("conceptKey"),
+                "an analysis that resolved no concept must omit the field so the existing " +
+                "COALESCE preserves whatever concept_key the entity already has — never write null explicitly");
+    }
+
+    @Test
+    void multipleConnectionsResolveIndependentPacksInTheSameBatchCall() {
+        FakeIndustryPackRepository packRepository = new FakeIndustryPackRepository();
+        packRepository.assign("conn-1", "retail-v1");
+        packRepository.assign("conn-2", "logistics-v1");
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, packRepository);
+
+        service.register(request(storesEntity()), "user@x.com"); // request() hardcodes connectionKey=conn-1
+        assertEquals("retail-v1", semantic.entityBodies.get(0).get("packKey"));
+
+        Map<String, Object> req2 = Map.of("connectionKey", "conn-2", "schemaName", "logistics_core",
+                "domainKey", "PLATFORM", "entities", List.of(suppliersEntity()));
+        service.register(req2, "user@x.com");
+        assertEquals("logistics-v1", semantic.entityBodies.get(1).get("packKey"),
+                "a different connection in a separate call must resolve its own pack, not conn-1's");
     }
 }

@@ -196,6 +196,141 @@ public class DynamicSqlService {
         }
     }
 
+    /** Column list plus the table-level comment (both enrichment, both optional — see
+     *  {@link #describeTableWithComments}). {@code tableComment} is {@code null} when the
+     *  database has none set, doesn't support them, or retrieval failed. */
+    public record TableDescription(List<Map<String, Object>> columns, String tableComment) {}
+
+    /** Safety ceiling on a single retrieved comment's length — generous enough to preserve a
+     *  genuinely rich, multi-sentence business comment (a real example observed in this project's
+     *  own live validation ran to several hundred characters) while still bounding a pathological
+     *  outlier (e.g. a comment field someone used to paste a whole document). Business Object
+     *  Semantic Grounding Improvement — a safety net, not a content-shaping truncation. */
+    static final int MAX_COMMENT_CHARS = 2000;
+
+    /**
+     * Same as {@link #describeTable}, plus — where the connected database supports it — the
+     * table's own {@code COMMENT ON TABLE}/{@code ALL_TAB_COMMENTS} description and each column's
+     * {@code COMMENT ON COLUMN}/{@code ALL_COL_COMMENTS} description, merged into each column's map
+     * under {@code "column_comment"}.
+     *
+     * <p>Business Object Semantic Grounding Improvement: comments are enrichment, never a
+     * dependency — the column list itself comes from the existing, already-tested
+     * {@link #describeTable} call (so any test double overriding only that method keeps working
+     * unchanged), and comment retrieval is wrapped in its own try/catch: a database that doesn't
+     * support comments, a table with none set, or a retrieval failure all degrade to
+     * {@code tableComment == null} / no {@code "column_comment"} keys — never an exception, never
+     * a failed table analysis.
+     */
+    public TableDescription describeTableWithComments(String connectionKey, String schemaName, String tableName) {
+        List<Map<String, Object>> columns = describeTable(connectionKey, schemaName, tableName);
+
+        String tableComment = null;
+        Map<String, String> columnComments = Map.of();
+        try {
+            NexusConnection conn = requireConnection(connectionKey);
+            if ("ORACLE".equalsIgnoreCase(conn.connectionType())) {
+                tableComment = fetchOracleTableComment(conn, schemaName, tableName);
+                columnComments = fetchOracleColumnComments(conn, schemaName, tableName);
+            } else if ("POSTGRES".equalsIgnoreCase(conn.connectionType())) {
+                tableComment = fetchPostgresTableComment(conn, schemaName, tableName);
+                columnComments = fetchPostgresColumnComments(conn, schemaName, tableName);
+            }
+            // Any other/unknown connection type: no comment support known — leave both empty.
+        } catch (Exception ex) {
+            log.warn("Comment retrieval failed for {}.{} on {} (continuing without comments): {}",
+                    schemaName, tableName, connectionKey, ex.getMessage());
+        }
+
+        if (!columnComments.isEmpty()) {
+            for (Map<String, Object> col : columns) {
+                Object nameVal = col.getOrDefault("column_name", col.get("COLUMN_NAME"));
+                String comment = columnComments.get(String.valueOf(nameVal));
+                if (comment != null) col.put("column_comment", cap(comment));
+            }
+        }
+        return new TableDescription(columns, tableComment != null ? cap(tableComment) : null);
+    }
+
+    private static String cap(String s) {
+        return s.length() > MAX_COMMENT_CHARS ? s.substring(0, MAX_COMMENT_CHARS) + "…[truncated]" : s;
+    }
+
+    private String fetchPostgresTableComment(NexusConnection conn, String schemaName, String tableName) throws SQLException {
+        String secret = conn.encryptedSecret();
+        String sql = "SELECT obj_description(('\"' || ? || '\".\"' || ? || '\"')::regclass) AS table_comment";
+        try (Connection jdbc = DriverManager.getConnection(conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+            ps.setString(1, schemaName);
+            ps.setString(2, tableName);
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<Map<String, Object>> rows = mapResultSet(rs);
+                return rows.isEmpty() ? null : (String) rows.get(0).get("table_comment");
+            }
+        }
+    }
+
+    private Map<String, String> fetchPostgresColumnComments(NexusConnection conn, String schemaName, String tableName) throws SQLException {
+        String secret = conn.encryptedSecret();
+        String sql = """
+                SELECT c.column_name,
+                       col_description(('"' || c.table_schema || '"."' || c.table_name || '"')::regclass,
+                                        c.ordinal_position) AS col_comment
+                  FROM information_schema.columns c
+                 WHERE c.table_schema = ? AND c.table_name = ?
+                 ORDER BY c.ordinal_position
+                """;
+        try (Connection jdbc = DriverManager.getConnection(conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+            ps.setString(1, schemaName);
+            ps.setString(2, tableName);
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = ps.executeQuery()) {
+                Map<String, String> comments = new LinkedHashMap<>();
+                for (Map<String, Object> row : mapResultSet(rs)) {
+                    Object comment = row.get("col_comment");
+                    if (comment != null) comments.put(String.valueOf(row.get("column_name")), String.valueOf(comment));
+                }
+                return comments;
+            }
+        }
+    }
+
+    private String fetchOracleTableComment(NexusConnection conn, String schemaName, String tableName) throws SQLException {
+        String secret = conn.encryptedSecret();
+        String sql = "SELECT comments FROM all_tab_comments WHERE owner = ? AND table_name = ?";
+        try (Connection jdbc = DriverManager.getConnection(conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+            ps.setString(1, schemaName != null ? schemaName.toUpperCase() : null);
+            ps.setString(2, tableName.toUpperCase());
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<Map<String, Object>> rows = mapResultSet(rs);
+                return rows.isEmpty() ? null : (String) rows.get(0).get("COMMENTS");
+            }
+        }
+    }
+
+    private Map<String, String> fetchOracleColumnComments(NexusConnection conn, String schemaName, String tableName) throws SQLException {
+        String secret = conn.encryptedSecret();
+        String sql = "SELECT column_name, comments FROM all_col_comments WHERE owner = ? AND table_name = ?";
+        try (Connection jdbc = DriverManager.getConnection(conn.jdbcUrl(), conn.username(), secret);
+             PreparedStatement ps = jdbc.prepareStatement(sql)) {
+            ps.setString(1, schemaName != null ? schemaName.toUpperCase() : null);
+            ps.setString(2, tableName.toUpperCase());
+            ps.setQueryTimeout(COUNT_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = ps.executeQuery()) {
+                Map<String, String> comments = new LinkedHashMap<>();
+                for (Map<String, Object> row : mapResultSet(rs)) {
+                    Object comment = row.get("COMMENTS");
+                    if (comment != null) comments.put(String.valueOf(row.get("COLUMN_NAME")), String.valueOf(comment));
+                }
+                return comments;
+            }
+        }
+    }
+
     /**
      * Returns every ENUM type defined in the given schema with its ordered legal
      * values — in a single round-trip against the PostgreSQL system catalogs

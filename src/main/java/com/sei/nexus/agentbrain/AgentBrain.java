@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -55,11 +56,28 @@ public class AgentBrain {
 
     private final EnterpriseSemanticAssembler assembler;
     private final BusinessLanguageResolver    resolver;
+    // Concept-Scoped Metadata Narrowing: nullable, same dual-constructor pattern already used by
+    // EnterpriseSemanticAssembler/BusinessObjectBatchAnalyzer for an additive collaborator — every
+    // existing test constructs AgentBrain via the 2-arg constructor below, so conceptResolver is
+    // null for all of them and this feature is a complete no-op, byte-identical to before it
+    // existed (see assembleBusinessScope).
+    private final ConceptScopedMetadataResolver conceptResolver;
 
+    /** Backward-compatible convenience (tests, and any caller that predates this feature):
+     *  concept-scoped narrowing is inactive — {@code assembleBusinessScope} always falls back to
+     *  the existing full assembly, exactly as before this feature existed. */
     public AgentBrain(EnterpriseSemanticAssembler assembler,
                       BusinessLanguageResolver resolver) {
-        this.assembler = assembler;
-        this.resolver  = resolver;
+        this(assembler, resolver, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public AgentBrain(EnterpriseSemanticAssembler assembler,
+                      BusinessLanguageResolver resolver,
+                      ConceptScopedMetadataResolver conceptResolver) {
+        this.assembler       = assembler;
+        this.resolver        = resolver;
+        this.conceptResolver = conceptResolver;
     }
 
     /**
@@ -85,7 +103,7 @@ public class AgentBrain {
                 ? ResolvedQuestion.empty(question == null ? "" : question)
                 : resolver.resolve(question, domainKeys);
 
-        SemanticModel model = assembleBusinessScope(connectionKeys, domainKeys);
+        SemanticModel model = assembleBusinessScope(connectionKeys, domainKeys, question);
 
         // Rank the resolved objects by relevance to the request (business reasoning) so
         // grounding leads with what the user most likely means — without narrowing the surface.
@@ -121,8 +139,10 @@ public class AgentBrain {
      * </ul>
      */
     private SemanticModel assembleBusinessScope(List<String> connectionKeys,
-                                                List<String> domainKeys) {
+                                                List<String> domainKeys, String question) {
         if (domainKeys == null || domainKeys.isEmpty()) {
+            Optional<SemanticModel> conceptScoped = conceptScopedModel(connectionKeys, question);
+            if (conceptScoped.isPresent()) return conceptScoped.get();
             return assembler.assemble(connectionKeys);
         }
         SemanticModel byDomain = assembler.assembleByDomains(domainKeys);
@@ -131,6 +151,42 @@ public class AgentBrain {
         }
         SemanticModel narrowed = narrowToConnections(byDomain, connectionKeys);
         return narrowed.objects().isEmpty() ? byDomain : narrowed;
+    }
+
+    /**
+     * Concept-Scoped Metadata Narrowing (upstream Agent Brain context reduction): when EVERY
+     * connection in scope has an active Industry Pack with a non-empty tenant concept catalog,
+     * a compact Stage 1 concept-selection LLM call decides which concepts are relevant to the
+     * question, and Stage 2 resolves that selection to exactly the physical objects bound to it
+     * — see {@link ConceptScopedMetadataResolver}. Absent for any reason (no resolver wired, no
+     * connections, no active pack on ANY of them, no tenant concept catalog yet, or any failure)
+     * ⇒ {@link Optional#empty()}, and the caller falls back to the full, unnarrowed assembly —
+     * never a partial narrowing across a mixed set of connections in this version.
+     *
+     * <p>This is a deliberate, additive divergence from this class's own "ranking never narrows
+     * the approved surface" principle (see this class's javadoc) — that principle governs the
+     * keyword-ranking step below, which still never narrows. Concept-scoped narrowing is a
+     * different, explicit mechanism: it only activates for a connection whose tenant has already
+     * gone through Pack application + LLM concept classification, and even then the LLM (never
+     * Java) decides what is relevant — the same non-negotiable ownership rule Apply Pack's own
+     * classification path already enforces.
+     */
+    private Optional<SemanticModel> conceptScopedModel(List<String> connectionKeys, String question) {
+        if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
+            return Optional.empty();
+        }
+        List<String> allObjectKeys = new ArrayList<>();
+        for (String connectionKey : connectionKeys) {
+            Optional<List<String>> objectKeys = conceptResolver.resolveObjectKeys(connectionKey, question);
+            if (objectKeys.isEmpty()) return Optional.empty();
+            allObjectKeys.addAll(objectKeys.get());
+        }
+        if (allObjectKeys.isEmpty()) {
+            // Every in-scope connection is concept-classified, and the LLM found none of the
+            // available concepts relevant — a legitimate, honest "nothing applies" outcome.
+            return Optional.of(new SemanticModel(List.of(), Map.of(), Map.of()));
+        }
+        return Optional.of(assembler.assembleByObjectKeys(allObjectKeys));
     }
 
     /** Restricts a domain scope to objects reachable through the approved connections. */
