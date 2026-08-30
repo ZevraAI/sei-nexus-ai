@@ -145,7 +145,14 @@ public class ReasoningEngine {
             saveStep(sessionKey, 0, seedPlan, preEval.decision(), preEval.rationale(),
                     evidence, evidence.latestRows(), priorExecution.resultJson());
 
-            if (preEval.isSufficient() || "DEAD_END".equals(preEval.decision())) {
+            boolean reusedPriorEvidence = preEval.isSufficient() || "DEAD_END".equals(preEval.decision());
+            // Observability (conversational evidence-reuse correctness): lets a real request be
+            // classified, after the fact, as "reused the prior turn's result set" vs "invoked
+            // Planner for a new execution" without logging the question or rationale text (both
+            // may contain business/user data) — only the decision and the resulting boolean.
+            log.info("CONVERSATION_EVIDENCE_REUSE conversationId={} decision={} reusedPriorResultSet={}",
+                    conversationId, preEval.decision(), reusedPriorEvidence);
+            if (reusedPriorEvidence) {
                 stepNo = MAX_STEPS + 1;
             } else {
                 stepNo = evidence.stepCount() + 1;

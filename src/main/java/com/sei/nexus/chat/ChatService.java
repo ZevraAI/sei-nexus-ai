@@ -33,6 +33,7 @@ import com.sei.nexus.reasoning.ReasoningSession;
 import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
 import com.sei.nexus.agentbrain.AgentBrain;
+import com.sei.nexus.agentbrain.ConceptScopedMetadataResolver;
 import com.sei.nexus.agentbrain.ExecutionBindings;
 import com.sei.nexus.agentbrain.ExecutionContract;
 import com.sei.nexus.agentbrain.ExecutionContractBuilder;
@@ -405,6 +406,16 @@ public class ChatService {
             List<String> domainKeys = toDomainKeyList(agent);
             List<String> connKeys = toConnKeyList(agent);
 
+            // Decision Router absorption: document memory availability is the one runtime fact
+            // the combined Persistent Knowledge / File Search call cannot obtain itself (document
+            // memory is a structurally separate subsystem from the tenant's persistent-knowledge
+            // Vector Store — not retrievable via file_search) — so it must be computed BEFORE
+            // AgentBrain.resolve() runs Stage 1, not after. This is the one reordering this
+            // absorption required; STEP 6's own SSE phase markers below are otherwise unchanged
+            // and simply reuse this already-computed value instead of re-fetching it.
+            List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(raw, domainKeys);
+            boolean memoryAvailable = !memChunks.isEmpty();
+
             // STEP 5b: Business reasoning (Unified Answer Engine, Phase 3 Step 1).
             // AgentBrain is the sole reasoning owner: it performs Business Language
             // Resolution (PRO-31) for this scope — deterministic, domain-scoped,
@@ -419,8 +430,18 @@ public class ChatService {
             // Step 2 and the grounding swap in Step 4, so prompts and execution are
             // unchanged by this step.
             reasoningEventBus.phaseStarted(runKey, ProgressPhase.METADATA);
+            // Zevra Cognitive Runtime baseline — measurement only: wall-clock time for
+            // AgentBrain.resolve, which is PostgreSQL retrieval + Java assembly PLUS, whenever
+            // concept-scoped narrowing applies, the Stage 1 LLM call's own latency (that call's
+            // own latency is separately captured as its own LLM_METRIC line — this figure is not
+            // a substitute for that, it's the wall-clock cost of the whole resolve() call).
+            long agentBrainResolveStartNanos = System.nanoTime();
             ResolvedBusinessModel businessModel = agentBrain.resolve(
-                    agent != null ? agent.agentKey() : null, connKeys, domainKeys, raw);
+                    agent != null ? agent.agentKey() : null, connKeys, domainKeys, raw, conversationId, memoryAvailable);
+            long agentBrainResolveMs = (System.nanoTime() - agentBrainResolveStartNanos) / 1_000_000;
+            log.info("RETRIEVAL_TIMING stage=agentBrainResolve wallClockMs={} "
+                            + "note=includesStage1LlmCallLatencyWhenConceptScoped",
+                    agentBrainResolveMs);
             ResolvedQuestion resolved = businessModel.resolution();
             ExecutionContract executionContract = executionContractBuilder.compile(businessModel);
 
@@ -431,14 +452,28 @@ public class ChatService {
             PromptContext promptContext = promptContextBuilder.build(executionContract);
             reasoningEventBus.phaseCompleted(runKey, ProgressPhase.METADATA);
 
-            // STEP 6: Memory retrieval — semantic search on the user's intent, not the file
+            // STEP 6: Memory retrieval — semantic search on the user's intent, not the file.
+            // memChunks was already computed above (Decision Router absorption needs it before
+            // Stage 1 runs) — this phase marker is purely for SSE progress display and is
+            // otherwise unchanged.
             reasoningEventBus.phaseStarted(runKey, ProgressPhase.RETRIEVAL);
-            List<DocumentChunk> memChunks = documentMemoryService.retrieveContext(raw, domainKeys);
 
             // STEP 7: Semantic + Anomaly + Findings context.
             // The semantic context also carries entity/vocabulary → table bindings.
-            SemanticService.SemanticContext semantic =
-                    semanticService.semanticContextWithBindings(domainKeys, raw);
+            //
+            // Downstream Context Boundary (Concept-Scoped Metadata Narrowing): when AgentBrain's
+            // Stage 1/2 concept-scoped resolution actually produced businessModel (see
+            // ResolvedBusinessModel#conceptScoped()), THIS channel must be bounded by the same
+            // Stage-2-resolved object scope PromptAssembler already renders the physical schema
+            // from — never the broader, domain-wide entity retrieval. That domain-wide call is
+            // preserved byte-for-byte as the fallback whenever concept-scoping did not apply
+            // (no active pack, no tenant concept catalog, resolver unavailable, or any of the
+            // other conditions AgentBrain already falls back on). No new selection/ranking is
+            // performed here — objectTargets().keySet() is exactly Stage 2's own resolved set.
+            SemanticService.SemanticContext semantic = businessModel.conceptScoped()
+                    ? semanticService.semanticContextForObjectKeys(
+                            new ArrayList<>(businessModel.objectTargets().keySet()))
+                    : semanticService.semanticContextWithBindings(domainKeys, raw);
             String semCtx = semantic.contextText();
             List<OperationalFinding> findings = reasoningRepository.findRecentFindings(domainKeys, 5);
             String anomalyCtx = baselineService.getAnomalyContext(domainKeys);
@@ -459,11 +494,35 @@ public class ChatService {
             // STEP 9: Prior result check
             Optional<String> priorSnapshot = runRepository.latestResultSnapshot(conversationId);
 
-            // STEP 10: LLM decision — routes on user intent (raw), not file content.
-            // This is the key: the router sees "do these orders exist in the system?" and
-            // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
-            Map<String, Object> decision = getLlmDecision(raw, memChunks, promptContext, semantic,
-                    findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved, conversationContext);
+            // STEP 10: Routing decision. Decision Router absorption: when the combined
+            // Persistent Knowledge / File Search call (Stage 1) already produced a routing
+            // decision, it is relayed VERBATIM here — Java parses and consumes it, never
+            // overrides or second-guesses it, and the separate Decision Router LLM call is
+            // skipped entirely for this request. Only when routing is absent (Stage 1
+            // inapplicable, the legacy catalog-in-prompt fallback ran, the flag is off, or the
+            // model's own routing field was invalid/unparseable) does the legacy Decision Router
+            // call still run — this is the ONLY path that reaches getLlmDecision() today.
+            Map<String, Object> decision;
+            boolean decisionRouterCalled;
+            if (businessModel.routingDecision().isPresent()) {
+                ConceptScopedMetadataResolver.RoutingDecision routing = businessModel.routingDecision().get();
+                decision = Map.of("type", routing.type(), "clarification_question", routing.clarificationQuestion());
+                decisionRouterCalled = false;
+            } else {
+                // This is the key: the router sees "do these orders exist in the system?" and
+                // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
+                decision = getLlmDecision(raw, memChunks, promptContext, semantic,
+                        findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved, conversationContext,
+                        businessModel.conceptScoped(), businessModel.objectTargets().keySet());
+                decisionRouterCalled = true;
+            }
+            // Observability (Decision Router absorption): distinguishes, without logging the
+            // question or any routing/clarification content, whether this request's routing
+            // decision came from the combined Persistent Knowledge call or the legacy Decision
+            // Router LLM call.
+            log.info("DECISION_SOURCE conversationId={} source={} decisionRouterCalled={}",
+                    conversationId, decisionRouterCalled ? "DECISION_ROUTER_LEGACY" : "PERSISTENT_KNOWLEDGE_COMBINED",
+                    decisionRouterCalled);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
@@ -553,14 +612,30 @@ public class ChatService {
                         List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
                         if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
                     }
+                    // Zevra Cognitive Runtime baseline — measurement only: buildContextSummary
+                    // makes no LLM call itself (confirmed by the investigation report), so this
+                    // wall-clock figure is purely PostgreSQL retrieval (already-completed calls
+                    // like SemanticService/KnowledgeGraphService feed their results in as already-
+                    // fetched parameters, but promptAssembler.assemble and the graph/semantic
+                    // rendering happen inside) + Java string-building time, isolated from any LLM
+                    // latency.
+                    long buildContextStartNanos = System.nanoTime();
                     String schemaCtx = buildContextSummary(raw, memChunks, promptContext, semantic, findings,
-                            anomalyCtx, false, history, agent, resolved, conversationContext);
+                            anomalyCtx, false, history, agent, resolved, conversationContext,
+                            businessModel.conceptScoped(), businessModel.objectTargets().keySet());
+                    long buildContextMs = (System.nanoTime() - buildContextStartNanos) / 1_000_000;
+                    log.info("RETRIEVAL_TIMING stage=buildContextSummary wallClockMs={} note=noLlmCallInsideThisMethod",
+                            buildContextMs);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
                     // ── Phase 3: inject learned business vocabulary into the planner context ──
                     String agentDomainKey = agent != null ? agent.domainKeys() : null;
+                    long learningCtxStartNanos = System.nanoTime();
                     LearningContextBuilder.LearningContext learningCtx =
                             learningContextBuilder.build(agentDomainKey, conversationId);
+                    long learningCtxMs = (System.nanoTime() - learningCtxStartNanos) / 1_000_000;
+                    log.info("RETRIEVAL_TIMING stage=learningContextBuilder wallClockMs={} note=noLlmCallInsideThisMethod",
+                            learningCtxMs);
                     if (!learningCtx.isEmpty()) {
                         schemaCtx = schemaCtx + "\n\n" + learningCtx.contextText();
                         learningsApplied.addAll(learningCtx.termsApplied());
@@ -800,6 +875,7 @@ public class ChatService {
             }
             String prompt = "Question: " + question + "\n\n" + ctx +
                     "\nRespond with JSON only: {\"agent_key\": \"...\", \"confidence\": 0.9}";
+            com.sei.nexus.ai.LlmCallTag.set("AGENT_ROUTER");
             String resp = aiClient.chatWithJsonFast(List.of(ChatMessage.user(prompt)),
                     "You are an agent router. Select the most appropriate agent for the question. Return JSON only.");
             Map<?, ?> parsed = objectMapper.readValue(extractJson(resp), Map.class);
@@ -846,7 +922,22 @@ public class ChatService {
      * constrained literal choice) never ran. Rule 6 makes the section's
      * meaning explicit at the routing layer: candidates present ⇒ the term is
      * resolvable downstream ⇒ route to live data.
+     *
+     * @deprecated Decision Router absorption: the same five-value routing decision this prompt
+     * produces is now produced, when possible, by the combined Persistent Knowledge / File
+     * Search Stage 1 call itself — see {@link
+     * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveObjectKeysWithRouting} and
+     * {@code docs/ai/decision-router-absorption.md}. Retained for legacy Stage-1 fallback while
+     * {@code persistent_knowledge_stage1_enabled} is not universally migrated, and for any
+     * request where Stage 1 does not apply at all (no active pack, no tenant concept catalog) or
+     * the combined call's routing field is invalid/unparseable — {@link #getLlmDecision} is only
+     * ever called from {@link #ask} when {@code businessModel.routingDecision()} is empty. Not
+     * removed and not to be extended with new functionality. Candidate for retirement only after
+     * every tenant is migrated to the Persistent Knowledge Stage 1 path (mirrors the retirement
+     * condition already documented for {@code ConceptScopedMetadataResolver}'s own deprecated
+     * legacy methods).
      */
+    @Deprecated
     static final String DECISION_SYSTEM_PROMPT = """
             You are the SEI Nexus orchestration engine. Decide the best answer mode.
             Return JSON only:
@@ -934,6 +1025,7 @@ public class ChatService {
                     .map(e -> e.entityKey() + " | " + e.businessName() + " | " + e.objectType())
                     .reduce((a, b) -> a + "\n" + b).orElse("");
             String prompt = "Question: " + question + "\n\nAlready known in this conversation:\n" + index;
+            com.sei.nexus.ai.LlmCallTag.set("MEMORY_SELECTION");
             String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), MEMORY_SELECTION_SYSTEM_PROMPT);
 
             Map<String, Object> parsed = objectMapper.readValue(extractJson(resp),
@@ -1011,13 +1103,23 @@ public class ChatService {
         }
     }
 
+    /**
+     * @deprecated Decision Router absorption: only called from {@link #ask} when {@code
+     * businessModel.routingDecision()} is empty — i.e. the legacy fallback path. See {@link
+     * #DECISION_SYSTEM_PROMPT}'s own deprecation note for the full explanation and retirement
+     * condition. Not removed, not extended.
+     */
+    @Deprecated
     private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
             PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent,
-            ResolvedQuestion resolved, String executionGrounding) {
+            ResolvedQuestion resolved, String executionGrounding,
+            boolean conceptScoped, java.util.Set<String> objectKeyScope) {
         try {
-            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx, hasPrior, history, agent, resolved, executionGrounding);
+            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx,
+                    hasPrior, history, agent, resolved, executionGrounding, conceptScoped, objectKeyScope);
             String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
+            com.sei.nexus.ai.LlmCallTag.set("DECISION_ROUTER");
             String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), DECISION_SYSTEM_PROMPT);
             return objectMapper.readValue(extractJson(resp),
                     new TypeReference<Map<String, Object>>() {});
@@ -1301,21 +1403,48 @@ public class ChatService {
             PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
             String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
             ResolvedQuestion resolved, String executionGrounding) {
+        return buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx,
+                hasPrior, history, agent, resolved, executionGrounding, false, java.util.Set.of());
+    }
+
+    /**
+     * Downstream Context Boundary for Concept-Scoped Metadata Narrowing: identical to the
+     * overload above, except the Knowledge Graph block is also bounded to {@code objectKeyScope}
+     * when {@code conceptScoped} is true — see {@link ResolvedBusinessModel#conceptScoped()} and
+     * {@link KnowledgeGraphService#buildGraphContext(List, java.util.Set)}. {@code conceptScoped
+     * = false} (every pre-existing caller, via the overload above) reproduces the exact prior
+     * domain-wide, keyword-filtered graph context — byte-identical.
+     */
+    private String buildContextSummary(String question, List<DocumentChunk> memChunks,
+            PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
+            ResolvedQuestion resolved, String executionGrounding,
+            boolean conceptScoped, java.util.Set<String> objectKeyScope) {
         StringBuilder sb = new StringBuilder();
         String semCtx = semantic != null ? semantic.contextText() : "";
         java.util.Set<String> expandedTokens = resolved != null
                 ? resolved.expandedTokens() : java.util.Set.of();
+
+        // Zevra Cognitive Runtime baseline — measurement only, no behavior change: records the
+        // exact character delta each section below actually contributes to schemaCtx, purely by
+        // reading sb.length() before/after each pre-existing append block. Nothing here changes
+        // what gets appended, the order it's appended in, or any conditional — see the
+        // CONTEXT_BREAKDOWN log line at the end of this method.
+        java.util.Map<String, Integer> sectionChars = new java.util.LinkedHashMap<>();
+        int mark = sb.length();
 
         // Execution Continuity: the previous execution's facts first, so the decision/planner
         // continue the same result set on a follow-up. Empty for single-turn questions.
         if (executionGrounding != null && !executionGrounding.isBlank()) {
             sb.append(executionGrounding).append('\n');
         }
+        sectionChars.put("executionGrounding", sb.length() - mark); mark = sb.length();
 
         if (agent != null) {
             sb.append("Agent: ").append(agent.name())
               .append(" | Domain: ").append(agent.domainKeys()).append("\n\n");
         }
+        sectionChars.put("agentDomainLine", sb.length() - mark); mark = sb.length();
 
         // ── RESOLUTIONS block (PRO-31, contract PRO-30 §6) — rendered only when
         // at least one resolution exists, so resolution-free questions produce
@@ -1324,6 +1453,7 @@ public class ChatService {
         if (resolved != null && !resolved.isEmpty()) {
             sb.append(resolved.renderPromptBlock()).append("\n");
         }
+        sectionChars.put("resolutions", sb.length() - mark); mark = sb.length();
 
         // ── LITERAL CANDIDATES block (PRO-33, contract PRO-32 §3) — the
         // constrained-choice task for unresolved literal-shaped terms.
@@ -1332,6 +1462,7 @@ public class ChatService {
             String literalBlock = resolved.renderLiteralCandidatesBlock();
             if (!literalBlock.isEmpty()) sb.append(literalBlock).append("\n");
         }
+        sectionChars.put("literalCandidates", sb.length() - mark); mark = sb.length();
 
         // ── Knowledge graph context — filtered to entities relevant to the question ──
         // Sending the full graph (50+ entities) on every call wastes thousands of tokens.
@@ -1341,12 +1472,21 @@ public class ChatService {
         List<String> domainKeys = toDomainKeyList(agent);
         String filteredGraph = "";
         if (!domainKeys.isEmpty()) {
-            String graphCtx = knowledgeGraphService.buildGraphContext(domainKeys);
+            String graphCtx = conceptScoped
+                    ? knowledgeGraphService.buildGraphContext(domainKeys, objectKeyScope)
+                    : knowledgeGraphService.buildGraphContext(domainKeys);
             if (!graphCtx.isBlank()) {
-                filteredGraph = filterGraphContext(graphCtx, question, expandedTokens);
+                // Once Stage 2 has already resolved the authoritative scope, the node set above
+                // is that scope exactly — a further keyword-relevance filter would only ever
+                // narrow it more (or, via its own "if empty, return everything" safety valve,
+                // silently widen it back to the graph-context-within-scope, never beyond it —
+                // but simplest and clearest is to skip a second, redundant filtering pass
+                // entirely and render the already-scoped graph context as-is).
+                filteredGraph = conceptScoped ? graphCtx : filterGraphContext(graphCtx, question, expandedTokens);
                 if (!filteredGraph.isBlank()) sb.append(filteredGraph).append("\n");
             }
         }
+        sectionChars.put("knowledgeGraph", sb.length() - mark); mark = sb.length();
 
         // ── TABLE SCHEMA grounding — rendered by the shared PromptAssembler ───────
         // The approved surface (relevance-ranked by AgentBrain) is rendered by the shared
@@ -1369,6 +1509,7 @@ public class ChatService {
                 sb.append("No memory documents either — use KNOWLEDGE_GAP.\n\n");
             }
         }
+        sectionChars.put("tableSchema", sb.length() - mark); mark = sb.length();
 
         // ── Supporting context ────────────────────────────────────────────────
         if (hasMemory) {
@@ -1383,9 +1524,11 @@ public class ChatService {
         // existing entity/vocabulary text already used elsewhere in this class (answerFromMemory,
         // composeAnswer).
         if (!semCtx.isBlank()) sb.append(semCtx).append("\n");
+        sectionChars.put("memoryChunksLineAndSemanticContext", sb.length() - mark); mark = sb.length();
         if (!findings.isEmpty()) sb.append("Prior findings: ").append(findings.size()).append("\n");
         if (!anomalyCtx.isBlank()) sb.append(anomalyCtx).append("\n");
         if (hasPrior) sb.append("Prior query result: available\n");
+        sectionChars.put("findingsAndAnomaly", sb.length() - mark); mark = sb.length();
 
         // ── Conversation thread (prior user questions only) ───────────────────
         // The user's own earlier questions give lightweight conversational framing.
@@ -1404,6 +1547,14 @@ public class ChatService {
                 sb.append("\nEarlier in this conversation the user asked:\n")
                   .append(priorQuestions).append("\n");
             }
+        }
+        sectionChars.put("priorQuestions", sb.length() - mark);
+
+        try {
+            log.info("CONTEXT_BREAKDOWN conceptScoped={} totalChars={} sections={}",
+                    conceptScoped, sb.length(), sectionChars);
+        } catch (Exception ignored) {
+            // Measurement-only — never affect the returned context
         }
 
         return sb.toString();

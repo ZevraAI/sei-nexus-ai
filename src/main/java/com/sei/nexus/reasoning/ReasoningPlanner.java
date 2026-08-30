@@ -140,6 +140,7 @@ public class ReasoningPlanner {
     public StepPlan nextStep(String question, String schemaCtx, EvidenceStore evidence) {
         try {
             String prompt = buildPrompt(question, schemaCtx, evidence);
+            com.sei.nexus.ai.LlmCallTag.set("PLANNER");
             String raw    = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json   = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});

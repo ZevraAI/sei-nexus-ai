@@ -405,6 +405,25 @@ public class SemanticRepository {
         return jdbc.query(sql, entityMapper(), params.toArray());
     }
 
+    // Downstream Context Boundary for Concept-Scoped Metadata Narrowing: retrieves the ACTIVE
+    // Business Entities bound to an already Stage-2-resolved set of physical object keys —
+    // purely a retrieval keyed on primary_object_key membership, no domain_key, no ranking, no
+    // interpretation of the question. Callers use this ONLY when AgentBrain's own Stage 1/2
+    // concept-scoped resolution actually produced the object keys being passed in (see
+    // ResolvedBusinessModel#conceptScoped()) — this method makes no such determination itself.
+    public List<BusinessEntity> findEntitiesByObjectKeys(List<String> objectKeys) {
+        if (objectKeys == null || objectKeys.isEmpty()) return List.of();
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < objectKeys.size(); i++) placeholders.append(i == 0 ? "?" : ", ?");
+        String sql = "SELECT entity_key, domain_key, entity_name, description, primary_object_key, "
+                + "operational_meaning, investigation_hints, status, created_by, created_at, updated_at, "
+                + "entity_type, group_label, pack_key, concept_key "
+                + "FROM nexus_business_entity "
+                + "WHERE status = 'ACTIVE' AND primary_object_key IN (" + placeholders + ") "
+                + "ORDER BY entity_name";
+        return jdbc.query(sql, entityMapper(), objectKeys.toArray());
+    }
+
     // -------------------------------------------------------------------------
     // EntityLifecycleState
     // -------------------------------------------------------------------------

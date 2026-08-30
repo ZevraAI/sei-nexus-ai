@@ -97,13 +97,56 @@ public class AgentBrain {
      */
     public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
                                          List<String> domainKeys, String question) {
+        return resolve(agentId, connectionKeys, domainKeys, question, null);
+    }
+
+    /**
+     * Same as {@link #resolve(String, List, List, String)}, additionally threading a {@code
+     * conversationId} through to {@link ConceptScopedMetadataResolver}'s Stage 1 so the File
+     * Search path (when enabled) can chain to the tenant's own prior turn in this conversation —
+     * see {@link ConceptScopedMetadataResolver#resolveObjectKeys(String, String, String)}. Purely
+     * additive: {@code null} (or a null {@link #conceptResolver}) reproduces the 4-arg overload's
+     * behavior exactly.
+     */
+    public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
+                                         List<String> domainKeys, String question, String conversationId) {
+        return resolve(agentId, connectionKeys, domainKeys, question, conversationId, null);
+    }
+
+    /**
+     * Same as {@link #resolve(String, List, List, String, String)}, additionally requesting the
+     * Decision Router absorption: when {@code memoryAvailable} is non-null, the combined
+     * Persistent Knowledge / File Search LLM call is asked to also produce a routing decision
+     * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}), returned on
+     * {@link ResolvedBusinessModel#routingDecision()}. Passing {@code null} (the 5-arg overload)
+     * requests no routing at all — the exact prior call graph — so every existing caller
+     * (autonomous agents, any test) is entirely unaffected.
+     *
+     * @param memoryAvailable the one Java-computed runtime fact the LLM cannot obtain itself —
+     *                        whether document memory was found relevant for this question. Only
+     *                        meaningful when non-null; ignored (and no routing requested) when
+     *                        {@code null}.
+     */
+    public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
+                                         List<String> domainKeys, String question, String conversationId,
+                                         Boolean memoryAvailable) {
         // Business-language resolution (PRO-31/33) — deterministic, domain-scoped, and
         // annotate-never-substitute: the question text is never rewritten.
         ResolvedQuestion resolution = (domainKeys == null || domainKeys.isEmpty())
                 ? ResolvedQuestion.empty(question == null ? "" : question)
                 : resolver.resolve(question, domainKeys);
 
-        SemanticModel model = assembleBusinessScope(connectionKeys, domainKeys, question);
+        Optional<SemanticModel> conceptScoped;
+        Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision;
+        if (memoryAvailable == null) {
+            conceptScoped = conceptScopedModel(connectionKeys, question, conversationId);
+            routingDecision = Optional.empty();
+        } else {
+            ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, question, conversationId, memoryAvailable);
+            conceptScoped = r.model();
+            routingDecision = r.routing();
+        }
+        SemanticModel model = conceptScoped.orElseGet(() -> assembleByFallback(connectionKeys, domainKeys));
 
         // Rank the resolved objects by relevance to the request (business reasoning) so
         // grounding leads with what the user most likely means — without narrowing the surface.
@@ -116,7 +159,7 @@ public class AgentBrain {
 
         return new ResolvedBusinessModel(agentId, connectionKeys, question,
                 ranked, model.objectTargets(), model.attributeTargets(),
-                resolution, literalScopeOf(resolution));
+                resolution, literalScopeOf(resolution), conceptScoped.isPresent(), routingDecision);
     }
 
     // ── Business scope (owned here from Phase 3) ───────────────────────────────
@@ -161,11 +204,12 @@ public class AgentBrain {
      *   </li>
      * </ul>
      */
-    private SemanticModel assembleBusinessScope(List<String> connectionKeys,
-                                                List<String> domainKeys, String question) {
-        Optional<SemanticModel> conceptScoped = conceptScopedModel(connectionKeys, question);
-        if (conceptScoped.isPresent()) return conceptScoped.get();
-
+    /** The exact pre-concept-scoping assembly — reached whenever {@link #conceptScopedModel}
+     *  is empty (see this method's own javadoc, retained above the method it now backs). {@link
+     *  #resolve} calls {@link #conceptScopedModel} directly and falls back to this method so it
+     *  can also record, alongside the model, whether concept-scoping actually produced it (see
+     *  {@link ResolvedBusinessModel#conceptScoped()}). */
+    private SemanticModel assembleByFallback(List<String> connectionKeys, List<String> domainKeys) {
         if (domainKeys == null || domainKeys.isEmpty()) {
             return assembler.assemble(connectionKeys);
         }
@@ -195,13 +239,13 @@ public class AgentBrain {
      * Java) decides what is relevant — the same non-negotiable ownership rule Apply Pack's own
      * classification path already enforces.
      */
-    private Optional<SemanticModel> conceptScopedModel(List<String> connectionKeys, String question) {
+    private Optional<SemanticModel> conceptScopedModel(List<String> connectionKeys, String question, String conversationId) {
         if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
             return Optional.empty();
         }
         List<String> allObjectKeys = new ArrayList<>();
         for (String connectionKey : connectionKeys) {
-            Optional<List<String>> objectKeys = conceptResolver.resolveObjectKeys(connectionKey, question);
+            Optional<List<String>> objectKeys = conceptResolver.resolveObjectKeys(connectionKey, question, conversationId);
             if (objectKeys.isEmpty()) return Optional.empty();
             allObjectKeys.addAll(objectKeys.get());
         }
@@ -211,6 +255,46 @@ public class AgentBrain {
             return Optional.of(new SemanticModel(List.of(), Map.of(), Map.of()));
         }
         return Optional.of(assembler.assembleByObjectKeys(allObjectKeys));
+    }
+
+    /** Combined semantic model + routing decision — see {@link #conceptScopedModelWithRouting}. */
+    private record ConceptScopedModelResult(Optional<SemanticModel> model,
+                                            Optional<ConceptScopedMetadataResolver.RoutingDecision> routing) {}
+
+    /**
+     * Same as {@link #conceptScopedModel}, additionally requesting the Decision Router
+     * absorption's routing decision from the combined Persistent Knowledge call per connection
+     * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}).
+     *
+     * <p>Scope limitation, honestly disclosed rather than silently resolved: {@code
+     * routingDecision} is a whole-REQUEST decision, but Stage 1 runs per CONNECTION. For the
+     * common case (one connection in scope), this is exactly one combined call and one routing
+     * decision. For a multi-connection scope, the FIRST connection's routing decision is used as
+     * the request's routing decision — later connections' routing decisions (if they differ) are
+     * discarded. This mirrors this class's existing all-or-nothing semantics for object keys
+     * (any one connection failing empties the whole scope) rather than inventing a new merge
+     * rule for a case that does not arise in this codebase's current agent/connection topology.
+     */
+    private ConceptScopedModelResult conceptScopedModelWithRouting(List<String> connectionKeys, String question,
+                                                                    String conversationId, boolean memoryAvailable) {
+        if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
+            return new ConceptScopedModelResult(Optional.empty(), Optional.empty());
+        }
+        List<String> allObjectKeys = new ArrayList<>();
+        Optional<ConceptScopedMetadataResolver.RoutingDecision> routing = Optional.empty();
+        for (String connectionKey : connectionKeys) {
+            ConceptScopedMetadataResolver.CombinedResolution resolution =
+                    conceptResolver.resolveObjectKeysWithRouting(connectionKey, question, conversationId, memoryAvailable);
+            if (resolution.objectKeys().isEmpty()) {
+                return new ConceptScopedModelResult(Optional.empty(), Optional.empty());
+            }
+            allObjectKeys.addAll(resolution.objectKeys().get());
+            if (routing.isEmpty()) routing = resolution.routing();
+        }
+        if (allObjectKeys.isEmpty()) {
+            return new ConceptScopedModelResult(Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing);
+        }
+        return new ConceptScopedModelResult(Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), routing);
     }
 
     /** Restricts a domain scope to objects reachable through the approved connections. */

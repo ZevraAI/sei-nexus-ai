@@ -81,6 +81,7 @@ public class NaturalLanguageComposer {
     public String compose(CompositionRequest req) {
         List<ChatMessage> messages = List.of(ChatMessage.user(req.userPrompt()));
         try {
+            com.sei.nexus.ai.LlmCallTag.set("ANSWER_COMPOSER");
             return switch (req.mode()) {
                 case TEXT -> aiClient.chat(messages, req.systemPrompt());
                 case JSON -> aiClient.chatWithJson(messages, req.systemPrompt());

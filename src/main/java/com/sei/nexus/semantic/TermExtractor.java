@@ -71,6 +71,7 @@ public class TermExtractor {
         }
         try {
             String prompt = "Question: " + question + "\n\nSQL:\n" + truncate(sql, 1000);
+            com.sei.nexus.ai.LlmCallTag.set("TERM_LEARNING_ASYNC");
             String raw    = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json   = extractJsonArray(raw);
             List<Map<String, Object>> parsed = objectMapper.readValue(

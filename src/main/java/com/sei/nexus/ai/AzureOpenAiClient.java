@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.usage.UsageService;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -26,6 +28,8 @@ import java.util.regex.Pattern;
 
 @Service
 public class AzureOpenAiClient {
+
+    private static final Logger log = LoggerFactory.getLogger(AzureOpenAiClient.class);
 
     private static final int MAX_RETRIES = 4;
     private static final long INITIAL_BACKOFF_MS    = 1_000L;   // for general errors
@@ -114,6 +118,394 @@ public class AzureOpenAiClient {
         } catch (Exception e) {
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Failed to parse embedding response: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Creates an OpenAI Vector Store and returns its id (e.g. {@code "vs_..."}).
+     *
+     * <p>Phase 1 of the Persistent Tenant Knowledge migration: provisioning only.
+     * The store is created empty — no files are uploaded, and nothing here performs
+     * File Search. Reuses the same request/retry/throttle/rate-awareness path as
+     * every other call on this client ({@link #executeWithRetry}), so a transient
+     * failure or rate limit is retried exactly like any other OpenAI call before
+     * surfacing to the caller.
+     *
+     * @param name deterministic, non-sensitive store name (e.g. derived from the
+     *             tenant's schema name — never a tenant's display name or email)
+     * @return the OpenAI-assigned vector store id
+     */
+    public String createVectorStore(String name) {
+        String url = BASE_URL + "/vector_stores";
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("name", name);
+
+        String responseBody = executeWithRetry(url, requestBody);
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            String id = root.path("id").asText(null);
+            if (id == null || id.isBlank()) {
+                throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "OpenAI vector store creation response did not contain an id");
+            }
+            return id;
+        } catch (NexusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse vector store response: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Uploads a small in-memory file to OpenAI ({@code purpose=assistants}, required for Vector
+     * Store attachment) and returns its file id. Phase 2A: the caller builds the file content as a
+     * {@code byte[]} — never a filesystem path — so nothing here ever touches disk.
+     *
+     * @param content  the raw file bytes (e.g. UTF-8 JSON)
+     * @param filename a deterministic name for the uploaded file (shown in the OpenAI dashboard
+     *                 and available to File Search citations — carries no tenant-sensitive data)
+     * @param mimeType e.g. {@code "application/json"}
+     * @return the OpenAI-assigned file id (e.g. {@code "file_..."})
+     */
+    public String uploadFile(byte[] content, String filename, String mimeType) {
+        String boundary = "zevra-" + java.util.UUID.randomUUID();
+        byte[] body = buildMultipartUploadBody(boundary, content, filename, mimeType);
+        String responseBody = executeMultipartWithRetry(BASE_URL + "/files", body, boundary);
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            String id = root.path("id").asText(null);
+            if (id == null || id.isBlank()) {
+                throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "OpenAI file upload response did not contain an id");
+            }
+            return id;
+        } catch (NexusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse file upload response: " + e.getMessage());
+        }
+    }
+
+    private byte[] buildMultipartUploadBody(String boundary, byte[] content, String filename, String mimeType) {
+        String crlf = "\r\n";
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        try {
+            out.write(("--" + boundary + crlf).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(("Content-Disposition: form-data; name=\"purpose\"" + crlf + crlf)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(("assistants" + crlf).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            out.write(("--" + boundary + crlf).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(("Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"" + crlf)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(("Content-Type: " + mimeType + crlf + crlf).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(content);
+            out.write(crlf.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            out.write(("--" + boundary + "--" + crlf).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (java.io.IOException e) {
+            // ByteArrayOutputStream never actually throws IOException — kept for the write() signature.
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to build upload body: " + e.getMessage());
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Attaches an already-uploaded file to a Vector Store, optionally carrying string attributes
+     * (Phase 2A uses this for provenance: {@code concept_uid}, {@code concept_key}, {@code
+     * knowledge_type}, {@code pack_key}, {@code connection_key} — see {@code
+     * ConceptKnowledgeMaterializationService}). Does not poll for indexing completion — the caller
+     * decides whether/how long to wait via {@link #getVectorStoreFileStatus}.
+     */
+    public void attachFileToVectorStore(String vectorStoreId, String fileId, Map<String, String> attributes) {
+        String url = BASE_URL + "/vector_stores/" + vectorStoreId + "/files";
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("file_id", fileId);
+        if (attributes != null && !attributes.isEmpty()) {
+            requestBody.put("attributes", attributes);
+        }
+        executeWithRetry(url, requestBody);
+    }
+
+    /** The {@code status} field of one vector-store-file attachment (e.g. {@code "in_progress"}, {@code "completed"}, {@code "failed"}). */
+    public String getVectorStoreFileStatus(String vectorStoreId, String fileId) {
+        String url = BASE_URL + "/vector_stores/" + vectorStoreId + "/files/" + fileId;
+        String responseBody = executeGetWithRetry(url);
+        try {
+            return objectMapper.readTree(responseBody).path("status").asText(null);
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse vector store file status response: " + e.getMessage());
+        }
+    }
+
+    /** One file currently attached to a Vector Store, with whatever string attributes it carries. */
+    public record VectorStoreFileRef(String fileId, Map<String, String> attributes) {}
+
+    /**
+     * Lists every file currently attached to a Vector Store — used only for Phase 2A's
+     * idempotency check (skip re-uploading a concept whose {@code concept_uid} attribute is
+     * already present). Not paginated beyond OpenAI's default page size; Phase 2A tenants have at
+     * most a few dozen concepts, well under that, so pagination is intentionally not implemented
+     * here — see the Phase 2A report's Known Limitations.
+     */
+    public List<VectorStoreFileRef> listVectorStoreFiles(String vectorStoreId) {
+        String url = BASE_URL + "/vector_stores/" + vectorStoreId + "/files";
+        String responseBody = executeGetWithRetry(url);
+        List<VectorStoreFileRef> refs = new ArrayList<>();
+        try {
+            JsonNode data = objectMapper.readTree(responseBody).path("data");
+            for (JsonNode item : data) {
+                String fileId = item.path("id").asText(null);
+                Map<String, String> attrs = new HashMap<>();
+                JsonNode attributes = item.path("attributes");
+                attributes.fields().forEachRemaining(entry -> attrs.put(entry.getKey(), entry.getValue().asText()));
+                refs.add(new VectorStoreFileRef(fileId, attrs));
+            }
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse vector store file list response: " + e.getMessage());
+        }
+        return refs;
+    }
+
+    /**
+     * File Search query against a Vector Store via {@code POST /v1/responses} — returns the raw
+     * response JSON body as text, unparsed.
+     *
+     * <p><strong>Phase 2A validation use only.</strong> Nothing in the production Chat path
+     * ({@code ChatService}/{@code AgentBrain}/{@code ConceptScopedMetadataResolver}) calls this —
+     * it exists solely for {@code ConceptKnowledgeRetrievalRealTenantValidation} (a real-tenant,
+     * real-OpenAI manual validation class, never run by {@code mvn test}) to prove uploaded
+     * concept knowledge is actually retrievable. Chat File Search integration is explicitly out of
+     * scope for this phase.
+     */
+    public String fileSearchQuery(String vectorStoreId, String query) {
+        String url = BASE_URL + "/responses";
+        Map<String, Object> tool = new HashMap<>();
+        tool.put("type", "file_search");
+        tool.put("vector_store_ids", List.of(vectorStoreId));
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", chatModel);
+        requestBody.put("input", query);
+        requestBody.put("tools", List.of(tool));
+
+        return executeWithRetry(url, requestBody);
+    }
+
+    /**
+     * A single model turn with OpenAI's <b>native</b> {@code file_search} capability enabled
+     * against one tenant Vector Store, with the model's final answer constrained to a JSON
+     * object (Responses API {@code text.format = json_object}).
+     *
+     * <p><b>Java performs no retrieval anywhere in this method.</b> This is one HTTP request to
+     * {@code POST /v1/responses}, exactly like {@link #chat}/{@link #chatWithJson} are one
+     * request to {@code /chat/completions} — the only difference is which OpenAI endpoint/tool
+     * is used. There is no Java-implemented search algorithm, no downloaded file content, no
+     * filename or citation parsing, no multi-turn tool-calling loop, and no custom function/tool
+     * exposed to the model (contrast with {@link #chatWithTools}, which genuinely does implement
+     * an OpenAI function-calling loop where the caller supplies tool results back to the model —
+     * that pattern is deliberately NOT used here). OpenAI's own infrastructure executes the
+     * search against the named Vector Store server-side, entirely within this one round trip;
+     * Java's role starts and ends at sending the request and reading the model's final text.
+     *
+     * <p>This is a general-purpose capability, not a concept-selection-specific one — it is named
+     * and shaped symmetrically with {@link #chat}/{@link #chatWithJson}/{@link #chatWithTools}
+     * precisely so it can be reused by any future caller that needs the model to consult a
+     * tenant's persistent knowledge, not only {@code ConceptScopedMetadataResolver}.
+     *
+     * @param vectorStoreId the tenant's own {@code ai_knowledge_vector_store_id} — resolved by
+     *                      the caller from {@code TenantContext}, never from client input
+     * @param instructions  the system-prompt-equivalent instructions (Responses API {@code
+     *                      instructions} field)
+     * @param question      the user's question, verbatim
+     * @return the model's final message text (expected to be the requested JSON object) — the
+     *         same string shape {@link #chatWithJson} returns, ready for the caller's existing
+     *         JSON parsing
+     */
+    public String chatWithFileSearch(String vectorStoreId, String instructions, String question) {
+        return chatWithFileSearch(vectorStoreId, instructions, question, null).text();
+    }
+
+    /**
+     * Result of a {@link #chatWithFileSearch} call that also needs the OpenAI response id —
+     * e.g. to persist it for a later {@code previous_response_id}-chained turn. Additive: the
+     * original 3-arg {@link #chatWithFileSearch} delegates here and simply discards {@link
+     * #responseId}, so every existing caller/test keeps compiling and behaving identically.
+     *
+     * @param text       the model's final message text — identical to what the 3-arg overload returns
+     * @param responseId the OpenAI-assigned response id ({@code resp_...}), or {@code null} if the
+     *                   response envelope didn't contain one (never expected in practice, but the
+     *                   caller must not assume non-null)
+     */
+    public record FileSearchResult(String text, String responseId) {}
+
+    /**
+     * Same native-{@code file_search} single-turn call as the 3-arg {@link #chatWithFileSearch},
+     * with one additive capability: OpenAI conversation chaining via {@code previous_response_id}.
+     *
+     * <p>Passing a non-null {@code previousResponseId} asks OpenAI to reconstruct the prior turn's
+     * context server-side — Java never resends prior question/answer text for this. Passing
+     * {@code null} (or using the 3-arg overload) makes an ordinary, unchained turn — the existing,
+     * unmodified behavior. This does not change what native {@code file_search} is or how it's
+     * configured (still {@code tools=[{"type":"file_search","vector_store_ids":[vectorStoreId]}]});
+     * {@code previous_response_id} is a separate, additive top-level request field.
+     *
+     * @param previousResponseId the prior turn's OpenAI response id for this same conversation, or
+     *                           {@code null} for a fresh/unchained turn. The caller is responsible
+     *                           for resolving this from Zevra-owned, tenant/conversation-scoped
+     *                           state — never from client input — and for falling back to a fresh
+     *                           call if OpenAI rejects an invalid/expired id (this method does not
+     *                           retry internally; see {@code ConceptScopedMetadataResolver} for the
+     *                           fallback-to-fresh discipline)
+     * @return the model's final text plus the new response id, for the caller to persist as this
+     *         conversation's new "latest" id
+     */
+    public FileSearchResult chatWithFileSearch(String vectorStoreId, String instructions, String question,
+                                                String previousResponseId) {
+        return chatWithFileSearch(vectorStoreId, instructions, question, previousResponseId, null);
+    }
+
+    /**
+     * Same as the 4-arg {@link #chatWithFileSearch}, with one additive capability: strict
+     * JSON-schema-enforced structured output (Responses API {@code text.format={"type":
+     * "json_schema",...,"strict":true}}) instead of the looser {@code json_object} mode, when
+     * {@code jsonSchema} is non-null. Passing {@code null} (or using the 4-arg overload)
+     * reproduces the existing {@code json_object} behavior exactly — this parameter is purely
+     * additive.
+     *
+     * <p>Used for the Persistent Knowledge combined concept-selection + routing-decision
+     * contract (see {@code ConceptScopedMetadataResolver#selectConceptsAndRoutingViaPersistentKnowledge}),
+     * where the {@code routing.type} field must be constrained to an exact enum at the API level
+     * rather than relying on prose alone — the same discipline the old Decision Router's
+     * {@code chat()} call never had.
+     *
+     * @param jsonSchema a JSON Schema object (as nested {@code Map}/{@code List}/primitive
+     *                   values — the same shape {@code ObjectMapper} would produce from parsing
+     *                   a JSON Schema document) describing the exact required response shape, or
+     *                   {@code null} for the existing {@code json_object} mode. The caller is
+     *                   responsible for the schema being valid strict-mode JSON Schema (every
+     *                   property required, {@code additionalProperties:false} at every object
+     *                   level) — OpenAI rejects the request otherwise.
+     */
+    public FileSearchResult chatWithFileSearch(String vectorStoreId, String instructions, String question,
+                                                String previousResponseId, Map<String, Object> jsonSchema) {
+        String url = BASE_URL + "/responses";
+        Map<String, Object> tool = new HashMap<>();
+        tool.put("type", "file_search");
+        tool.put("vector_store_ids", List.of(vectorStoreId));
+
+        Map<String, Object> textFormat = new HashMap<>();
+        if (jsonSchema != null) {
+            textFormat.put("type", "json_schema");
+            textFormat.put("name", "persistent_knowledge_response");
+            textFormat.put("strict", true);
+            textFormat.put("schema", jsonSchema);
+        } else {
+            textFormat.put("type", "json_object");
+        }
+        Map<String, Object> text = new HashMap<>();
+        text.put("format", textFormat);
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", chatModel);
+        requestBody.put("instructions", instructions);
+        // OpenAI requires the literal word "json" to appear in `input` itself (not just
+        // `instructions`) to use text.format=json_object — confirmed via a real 400 response:
+        // "Response input messages must contain the word 'json' in some form...". This appended
+        // line is a pure API-compliance formality, never shown to or written by the user, and
+        // does not change the question's meaning.
+        requestBody.put("input", question + "\n\n(Respond in JSON as instructed.)");
+        requestBody.put("tools", List.of(tool));
+        requestBody.put("text", text);
+        if (previousResponseId != null && !previousResponseId.isBlank()) {
+            requestBody.put("previous_response_id", previousResponseId);
+        }
+
+        long startNanos = System.nanoTime();
+        String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        recordFileSearchUsage(responseBody, vectorStoreId, latencyMs);
+        String newResponseId = extractResponseId(responseBody);
+        return new FileSearchResult(extractResponseText(responseBody), newResponseId);
+    }
+
+    /** Extracts the top-level {@code id} field from a Responses API envelope. {@code null} (never
+     *  throws) when absent/malformed — the same defensive posture as {@link #extractResponseText}. */
+    private String extractResponseId(String responseBody) {
+        try {
+            return objectMapper.readTree(responseBody).path("id").asText(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Diagnostic-only observability for {@link #chatWithFileSearch}, read from the raw response
+     * BEFORE {@link #extractResponseText} discards everything except the final message text.
+     * Proves whether OpenAI's native {@code file_search} tool was actually invoked and completed
+     * for this call — never logs the question, {@code instructions}, or any retrieved document
+     * content; only the {@code vectorStoreId} (diagnostic, non-sensitive), model, latency, and
+     * the {@code file_search_call} item's own presence/status/result-count.
+     *
+     * <p>Mirrors the existing {@code LLM_METRIC} convention's {@link LlmCallTag} consume-and-clear
+     * discipline (same pattern as {@link #recordUsage}), as its own {@code FILE_SEARCH_METRIC}
+     * line rather than reusing {@code recordUsage} itself — the Responses API's {@code usage}
+     * shape ({@code input_tokens}/{@code output_tokens}) and this call's actually-interesting
+     * fields (tool invocation/status/result count, not token counts) are different enough that
+     * forcing them through the Chat-Completions-shaped {@code recordUsage} would either silently
+     * report zero tokens or require reshaping that method for every other caller — this dedicated,
+     * additive method is the smaller change.
+     */
+    private void recordFileSearchUsage(String responseBody, String vectorStoreId, long latencyMs) {
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            boolean fileSearchCallPresent = false;
+            String status = "absent";
+            int resultCount = -1; // -1 = results not requested/unavailable, distinct from 0 = requested and empty
+            for (JsonNode item : root.path("output")) {
+                if ("file_search_call".equals(item.path("type").asText())) {
+                    fileSearchCallPresent = true;
+                    status = item.path("status").asText("unknown");
+                    JsonNode results = item.path("results");
+                    if (results.isArray()) resultCount = results.size();
+                    break;
+                }
+            }
+            log.info("FILE_SEARCH_METRIC callType={} model={} vectorStoreId={} latencyMs={} "
+                            + "fileSearchCallPresent={} status={} resultCount={}",
+                    LlmCallTag.get(), chatModel, vectorStoreId, latencyMs,
+                    fileSearchCallPresent, status, resultCount);
+        } catch (Exception ignored) {
+            // Metrics logging is measurement-only — never break the main flow
+        } finally {
+            LlmCallTag.clear();
+        }
+    }
+
+    /** Extracts the final assistant message text from a Responses API envelope — the {@code
+     *  message}-type output item's concatenated {@code output_text} content. Returns an empty
+     *  string (never throws) when the shape doesn't match, so a malformed/unexpected response
+     *  degrades to "no JSON found" for the caller's existing parser rather than an exception. */
+    private String extractResponseText(String responseBody) {
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode item : root.path("output")) {
+                if (!"message".equals(item.path("type").asText())) continue;
+                for (JsonNode content : item.path("content")) {
+                    if ("output_text".equals(content.path("type").asText())) {
+                        sb.append(content.path("text").asText());
+                    }
+                }
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -230,11 +622,17 @@ public class AzureOpenAiClient {
         requestBody.put("temperature", 0.2);
         requestBody.put("max_tokens", 4096);
 
+        long startNanos = System.nanoTime();
         String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
 
         try {
             JsonNode root    = objectMapper.readTree(responseBody);
-            recordUsage(root, chatModel);
+            int requestChars = systemPrompt != null ? systemPrompt.length() : 0;
+            for (AgentMessage msg : messages) {
+                requestChars += msg.content() != null ? msg.content().length() : 0;
+            }
+            recordUsage(root, chatModel, latencyMs, requestChars);
             JsonNode message = root.path("choices").get(0).path("message");
             JsonNode toolCalls = message.path("tool_calls");
 
@@ -289,11 +687,17 @@ public class AzureOpenAiClient {
             requestBody.put("response_format", responseFormat);
         }
 
+        long startNanos = System.nanoTime();
         String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
 
         try {
             JsonNode root = objectMapper.readTree(responseBody);
-            recordUsage(root, model);
+            int requestChars = systemPrompt != null ? systemPrompt.length() : 0;
+            for (ChatMessage msg : messages) {
+                requestChars += msg.content() != null ? msg.content().length() : 0;
+            }
+            recordUsage(root, model, latencyMs, requestChars);
             return root.path("choices").get(0).path("message").path("content").asText();
         } catch (NexusException e) {
             throw e;
@@ -329,10 +733,24 @@ public class AzureOpenAiClient {
         }
     }
 
-    /** Extracts token counts from an OpenAI response and records them for billing. */
-    private void recordUsage(JsonNode root, String model) {
+    /**
+     * Extracts token counts from an OpenAI response and records them for billing — behavior
+     * unchanged from before the Zevra Cognitive Runtime baseline instrumentation was added
+     * (still a no-op when {@code usage} is absent, still silently swallows any parsing failure).
+     *
+     * <p>Additionally — purely observational, never feeding back into any decision — logs one
+     * {@code LLM_METRIC} line per call for the measured baseline: the {@link LlmCallTag} the
+     * caller set, the model, wall-clock latency for the {@link #executeWithRetry} call (network +
+     * any retry/backoff time), prompt/completion tokens, {@code cached_tokens} when OpenAI's
+     * automatic prompt caching reports one (absent/0 simply means this call's prefix wasn't
+     * cache-eligible or didn't hit — never treated as an error), and the character count of what
+     * was actually sent (system prompt + all message contents, computed by each call site before
+     * this method runs). This logging is best-effort and independently guarded so a failure in it
+     * can never affect the pre-existing usage-recording behavior above, or vice versa.
+     */
+    private void recordUsage(JsonNode root, String model, long latencyMs, int requestChars) {
+        JsonNode usage = root.path("usage");
         try {
-            JsonNode usage = root.path("usage");
             if (!usage.isMissingNode()) {
                 int prompt     = usage.path("prompt_tokens").asInt(0);
                 int completion = usage.path("completion_tokens").asInt(0);
@@ -340,6 +758,18 @@ public class AzureOpenAiClient {
             }
         } catch (Exception ignored) {
             // Usage tracking is non-fatal — never break the main flow
+        }
+        try {
+            int prompt        = usage.path("prompt_tokens").asInt(0);
+            int completion     = usage.path("completion_tokens").asInt(0);
+            int cachedTokens   = usage.path("prompt_tokens_details").path("cached_tokens").asInt(0);
+            log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
+                            + "cachedTokens={} requestChars={}",
+                    LlmCallTag.get(), model, latencyMs, prompt, completion, cachedTokens, requestChars);
+        } catch (Exception ignored) {
+            // Metrics logging is measurement-only — never break the main flow
+        } finally {
+            LlmCallTag.clear();
         }
     }
 
@@ -358,10 +788,54 @@ public class AzureOpenAiClient {
         // (the API key is an Authorization header, never in the payload). No-op in normal runs.
         capturePayload(url, jsonBody);
 
-        // Global throttle: acquired before the retry loop begins, released only after it
-        // finally returns or throws — must wrap the whole retry+backoff sequence, not just
-        // the HTTP send, or a 429-storm still lets unlimited threads pile up mid-backoff,
-        // defeating the point of a concurrency cap.
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .timeout(Duration.ofSeconds(60))
+                .build();
+        return throttledSendWithRetry(request);
+    }
+
+    /**
+     * Multipart file upload (e.g. {@code POST /files}) — the one shape {@link #executeWithRetry}
+     * cannot express (it always serializes a {@code Map} as a JSON body). Shares the exact same
+     * throttle/retry/backoff/rate-awareness path via {@link #throttledSendWithRetry}; only how the
+     * {@link HttpRequest} body/content-type are built differs from the JSON path above.
+     *
+     * @param multipartBody the already-encoded {@code multipart/form-data} bytes (built in memory —
+     *                       never written to disk, so there is nothing here for a caller to clean up)
+     */
+    private String executeMultipartWithRetry(String url, byte[] multipartBody, String boundary) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .header("Authorization", "Bearer " + apiKey)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(multipartBody))
+                .timeout(Duration.ofSeconds(60))
+                .build();
+        return throttledSendWithRetry(request);
+    }
+
+    /** {@code GET} variant — no request body, same throttle/retry/backoff/rate-awareness path. */
+    private String executeGetWithRetry(String url) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + apiKey)
+                .timeout(Duration.ofSeconds(60))
+                .GET()
+                .build();
+        return throttledSendWithRetry(request);
+    }
+
+    /**
+     * Global throttle: acquired before the retry loop begins, released only after it finally
+     * returns or throws — must wrap the whole retry+backoff sequence, not just the HTTP send, or
+     * a 429-storm still lets unlimited threads pile up mid-backoff, defeating the point of a
+     * concurrency cap. Shared by every request shape (JSON, multipart, GET) this client sends.
+     */
+    private String throttledSendWithRetry(HttpRequest request) {
         try {
             globalCallLimit.acquire();
         } catch (InterruptedException ie) {
@@ -370,13 +844,20 @@ public class AzureOpenAiClient {
                     "OpenAI call interrupted while waiting for capacity");
         }
         try {
-            return executeWithRetryLocked(url, jsonBody);
+            return sendWithRetryLocked(request);
         } finally {
             globalCallLimit.release();
         }
     }
 
-    private String executeWithRetryLocked(String url, String jsonBody) {
+    /**
+     * The retry/backoff/rate-awareness loop itself, extracted from the JSON-only path this used
+     * to be — behavior is unchanged, only parameterized by an already-built {@link HttpRequest}
+     * instead of always constructing one from a JSON string. {@code HttpRequest.BodyPublishers}
+     * (both {@code ofString} and {@code ofByteArray}) are repeatable, so reusing the same request
+     * object across retry attempts is safe.
+     */
+    private String sendWithRetryLocked(HttpRequest request) {
         long backoffMs = INITIAL_BACKOFF_MS;
         Exception lastException = null;
 
@@ -387,14 +868,6 @@ public class AzureOpenAiClient {
             waitForRateBudget();
 
             try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", "Bearer " + apiKey)
-                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                        .timeout(Duration.ofSeconds(60))
-                        .build();
-
                 HttpResponse<String> response = sendHttp(request);
                 updateRateState(response);
 

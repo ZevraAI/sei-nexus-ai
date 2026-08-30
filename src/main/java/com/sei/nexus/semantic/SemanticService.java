@@ -263,6 +263,48 @@ public class SemanticService {
         return repository.findEntitiesByConnectionAndConcepts(connectionKey, conceptKeys);
     }
 
+    /**
+     * Downstream Context Boundary for Concept-Scoped Metadata Narrowing: the same rendered
+     * {@link SemanticContext} shape as {@link #semanticContextWithBindings}, but sourced ONLY
+     * from the Business Entities bound to {@code objectKeys} — an already Stage-2-resolved
+     * physical scope (see {@code AgentBrain#conceptScopedModel} /
+     * {@code ResolvedBusinessModel#conceptScoped()}) — instead of every ACTIVE entity in a
+     * domain. This is the fix for the leak traced in the "show me all open orders" investigation:
+     * once Stage 1 selects a concept and Stage 2 resolves it to physical objects, every
+     * downstream context channel — not just the physical-schema block — must be bounded by that
+     * same resolved scope, so an unselected entity (e.g. Purchase Order, when only
+     * Sales Transaction was selected) can never re-enter the prompt through this channel.
+     *
+     * <p>Deliberately entity-only: unlike {@link #semanticContextWithBindings}, this method does
+     * not query {@code nexus_operational_vocabulary} — that table has no {@code
+     * primary_object_key}/object-key relationship to filter by (only a domain-scoped one), and
+     * the Operational Vocabulary/Business Language Resolution mechanism is explicitly out of
+     * scope for this fix. Term lines and vocabulary bindings are simply absent from the
+     * returned context; the entity block — where the leaked "Purchase Order" text actually
+     * originated — is fully scoped.
+     *
+     * <p>{@code objectKeys} empty/null ⇒ {@link SemanticContext#EMPTY} — a legitimate, honest
+     * "nothing in scope" outcome when Stage 1 selected no concept, never a fallback to a
+     * broader retrieval.
+     */
+    public SemanticContext semanticContextForObjectKeys(List<String> objectKeys) {
+        if (objectKeys == null || objectKeys.isEmpty()) {
+            return SemanticContext.EMPTY;
+        }
+        try {
+            List<EntityRow> entities = repository.findEntitiesByObjectKeys(objectKeys).stream()
+                    .map(e -> new EntityRow(e.entityKey(), e.entityName(), e.entityType(),
+                            e.description(), e.operationalMeaning(), e.investigationHints(),
+                            e.primaryObjectKey()))
+                    .toList();
+            return assemble(entities, List.of());
+        } catch (Exception e) {
+            log.warn("Failed to build concept-scoped semantic context for object keys {}: {}",
+                    objectKeys, e.getMessage());
+            return SemanticContext.EMPTY;
+        }
+    }
+
     /** Thin pass-through to the existing soft-delete ({@code status = 'INACTIVE'}) — the same
      *  operation the Semantic Layer UI's own vocabulary "Delete" action already performs (via a
      *  full re-upsert on the frontend). This status-only variant is used by Industry Pack

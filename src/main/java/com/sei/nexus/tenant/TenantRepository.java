@@ -96,6 +96,38 @@ public class TenantRepository {
                 """, plan, maxUsers, slug);
     }
 
+    // ── AI knowledge store (Phase 1: provisioning only) ─────────────────────────
+    //
+    // Deliberately separate from save()'s generic upsert: save() is called from
+    // paths that only know about name/plan/status/contact/maxUsers (tenant
+    // creation, plan changes), and must never accidentally null out an already-
+    // provisioned vector store because its SET clause doesn't mention these
+    // columns. These two methods are the only writers of ai_knowledge_* columns.
+
+    /** Records a successful provisioning attempt. Idempotent — safe to call again with the same id. */
+    public void updateAiKnowledgeReady(String slug, String vectorStoreId) {
+        jdbc.update("""
+                UPDATE nexus_tenant
+                   SET ai_knowledge_vector_store_id = ?,
+                       ai_knowledge_status           = 'READY',
+                       ai_knowledge_error             = NULL,
+                       ai_knowledge_provisioned_at    = NOW(),
+                       updated_at                     = NOW()
+                 WHERE slug = ?
+                """, vectorStoreId, slug);
+    }
+
+    /** Records a failed provisioning attempt. Leaves vector_store_id untouched (it should still be null). */
+    public void updateAiKnowledgeFailed(String slug, String errorMessage) {
+        jdbc.update("""
+                UPDATE nexus_tenant
+                   SET ai_knowledge_status = 'FAILED',
+                       ai_knowledge_error  = ?,
+                       updated_at          = NOW()
+                 WHERE slug = ?
+                """, errorMessage, slug);
+    }
+
     // ── Session index ─────────────────────────────────────────────────────────
 
     public record SessionIndex(String tokenHash, String tenantSchema, String userEmail, Instant expiresAt) {}
@@ -153,7 +185,11 @@ public class TenantRepository {
                 rs.getString("contact_email"),
                 rs.getInt("max_users"),
                 toInstant(rs, "created_at"),
-                toInstant(rs, "updated_at"));
+                toInstant(rs, "updated_at"),
+                rs.getString("ai_knowledge_vector_store_id"),
+                rs.getString("ai_knowledge_status"),
+                rs.getString("ai_knowledge_error"),
+                toInstant(rs, "ai_knowledge_provisioned_at"));
     }
 
     private Instant toInstant(ResultSet rs, String col) throws SQLException {

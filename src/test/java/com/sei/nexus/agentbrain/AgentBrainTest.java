@@ -54,10 +54,12 @@ class AgentBrainTest {
         Map<String, java.util.Optional<List<String>>> resultByConnection = new java.util.HashMap<>();
         List<String> seenConnectionKeys = new java.util.ArrayList<>();
         String seenQuestion;
+        String seenConversationId;
         FakeConceptResolver() { super(null, null, null, null); }
-        @Override public java.util.Optional<List<String>> resolveObjectKeys(String connectionKey, String question) {
+        @Override public java.util.Optional<List<String>> resolveObjectKeys(String connectionKey, String question, String conversationId) {
             seenConnectionKeys.add(connectionKey);
             seenQuestion = question;
+            seenConversationId = conversationId;
             return resultByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
         }
     }
@@ -375,6 +377,64 @@ class AgentBrainTest {
         assertEquals(List.of("conn-1"), assembler.seenKeys, "must fall back to the full connection-scoped assembly");
         assertEquals(2, model.objects().size());
         assertNull(assembler.seenObjectKeys, "the targeted primitive must never be called on fallback");
+    }
+
+    // ── Downstream Context Boundary — ResolvedBusinessModel#conceptScoped() ─────────────────
+    // (the flag ChatService reads to decide whether the semantic-context channel must be
+    // bounded by Stage 2's own resolved object scope, or may keep its pre-existing,
+    // domain-wide behavior — see the "show me all open orders" leak investigation.)
+
+    @Test
+    void conceptScopedFlagIsTrueWhenNarrowingActuallyProducedTheModel() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how much stock do we have?");
+
+        assertTrue(model.conceptScoped(),
+                "narrowing succeeded and produced this model — downstream context must be bounded by it");
+    }
+
+    @Test
+    void conceptScopedFlagIsTrueEvenWhenTheLlmSelectedZeroConcepts() {
+        // A legitimate, honest "nothing applies" outcome is still a concept-scoped result — an
+        // empty scope, not "narrowing didn't happen." Downstream context must stay empty too,
+        // never fall back to a domain-wide retrieval it never asked for.
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of()));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "what is the weather today?");
+
+        assertTrue(model.conceptScoped());
+        assertTrue(model.objectTargets().isEmpty());
+    }
+
+    @Test
+    void conceptScopedFlagIsFalseOnFallback() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // no entry ⇒ Optional.empty()
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how many orders");
+
+        assertFalse(model.conceptScoped(),
+                "no concept resolver result — this is the pre-existing full-assembly fallback, "
+                        + "downstream context must keep its exact prior (domain-wide) behavior");
+    }
+
+    @Test
+    void conceptScopedFlagIsFalseWhenNoResolverIsWiredAtAll() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver()); // 2-arg — no conceptResolver
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how many orders");
+
+        assertFalse(model.conceptScoped());
     }
 
     /** Every pre-existing test in this file constructs AgentBrain via the 2-arg constructor —

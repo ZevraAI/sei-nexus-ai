@@ -70,6 +70,19 @@ public class KnowledgeGraphService {
      * Format is intentionally terse to minimise token cost.
      */
     public String buildGraphContext(List<String> domainKeys) {
+        return buildGraphContext(domainKeys, null);
+    }
+
+    /**
+     * Downstream Context Boundary for Concept-Scoped Metadata Narrowing: same rendering as
+     * {@link #buildGraphContext(List)}, but when {@code objectKeyScope} is non-null the node set
+     * is first restricted to nodes bound ({@code primaryObjectKey}) to that already
+     * Stage-2-resolved scope — a pure membership filter, never a keyword/relevance decision — so
+     * an unselected entity (e.g. Purchase Order, when only Sales Transaction was resolved) cannot
+     * re-enter the prompt through this channel either. {@code null} reproduces the exact
+     * pre-existing domain-wide behavior (every caller of the single-arg overload above).
+     */
+    public String buildGraphContext(List<String> domainKeys, java.util.Set<String> objectKeyScope) {
         if (domainKeys == null || domainKeys.isEmpty()) return "";
 
         try {
@@ -78,6 +91,12 @@ public class KnowledgeGraphService {
                     .flatMap(dk -> repository.findNodesByDomain(dk).stream())
                     .distinct()
                     .collect(Collectors.toList());
+
+            if (objectKeyScope != null) {
+                allNodes = allNodes.stream()
+                        .filter(n -> objectKeyScope.contains(n.primaryObjectKey()))
+                        .collect(Collectors.toList());
+            }
 
             List<GraphEdge> allEdges = repository.findEdgesForNodes(
                     allNodes.stream().map(GraphNode::id).collect(Collectors.toList()));

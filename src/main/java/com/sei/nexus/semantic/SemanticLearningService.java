@@ -85,7 +85,7 @@ public class SemanticLearningService {
      * @param domainKey      Agent's domain key (may be null).
      * @param conversationId Used for correction detection against the prior turn.
      */
-    @Async
+    @Async("semanticLearningExecutor")
     public void learnFromRun(String runKey, String question, String executedSql,
                               String domainKey, String conversationId) {
         if (question == null || question.isBlank() || executedSql == null || executedSql.isBlank()) {
@@ -128,7 +128,7 @@ public class SemanticLearningService {
      * maintenance may promote it to company vocabulary at the established
      * thresholds. <b>Never promotes directly.</b>
      */
-    @Async
+    @Async("semanticLearningExecutor")
     public void captureLiteralBinding(String runKey, String domainKey,
                                       String surface, String column, String value) {
         if (surface == null || surface.isBlank()
@@ -220,7 +220,7 @@ public class SemanticLearningService {
      * Reinforces learned mappings associated with a run the user rated positively.
      * Called from ChatController when a thumbs-up feedback is received.
      */
-    @Async
+    @Async("semanticLearningExecutor")
     public void reinforceFromFeedback(String runKey, String domainKey) {
         try {
             Optional<NexusRun> run = runRepository.findByKey(runKey);
