@@ -8,6 +8,8 @@ import com.sei.nexus.pack.IndustryPack;
 import com.sei.nexus.pack.IndustryPackRepository;
 import com.sei.nexus.pack.PackEntity;
 import com.sei.nexus.pack.TenantPack;
+import com.sei.nexus.semantic.LearnedMapping;
+import com.sei.nexus.semantic.LearnedMappingRepository;
 import com.sei.nexus.semantic.SemanticService;
 import com.sei.nexus.tenant.Tenant;
 import com.sei.nexus.tenant.TenantContext;
@@ -109,6 +111,27 @@ class ConceptKnowledgeMaterializationServiceTest {
         }
     }
 
+    /** Fakes only the one method this service actually calls — {@code findPromotedByConceptKey} —
+     *  keyed by conceptKey, mirroring the real query's contract exactly (promoted + classified only,
+     *  never anything else). */
+    static class FakeLearnedMappingRepository extends LearnedMappingRepository {
+        final Map<String, List<LearnedMapping>> byConceptKey = new LinkedHashMap<>();
+        FakeLearnedMappingRepository() { super(null); }
+        void seed(String conceptKey, LearnedMapping... mappings) {
+            byConceptKey.put(conceptKey, new ArrayList<>(List.of(mappings)));
+        }
+        @Override public List<LearnedMapping> findPromotedByConceptKey(String conceptKey) {
+            return byConceptKey.getOrDefault(conceptKey, List.of());
+        }
+    }
+
+    private LearnedMapping learnedMapping(String mappingKey, String businessTerm, String sqlPattern,
+                                           double confidence) {
+        return new LearnedMapping(mappingKey, "PLATFORM", businessTerm, sqlPattern, "run-1",
+                "QUERY_SUCCESS", confidence, 5, Instant.now(), true, Instant.now(), Instant.now(),
+                "purchase-order");
+    }
+
     private Tenant tenantWithVectorStore(String slug, String vectorStoreId) {
         return new Tenant(UUID.randomUUID(), slug, slug + " Inc", "tenant_" + slug.replace('-', '_'),
                 "STANDARD", "ACTIVE", "admin@" + slug + ".example", 50,
@@ -122,8 +145,14 @@ class ConceptKnowledgeMaterializationServiceTest {
 
     private ConceptKnowledgeMaterializationService service(FakeTenantRepository tenantRepo,
             FakePackRepository packRepo, FakeSemanticService semanticService, FakeAiClient aiClient) {
+        return service(tenantRepo, packRepo, semanticService, aiClient, new FakeLearnedMappingRepository());
+    }
+
+    private ConceptKnowledgeMaterializationService service(FakeTenantRepository tenantRepo,
+            FakePackRepository packRepo, FakeSemanticService semanticService, FakeAiClient aiClient,
+            FakeLearnedMappingRepository learnedMappingRepository) {
         return new ConceptKnowledgeMaterializationService(
-                tenantRepo, packRepo, semanticService, aiClient, new ObjectMapper());
+                tenantRepo, packRepo, semanticService, aiClient, new ObjectMapper(), learnedMappingRepository);
     }
 
     // ── Setup helper: one tenant, one connection/pack, two concepts ─────────────────────────────
@@ -335,6 +364,113 @@ class ConceptKnowledgeMaterializationServiceTest {
         assertEquals(2, result.materialized().size(), "both appear in the result — one skipped, one uploaded");
         long skipped = result.materialized().stream().filter(ConceptKnowledgeMaterializationService.ConceptResult::skippedAlreadyPresent).count();
         assertEquals(1, skipped);
+    }
+
+    // ── Learned knowledge projection (learned_knowledge array) ──────────────────────────────────
+    //
+    // Covers the concept_key backfill feature's core promise: a promoted+classified learning is
+    // folded into its concept's document array (and changes its hash), an unpromoted/unclassified
+    // one never is, several learnings under one concept still collapse into a single ConceptUnit,
+    // and "demoting" (simulated by the fake no longer returning the row) removes it on rebuild.
+
+    private FakePackRepository packRepoWithOneConcept() {
+        FakePackRepository packRepo = new FakePackRepository();
+        IndustryPack pack = new IndustryPack("retail-v1", "retail", "Retail", "1.0", "desc",
+                List.of(entity("purchase-order", "Purchase Order")),
+                List.of(), List.of(), List.of(), List.of(), null, null, null, null, List.of(), null, null);
+        packRepo.packsById.put("retail-v1", pack);
+        packRepo.appliedPacks.add(new TenantPack("retail-v1", "conn-1", "1.0", "Retail", "ACTIVE",
+                Map.of(), 1.0, Instant.now(), "test"));
+        return packRepo;
+    }
+
+    @Test
+    void pendingUnpromotedLearningIsNeverInTheConceptDocument() throws Exception {
+        FakePackRepository packRepo = packRepoWithOneConcept();
+        FakeSemanticService semanticService = semanticServiceUsing("conn-1", "purchase-order");
+        FakeLearnedMappingRepository learnedRepo = new FakeLearnedMappingRepository();
+        // Nothing seeded for "purchase-order" — mirrors findPromotedByConceptKey's real contract:
+        // a pending (not-yet-promoted) learning is simply never returned by that query.
+        ConceptKnowledgeMaterializationService svc =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), learnedRepo);
+
+        ConceptKnowledgeMaterializationService.ConceptUnit unit = svc.collectConceptUnits().get(0);
+        JsonNode doc = new ObjectMapper().readTree(svc.buildConceptKnowledgeJson(unit));
+
+        assertTrue(doc.has("learned_knowledge"), "key must always be present, even when empty");
+        assertEquals(0, doc.get("learned_knowledge").size());
+    }
+
+    @Test
+    void promotedClassifiedLearningAppearsInTheConceptDocumentAndChangesTheHash() throws Exception {
+        FakePackRepository packRepo = packRepoWithOneConcept();
+        FakeSemanticService semanticService = semanticServiceUsing("conn-1", "purchase-order");
+
+        FakeLearnedMappingRepository emptyRepo = new FakeLearnedMappingRepository();
+        ConceptKnowledgeMaterializationService svcEmpty =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), emptyRepo);
+        ConceptKnowledgeMaterializationService.ConceptUnit unitWithout = svcEmpty.collectConceptUnits().get(0);
+
+        FakeLearnedMappingRepository seededRepo = new FakeLearnedMappingRepository();
+        seededRepo.seed("purchase-order", learnedMapping("lmap-1", "open", "status = 'open'", 0.9));
+        ConceptKnowledgeMaterializationService svcWith =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), seededRepo);
+        ConceptKnowledgeMaterializationService.ConceptUnit unitWith = svcWith.collectConceptUnits().get(0);
+
+        JsonNode doc = new ObjectMapper().readTree(svcWith.buildConceptKnowledgeJson(unitWith));
+        assertEquals(1, doc.get("learned_knowledge").size());
+        JsonNode entry = doc.get("learned_knowledge").get(0);
+        assertEquals("open", entry.get("surface").asText());
+        assertEquals("status = 'open'", entry.get("binding").asText());
+        assertEquals(0.9, entry.get("confidence").asDouble(), 0.0001);
+        assertFalse(entry.has("meaning"), "no fabricated 'meaning' field — we don't have that data");
+
+        assertNotEquals(svcEmpty.contentHash(unitWithout), svcWith.contentHash(unitWith),
+                "promoting/classifying a learning must change the concept's content hash");
+    }
+
+    @Test
+    void multipleLearningsUnderOneConceptKeyAllLandInTheOneConceptDocument() throws Exception {
+        FakePackRepository packRepo = packRepoWithOneConcept();
+        FakeSemanticService semanticService = semanticServiceUsing("conn-1", "purchase-order");
+        FakeLearnedMappingRepository learnedRepo = new FakeLearnedMappingRepository();
+        learnedRepo.seed("purchase-order",
+                learnedMapping("lmap-1", "open", "status = 'open'", 0.9),
+                learnedMapping("lmap-2", "closed", "status = 'closed'", 0.85));
+        ConceptKnowledgeMaterializationService svc =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), learnedRepo);
+
+        List<ConceptKnowledgeMaterializationService.ConceptUnit> units = svc.collectConceptUnits();
+        assertEquals(1, units.size(), "one ConceptUnit per concept — never one per learning");
+
+        JsonNode doc = new ObjectMapper().readTree(svc.buildConceptKnowledgeJson(units.get(0)));
+        assertEquals(2, doc.get("learned_knowledge").size());
+    }
+
+    @Test
+    void demotingALearningRemovesItFromAFreshlyRebuiltDocument() throws Exception {
+        FakePackRepository packRepo = packRepoWithOneConcept();
+        FakeSemanticService semanticService = semanticServiceUsing("conn-1", "purchase-order");
+
+        FakeLearnedMappingRepository promotedRepo = new FakeLearnedMappingRepository();
+        promotedRepo.seed("purchase-order", learnedMapping("lmap-1", "open", "status = 'open'", 0.9));
+        ConceptKnowledgeMaterializationService svcBefore =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), promotedRepo);
+        ConceptKnowledgeMaterializationService.ConceptUnit unitBefore = svcBefore.collectConceptUnits().get(0);
+        JsonNode docBefore = new ObjectMapper().readTree(svcBefore.buildConceptKnowledgeJson(unitBefore));
+        assertEquals(1, docBefore.get("learned_knowledge").size());
+
+        // Simulate demotion: markDemoted flips promoted=false, so findPromotedByConceptKey no
+        // longer returns the row — modeled here by a fresh repository seeded with nothing.
+        FakeLearnedMappingRepository demotedRepo = new FakeLearnedMappingRepository();
+        ConceptKnowledgeMaterializationService svcAfter =
+                service(new FakeTenantRepository(), packRepo, semanticService, new FakeAiClient(), demotedRepo);
+        ConceptKnowledgeMaterializationService.ConceptUnit unitAfter = svcAfter.collectConceptUnits().get(0);
+        JsonNode docAfter = new ObjectMapper().readTree(svcAfter.buildConceptKnowledgeJson(unitAfter));
+
+        assertEquals(0, docAfter.get("learned_knowledge").size());
+        assertNotEquals(svcBefore.contentHash(unitBefore), svcAfter.contentHash(unitAfter),
+                "demotion must also change the hash so sync picks up the removal");
     }
 
     // ── TenantContext discipline ──────────────────────────────────────────────────────────────────

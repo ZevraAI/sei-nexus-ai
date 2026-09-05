@@ -106,7 +106,7 @@ class ConnectionControllerDeleteReleasesPackTest {
         packService = new IndustryPackService(packRepository, new PackEntityMapper(null, new ObjectMapper()),
                 new PackRecommendationService(packRepository), new FakeSemanticService(),
                 new FakeEnterpriseMapRepository(), connectionRepository, new FakeBusinessObjectBatchAnalyzer(),
-                new ConceptKnowledgeSynchronizationService(null, null, null, null) {
+                new ConceptKnowledgeSynchronizationService(null, null, null, null, null) {
                     @Override public void triggerAsync() { }
                 });
         connectionService = new ConnectionService(connectionRepository, packService);

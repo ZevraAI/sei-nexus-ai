@@ -49,7 +49,8 @@ class SemanticLearningServiceLogicTest {
             LearnedMapping saved = new LearnedMapping(
                     m.mappingKey() != null ? m.mappingKey() : "lmap-fake-" + upserted.size(),
                     m.domainKey(), m.businessTerm(), m.sqlPattern(), m.sourceRunKey(), m.source(),
-                    m.confidence(), m.useCount(), m.lastUsedAt(), m.promoted(), m.createdAt(), m.updatedAt());
+                    m.confidence(), m.useCount(), m.lastUsedAt(), m.promoted(), m.createdAt(), m.updatedAt(),
+                    m.conceptKey());
             upserted.add(saved);
             return saved;
         }
@@ -173,10 +174,10 @@ class SemanticLearningServiceLogicTest {
         setUp();
         mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", "open",
                 "status IN ('submitted', 'acknowledged')", "run-1", "QUERY_SUCCESS",
-                0.5, 1, java.time.Instant.now(), false, null, null));
+                0.5, 1, java.time.Instant.now(), false, null, null, null));
         mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", "closed",
                 "status = 'closed'", "run-1", "QUERY_SUCCESS",
-                0.5, 1, java.time.Instant.now(), false, null, null));
+                0.5, 1, java.time.Instant.now(), false, null, null, null));
         runRepository.scriptedRun = Optional.of(new com.sei.nexus.run.NexusRun(
                 "run-1", "conv-1", "agent-1", "PLATFORM", "user@example.com",
                 "show me all open purchase orders", "answer", "QUERY_LIVE_DATA", "OK",
@@ -194,7 +195,7 @@ class SemanticLearningServiceLogicTest {
         setUp();
         mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", "closed",
                 "status = 'closed'", "run-1", "QUERY_SUCCESS",
-                0.5, 1, java.time.Instant.now(), false, null, null));
+                0.5, 1, java.time.Instant.now(), false, null, null, null));
         runRepository.scriptedRun = Optional.of(new com.sei.nexus.run.NexusRun(
                 "run-1", "conv-1", "agent-1", "PLATFORM", "user@example.com",
                 "show me all open purchase orders", "answer", "QUERY_LIVE_DATA", "OK",

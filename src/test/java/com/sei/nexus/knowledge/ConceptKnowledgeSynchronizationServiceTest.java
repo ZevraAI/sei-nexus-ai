@@ -7,6 +7,8 @@ import com.sei.nexus.pack.IndustryPack;
 import com.sei.nexus.pack.IndustryPackRepository;
 import com.sei.nexus.pack.PackEntity;
 import com.sei.nexus.pack.TenantPack;
+import com.sei.nexus.semantic.LearnedMapping;
+import com.sei.nexus.semantic.LearnedMappingRepository;
 import com.sei.nexus.semantic.SemanticService;
 import com.sei.nexus.tenant.Tenant;
 import com.sei.nexus.tenant.TenantContext;
@@ -120,6 +122,18 @@ class ConceptKnowledgeSynchronizationServiceTest {
         }
     }
 
+    static class FakeLearnedMappingRepository extends LearnedMappingRepository {
+        final Map<String, List<LearnedMapping>> byConceptKey = new LinkedHashMap<>();
+        FakeLearnedMappingRepository() { super(null); }
+        void seed(String conceptKey, LearnedMapping... mappings) {
+            byConceptKey.put(conceptKey, new ArrayList<>(List.of(mappings)));
+        }
+        @Override public List<LearnedMapping> findPromotedByConceptKey(String conceptKey) {
+            return byConceptKey.getOrDefault(conceptKey, List.of());
+        }
+        @Override public int countPromotedUnclassified() { return 0; }
+    }
+
     private static Tenant tenantWithVectorStore(String slug, String schema, String vectorStoreId) {
         return new Tenant(UUID.randomUUID(), slug, slug + " Inc", schema,
                 "STANDARD", "ACTIVE", "admin@" + slug + ".example", 50,
@@ -149,6 +163,7 @@ class ConceptKnowledgeSynchronizationServiceTest {
         final FakeSemanticService semanticService;
         final FakeAiClient aiClient = new FakeAiClient();
         final FakeTenantSettingsRepository settings = new FakeTenantSettingsRepository();
+        final FakeLearnedMappingRepository learnedMappingRepository = new FakeLearnedMappingRepository();
         final ConceptKnowledgeMaterializationService materializer;
         final ConceptKnowledgeSynchronizationService sync;
 
@@ -158,8 +173,9 @@ class ConceptKnowledgeSynchronizationServiceTest {
             semanticService = new FakeSemanticService();
             semanticService.usedConceptKeysByConnection.put(connectionKey, List.of(conceptKey));
             materializer = new ConceptKnowledgeMaterializationService(
-                    tenantRepo, packRepo, semanticService, aiClient, new ObjectMapper());
-            sync = new ConceptKnowledgeSynchronizationService(tenantRepo, aiClient, materializer, settings);
+                    tenantRepo, packRepo, semanticService, aiClient, new ObjectMapper(), learnedMappingRepository);
+            sync = new ConceptKnowledgeSynchronizationService(
+                    tenantRepo, aiClient, materializer, settings, learnedMappingRepository);
             tenantRepo.seed(tenantWithVectorStore(slug, schema, vectorStoreId));
         }
     }
@@ -347,9 +363,26 @@ class ConceptKnowledgeSynchronizationServiceTest {
                 unit.connectionKey(), unit.packKey(),
                 new ConceptKnowledgeMaterializationService.ConceptEntry(
                         unit.entry().conceptKey(), unit.entry().name(), unit.entry().aliases(),
-                        "a materially different description", unit.entry().operationalMeaning()));
+                        "a materially different description", unit.entry().operationalMeaning()),
+                unit.learnedKnowledge());
         String hash3 = h.materializer.contentHash(changed);
         assertNotEquals(hash1, hash3, "changed description must produce a different hash");
+    }
+
+    @Test
+    void learnedKnowledgeChangesTheHashTooEvenWhenConceptMetadataIsIdentical() {
+        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
+        ConceptKnowledgeMaterializationService.ConceptUnit withoutLearning = h.materializer.collectConceptUnits().get(0);
+        String hashWithout = h.materializer.contentHash(withoutLearning);
+
+        h.learnedMappingRepository.seed("purchase-order", new LearnedMapping(
+                "lmap-1", "PLATFORM", "open", "status = 'open'", "run-1", "QUERY_SUCCESS",
+                0.9, 5, Instant.now(), true, Instant.now(), Instant.now(), "purchase-order"));
+        ConceptKnowledgeMaterializationService.ConceptUnit withLearning = h.materializer.collectConceptUnits().get(0);
+        String hashWith = h.materializer.contentHash(withLearning);
+
+        assertNotEquals(hashWithout, hashWith,
+                "folding in promoted/classified learned knowledge must change the hash");
     }
 
     // ── Sync watermark: status() derivation ─────────────────────────────────────────────────────

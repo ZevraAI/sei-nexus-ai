@@ -104,7 +104,7 @@ public class SemanticLearningService {
                     LearnedMapping mapping = new LearnedMapping(
                             null, domainKey, t.term(), t.sql(),
                             runKey, "QUERY_SUCCESS", 0.5, 1,
-                            Instant.now(), false, null, null);
+                            Instant.now(), false, null, null, null);
                     LearnedMapping saved = mappingRepository.upsert(mapping);
                     log.debug("Learned mapping upserted: '{}' → '{}' (key: {})",
                             t.term(), truncate(t.sql(), 60), saved.mappingKey());
@@ -154,7 +154,7 @@ public class SemanticLearningService {
             LearnedMapping mapping = new LearnedMapping(
                     null, domainKey, surface.toLowerCase(java.util.Locale.ROOT), sqlPattern,
                     runKey, "LITERAL_RESOLUTION", 0.5, 1,
-                    Instant.now(), false, null, null);
+                    Instant.now(), false, null, null, null);
             LearnedMapping saved = mappingRepository.upsert(mapping);
             log.debug("Literal binding captured: '{}' → '{}' (key: {})",
                     surface, sqlPattern, saved.mappingKey());

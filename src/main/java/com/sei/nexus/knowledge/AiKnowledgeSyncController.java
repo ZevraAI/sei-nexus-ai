@@ -158,6 +158,7 @@ public class AiKnowledgeSyncController {
         body.put("lastSyncCompletedAt", r.lastSyncCompletedAt());
         body.put("lastSyncStatus", r.lastSyncStatus());
         body.put("lastSyncError", r.lastSyncError());
+        body.put("unclassifiedPromotedLearnings", r.unclassifiedPromotedLearnings());
         return body;
     }
 

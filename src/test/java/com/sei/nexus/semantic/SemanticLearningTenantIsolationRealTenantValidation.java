@@ -69,7 +69,7 @@ class SemanticLearningTenantIsolationRealTenantValidation {
                 try {
                     mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termA,
                             "status = 'diagnostic_a'", "run-diag-iso-a", "QUERY_SUCCESS",
-                            0.5, 1, Instant.now(), false, null, null));
+                            0.5, 1, Instant.now(), false, null, null, null));
                 } catch (Exception e) {
                     errors.incrementAndGet();
                     System.out.println("Tenant A task failed: " + e);
@@ -84,7 +84,7 @@ class SemanticLearningTenantIsolationRealTenantValidation {
                 try {
                     mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termB,
                             "status = 'diagnostic_b'", "run-diag-iso-b", "QUERY_SUCCESS",
-                            0.5, 1, Instant.now(), false, null, null));
+                            0.5, 1, Instant.now(), false, null, null, null));
                 } catch (Exception e) {
                     errors.incrementAndGet();
                     System.out.println("Tenant B task failed: " + e);
@@ -165,7 +165,7 @@ class SemanticLearningTenantIsolationRealTenantValidation {
                 ran.incrementAndGet();
                 mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", term,
                         "status = 'should_never_be_written'", "run-diag-no-ctx", "QUERY_SUCCESS",
-                        0.5, 1, Instant.now(), false, null, null));
+                        0.5, 1, Instant.now(), false, null, null, null));
                 latch.countDown();
             });
 

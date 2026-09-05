@@ -43,14 +43,14 @@ class AiKnowledgeSyncControllerAuthTest {
     static class ScriptedSyncService extends ConceptKnowledgeSynchronizationService {
         boolean triggerAsyncCalled = false;
         List<String> triggeredForSchemas = new java.util.ArrayList<>();
-        ScriptedSyncService() { super(null, null, null, null); }
+        ScriptedSyncService() { super(null, null, null, null, null); }
         @Override public void triggerAsync() {
             triggerAsyncCalled = true;
             triggeredForSchemas.add(TenantContext.getSchema());
         }
         @Override public StatusReport status() {
             return new StatusReport(Status.IN_SYNC, 3, 0, List.of(), true, false,
-                    null, null, null, "SUCCESS", null);
+                    null, null, null, "SUCCESS", null, 0);
         }
     }
 

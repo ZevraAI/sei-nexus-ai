@@ -3,6 +3,7 @@ package com.sei.nexus.knowledge;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.onboarding.TenantSettingsRepository;
+import com.sei.nexus.semantic.LearnedMappingRepository;
 import com.sei.nexus.tenant.Tenant;
 import com.sei.nexus.tenant.TenantContext;
 import com.sei.nexus.tenant.TenantRepository;
@@ -69,6 +70,7 @@ public class ConceptKnowledgeSynchronizationService {
     private final AzureOpenAiClient                      aiClient;
     private final ConceptKnowledgeMaterializationService materializationService;
     private final TenantSettingsRepository               tenantSettingsRepository;
+    private final LearnedMappingRepository               learnedMappingRepository;
 
     /**
      * Per-tenant-schema concurrency guard. Application-level only — sufficient for a
@@ -83,11 +85,13 @@ public class ConceptKnowledgeSynchronizationService {
     public ConceptKnowledgeSynchronizationService(TenantRepository tenantRepository,
                                                    AzureOpenAiClient aiClient,
                                                    ConceptKnowledgeMaterializationService materializationService,
-                                                   TenantSettingsRepository tenantSettingsRepository) {
+                                                   TenantSettingsRepository tenantSettingsRepository,
+                                                   LearnedMappingRepository learnedMappingRepository) {
         this.tenantRepository        = tenantRepository;
         this.aiClient                = aiClient;
         this.materializationService  = materializationService;
         this.tenantSettingsRepository = tenantSettingsRepository;
+        this.learnedMappingRepository = learnedMappingRepository;
     }
 
     // ── Public result/status shapes ──────────────────────────────────────────────
@@ -105,11 +109,17 @@ public class ConceptKnowledgeSynchronizationService {
      *  UI-facing shape (see {@link ConceptKnowledgeMaterializationService.PendingConceptChange}). */
     public record PendingChange(String type, String name, String changedAt) {}
 
+    /** {@code unclassifiedPromotedLearnings}: admin sync-status visibility for {@link
+     *  LearnedMappingRepository#countPromotedUnclassified()} — promoted learnings that are still
+     *  excluded from every concept's projection because no admin has assigned them a concept_key
+     *  yet. Not itself a sync blocker (a fully-clean sync can still leave this positive), just a
+     *  visible reminder that some promoted learning isn't reaching the Vector Store at all. */
     public record StatusReport(Status status, int totalConcepts, int pendingChangeCount,
                                 List<PendingChange> pendingChanges, boolean vectorStoreConnected,
                                 boolean syncInProgress, String lastSuccessfulSync,
                                 String lastSyncStartedAt, String lastSyncCompletedAt,
-                                String lastSyncStatus, String lastSyncError) {}
+                                String lastSyncStatus, String lastSyncError,
+                                int unclassifiedPromotedLearnings) {}
 
     // ── Manual / automatic trigger (same implementation, both async) ────────────
 
@@ -283,17 +293,20 @@ public class ConceptKnowledgeSynchronizationService {
         String vectorStoreId = tenant.aiKnowledgeVectorStoreId();
         boolean vectorStoreConnected = vectorStoreId != null && !vectorStoreId.isBlank();
         boolean syncing = inProgress.contains(schema);
+        int unclassifiedPromotedLearnings = learnedMappingRepository.countPromotedUnclassified();
 
         if (!vectorStoreConnected) {
             return new StatusReport(Status.NOT_INITIALIZED, 0, 0, List.of(), false, syncing,
-                    lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError);
+                    lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError,
+                    unclassifiedPromotedLearnings);
         }
 
         int totalConcepts = materializationService.collectConceptUnits().size();
 
         if (syncing) {
             return new StatusReport(Status.SYNCING, totalConcepts, -1, List.of(), true, true,
-                    lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError);
+                    lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError,
+                    unclassifiedPromotedLearnings);
         }
 
         // Never synced successfully yet: Instant.EPOCH as the watermark means every concept's own
@@ -318,7 +331,8 @@ public class ConceptKnowledgeSynchronizationService {
         }
 
         return new StatusReport(status, totalConcepts, pendingChanges.size(), pendingChanges,
-                true, false, lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError);
+                true, false, lastSuccessfulAt, lastStartedAt, lastCompletedAt, lastStatus, lastError,
+                unclassifiedPromotedLearnings);
     }
 
     // ── Diff computation — shared by synchronize() and status() ─────────────────

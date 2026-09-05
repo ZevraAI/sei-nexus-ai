@@ -112,8 +112,10 @@ class Phase2ALiveMaterializationRealTenantValidation {
         initThrottle.setAccessible(true);
         initThrottle.invoke(aiClient);
 
+        com.sei.nexus.semantic.LearnedMappingRepository learnedMappingRepository =
+                new com.sei.nexus.semantic.LearnedMappingRepository(jdbc);
         ConceptKnowledgeMaterializationService service = new ConceptKnowledgeMaterializationService(
-                tenantRepository, packRepository, semanticService, aiClient, objectMapper);
+                tenantRepository, packRepository, semanticService, aiClient, objectMapper, learnedMappingRepository);
 
         // ── Pre-check (§2 of the task) ───────────────────────────────────────────────────────────
         Tenant tenant = tenantRepository.findBySlug(TENANT_SLUG).orElseThrow(

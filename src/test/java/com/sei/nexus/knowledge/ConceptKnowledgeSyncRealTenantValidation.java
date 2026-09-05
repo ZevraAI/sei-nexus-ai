@@ -88,10 +88,12 @@ class ConceptKnowledgeSyncRealTenantValidation {
         initThrottle.setAccessible(true);
         initThrottle.invoke(aiClient);
 
+        com.sei.nexus.semantic.LearnedMappingRepository learnedMappingRepository =
+                new com.sei.nexus.semantic.LearnedMappingRepository(jdbc);
         ConceptKnowledgeMaterializationService materializer = new ConceptKnowledgeMaterializationService(
-                tenantRepository, packRepository, semanticService, aiClient, objectMapper);
+                tenantRepository, packRepository, semanticService, aiClient, objectMapper, learnedMappingRepository);
         ConceptKnowledgeSynchronizationService sync = new ConceptKnowledgeSynchronizationService(
-                tenantRepository, aiClient, materializer, tenantSettingsRepository);
+                tenantRepository, aiClient, materializer, tenantSettingsRepository, learnedMappingRepository);
 
         Tenant tenant = tenantRepository.findBySlug(TENANT_SLUG).orElseThrow();
         String schema = tenant.schemaName();

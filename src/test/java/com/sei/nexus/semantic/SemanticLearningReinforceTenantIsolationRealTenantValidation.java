@@ -55,13 +55,13 @@ class SemanticLearningReinforceTenantIsolationRealTenantValidation {
             TenantContext.set(SCHEMA_A);
             keyA = db.mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termA,
                     "status = 'diagnostic_reinforce_a'", "run-diag-a", "QUERY_SUCCESS",
-                    0.5, 1, Instant.now(), false, null, null)).mappingKey();
+                    0.5, 1, Instant.now(), false, null, null, null)).mappingKey();
             TenantContext.clear();
 
             TenantContext.set(SCHEMA_B);
             keyB = db.mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termB,
                     "status = 'diagnostic_reinforce_b'", "run-diag-b", "QUERY_SUCCESS",
-                    0.5, 1, Instant.now(), false, null, null)).mappingKey();
+                    0.5, 1, Instant.now(), false, null, null, null)).mappingKey();
             TenantContext.clear();
 
             CountDownLatch latch = new CountDownLatch(2);
@@ -131,7 +131,7 @@ class SemanticLearningReinforceTenantIsolationRealTenantValidation {
             TenantContext.set(SCHEMA_A);
             key = db.mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", term,
                     "status = 'diagnostic_reinforce_no_ctx'", "run-diag-no-ctx", "QUERY_SUCCESS",
-                    0.5, 1, Instant.now(), false, null, null)).mappingKey();
+                    0.5, 1, Instant.now(), false, null, null, null)).mappingKey();
             TenantContext.clear();
 
             AtomicInteger ran = new AtomicInteger(0);
@@ -180,13 +180,13 @@ class SemanticLearningReinforceTenantIsolationRealTenantValidation {
             TenantContext.set(SCHEMA_A);
             keyA = db.mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termA,
                     "status = 'diagnostic_reinforce_conc_a'", "run-diag-conc-a", "QUERY_SUCCESS",
-                    0.5, 1, Instant.now(), false, null, null)).mappingKey();
+                    0.5, 1, Instant.now(), false, null, null, null)).mappingKey();
             TenantContext.clear();
 
             TenantContext.set(SCHEMA_B);
             keyB = db.mappingRepository.upsert(new LearnedMapping(null, "PLATFORM", termB,
                     "status = 'diagnostic_reinforce_conc_b'", "run-diag-conc-b", "QUERY_SUCCESS",
-                    0.5, 1, Instant.now(), false, null, null)).mappingKey();
+                    0.5, 1, Instant.now(), false, null, null, null)).mappingKey();
             TenantContext.clear();
 
             int rounds = 10;

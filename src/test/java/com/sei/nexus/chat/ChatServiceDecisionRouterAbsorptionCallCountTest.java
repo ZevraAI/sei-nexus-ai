@@ -126,8 +126,8 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
     }
 
     static class NoOpLearningContextBuilder extends LearningContextBuilder {
-        NoOpLearningContextBuilder() { super(null, null); }
-        @Override public LearningContext build(String domainKey, String conversationId) { return new LearningContext("", List.of()); }
+        NoOpLearningContextBuilder() { super(null); }
+        @Override public LearningContext build(String conversationId) { return new LearningContext(""); }
     }
 
     static class ChatOnlyStrategySelector implements ExecutionStrategySelector {

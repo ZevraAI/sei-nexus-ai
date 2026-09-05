@@ -97,6 +97,31 @@ public class LearnedMappingRepository {
                 mappingKey);
     }
 
+    /** Mark a promoted mapping as demoted (no longer formal vocabulary). Distinct from
+     *  {@link #delete}: the learning row and its history stay in Postgres — only its promoted
+     *  status flips off, so a demoted-then-reconsidered learning doesn't have to be relearned from
+     *  scratch. On the next Vector Store sync, this removes it from projection (a demoted mapping
+     *  no longer matches {@link #findPromotedByConceptKey}). */
+    public void markDemoted(String mappingKey) {
+        jdbc.update(
+                "UPDATE nexus_learned_mapping SET promoted = FALSE, updated_at = NOW() WHERE mapping_key = ?",
+                mappingKey);
+    }
+
+    /**
+     * Assigns this mapping's concept association. This is the ONLY way a learning ever gets a
+     * concept_key — deliberately never inferred from its SQL pattern, domain, or table names, since
+     * any such inference could silently attach team vocabulary to the wrong concept. An admin makes
+     * this call explicitly (see {@code SemanticController}'s promote/concept endpoints); until they
+     * do, a promoted mapping's concept_key stays NULL and it is excluded from every concept's
+     * Vector Store projection.
+     */
+    public void assignConceptKey(String mappingKey, String conceptKey) {
+        jdbc.update(
+                "UPDATE nexus_learned_mapping SET concept_key = ?, updated_at = NOW() WHERE mapping_key = ?",
+                conceptKey, mappingKey);
+    }
+
     /** Admin update — change sql_pattern or reset confidence. */
     public void update(String mappingKey, String sqlPattern, Double confidence) {
         jdbc.update("""
@@ -199,6 +224,36 @@ public class LearnedMappingRepository {
                 """, mapper(), minUses, minConfidence);
     }
 
+    /**
+     * Promoted, concept-classified mappings for one concept — this is what feeds that concept's
+     * Vector Store projection (see {@code ConceptKnowledgeMaterializationService}). Deliberately
+     * the only remaining runtime-adjacent read of this table: it is NOT used in any Chat/Planner/
+     * LLM prompt path — only by the materialization service, which folds the result into a
+     * concept's {@code learned_knowledge} array. Returns {@code List.of()} for a null/blank
+     * conceptKey rather than querying, since an unclassified concept can never have projected
+     * learnings.
+     */
+    public List<LearnedMapping> findPromotedByConceptKey(String conceptKey) {
+        if (conceptKey == null || conceptKey.isBlank()) {
+            return List.of();
+        }
+        return jdbc.query("""
+                SELECT * FROM nexus_learned_mapping
+                WHERE promoted = TRUE AND concept_key = ?
+                ORDER BY confidence DESC, use_count DESC
+                """, mapper(), conceptKey);
+    }
+
+    /** Admin sync-status visibility: how many promoted mappings still have no concept_key, i.e.
+     *  are promoted in Postgres but excluded from every Vector Store projection until an admin
+     *  classifies them. */
+    public int countPromotedUnclassified() {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM nexus_learned_mapping WHERE promoted = TRUE AND concept_key IS NULL",
+                Integer.class);
+        return count != null ? count : 0;
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private RowMapper<LearnedMapping> mapper() {
@@ -214,7 +269,8 @@ public class LearnedMappingRepository {
                 toInstant(rs.getTimestamp("last_used_at")),
                 rs.getBoolean("promoted"),
                 toInstant(rs.getTimestamp("created_at")),
-                toInstant(rs.getTimestamp("updated_at")));
+                toInstant(rs.getTimestamp("updated_at")),
+                rs.getString("concept_key"));
     }
 
     private Instant toInstant(Timestamp ts) {

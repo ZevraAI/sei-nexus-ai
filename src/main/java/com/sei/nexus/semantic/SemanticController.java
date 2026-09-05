@@ -3,6 +3,8 @@ package com.sei.nexus.semantic;
 import com.sei.nexus.auth.UserAccount;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.enterprise.EnterpriseMapService;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationService;
+import com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -22,18 +24,24 @@ public class SemanticController {
     private final RelationshipDiscoveryService discoveryService;
     private final LearnedMappingRepository     learnedMappingRepository;
     private final com.sei.nexus.onboarding.MetadataRegistrationService metadataRegistration;
+    private final ConceptKnowledgeSynchronizationService  conceptKnowledgeSynchronizationService;
+    private final ConceptKnowledgeMaterializationService  conceptKnowledgeMaterializationService;
 
     public SemanticController(SemanticService service, SemanticRepository repository,
                                EnterpriseMapService enterpriseMapService,
                                RelationshipDiscoveryService discoveryService,
                                LearnedMappingRepository learnedMappingRepository,
-                               com.sei.nexus.onboarding.MetadataRegistrationService metadataRegistration) {
+                               com.sei.nexus.onboarding.MetadataRegistrationService metadataRegistration,
+                               ConceptKnowledgeSynchronizationService conceptKnowledgeSynchronizationService,
+                               ConceptKnowledgeMaterializationService conceptKnowledgeMaterializationService) {
         this.service                 = service;
         this.repository              = repository;
         this.enterpriseMapService    = enterpriseMapService;
         this.discoveryService        = discoveryService;
         this.learnedMappingRepository = learnedMappingRepository;
         this.metadataRegistration    = metadataRegistration;
+        this.conceptKnowledgeSynchronizationService = conceptKnowledgeSynchronizationService;
+        this.conceptKnowledgeMaterializationService = conceptKnowledgeMaterializationService;
     }
 
     // -------------------------------------------------------------------------
@@ -279,12 +287,33 @@ public class SemanticController {
     }
 
     /**
+     * GET /semantic/concepts
+     * Read-only concept catalog — powers the Learnings panel's concept picker. See {@link
+     * ConceptKnowledgeMaterializationService#listConceptCatalog()}: NOT part of the runtime Chat
+     * path, purely so an admin can see and choose a valid concept_key.
+     */
+    @GetMapping("/concepts")
+    public ResponseEntity<List<Map<String, String>>> listConcepts() {
+        return ResponseEntity.ok(conceptKnowledgeMaterializationService.listConceptCatalog());
+    }
+
+    /**
      * POST /semantic/learnings/{mappingKey}/promote
      * Manually promote a learned mapping to formal vocabulary immediately,
      * without waiting for the nightly scheduler threshold.
+     *
+     * <p>Optionally accepts {"conceptKey": "..."} in the request body to classify the mapping into
+     * a concept at the same time it's promoted — the classification is validated against {@link
+     * ConceptKnowledgeMaterializationService#listConceptCatalog()} first, since an unknown
+     * concept_key would silently make the learning unprojectable forever. Promotion alone (no
+     * conceptKey) still leaves the mapping excluded from Vector Store projection until an admin
+     * classifies it separately via {@link #assignConcept}, exactly as before this endpoint accepted
+     * a body at all.
      */
     @PostMapping("/learnings/{mappingKey}/promote")
-    public ResponseEntity<Map<String, Object>> promoteLearning(@PathVariable String mappingKey) {
+    public ResponseEntity<Map<String, Object>> promoteLearning(
+            @PathVariable String mappingKey,
+            @RequestBody(required = false) Map<String, Object> body) {
         LearnedMapping m = learnedMappingRepository.findByKey(mappingKey)
                 .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
                         "Learned mapping not found: " + mappingKey));
@@ -295,10 +324,69 @@ public class SemanticController {
                 "sql_equivalent", m.sqlPattern(),
                 "status",        "ACTIVE"));
         learnedMappingRepository.markPromoted(mappingKey);
+
+        String conceptKey = body != null ? asNonBlank(body.get("conceptKey")) : null;
+        if (conceptKey != null) {
+            validateConceptKey(conceptKey);
+            learnedMappingRepository.assignConceptKey(mappingKey, conceptKey);
+        }
+
+        // Fire-and-forget, same pattern as the existing Pack apply/remove triggers — the HTTP
+        // response never waits on the OpenAI Vector Store round-trip.
+        conceptKnowledgeSynchronizationService.triggerAsync();
+
         return ResponseEntity.ok(Map.of(
                 "mapping_key", mappingKey,
                 "promoted",    true,
-                "term",        m.businessTerm()));
+                "term",        m.businessTerm(),
+                "concept_key", conceptKey != null ? conceptKey : ""));
+    }
+
+    /**
+     * POST /semantic/learnings/{mappingKey}/concept
+     * Assigns (or reassigns) a learning's concept_key — the backfill path for a learning that was
+     * promoted before this classification existed (e.g. the pre-existing "open" → PO status
+     * mapping), and the general way to (re)classify any learning independent of promotion. Body:
+     * {"conceptKey": "..."}, required and validated against {@link
+     * ConceptKnowledgeMaterializationService#listConceptCatalog()} — never inferred (see {@link
+     * LearnedMappingRepository#assignConceptKey}).
+     */
+    @PostMapping("/learnings/{mappingKey}/concept")
+    public ResponseEntity<Map<String, Object>> assignConcept(
+            @PathVariable String mappingKey,
+            @RequestBody Map<String, Object> body) {
+        String conceptKey = requireStr(body, "conceptKey");
+        validateConceptKey(conceptKey);
+        LearnedMapping m = learnedMappingRepository.findByKey(mappingKey)
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Learned mapping not found: " + mappingKey));
+        learnedMappingRepository.assignConceptKey(mappingKey, conceptKey);
+        if (m.promoted()) {
+            // Only a promoted mapping is ever eligible for projection — classifying an
+            // unpromoted one has nothing to sync yet.
+            conceptKnowledgeSynchronizationService.triggerAsync();
+        }
+        return learnedMappingRepository.findByKey(mappingKey)
+                .map(u -> ResponseEntity.ok(toLearningMap(u)))
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Learned mapping not found: " + mappingKey));
+    }
+
+    /**
+     * POST /semantic/learnings/{mappingKey}/demote
+     * Demotes a promoted mapping — {@link LearnedMappingRepository#markDemoted}, distinct from the
+     * hard {@link #deleteLearning} below: the row and its history stay in Postgres, only
+     * {@code promoted} flips off. Triggers a sync so the next convergence removes it from its
+     * concept's Vector Store projection (it no longer matches {@code findPromotedByConceptKey}).
+     */
+    @PostMapping("/learnings/{mappingKey}/demote")
+    public ResponseEntity<Map<String, Object>> demoteLearning(@PathVariable String mappingKey) {
+        learnedMappingRepository.markDemoted(mappingKey);
+        conceptKnowledgeSynchronizationService.triggerAsync();
+        return learnedMappingRepository.findByKey(mappingKey)
+                .map(u -> ResponseEntity.ok(toLearningMap(u)))
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Learned mapping not found: " + mappingKey));
     }
 
     /**
@@ -309,6 +397,23 @@ public class SemanticController {
     public ResponseEntity<Void> deleteLearning(@PathVariable String mappingKey) {
         learnedMappingRepository.delete(mappingKey);
         return ResponseEntity.noContent().build();
+    }
+
+    /** Validates a caller-supplied concept_key against the admin-facing concept catalog — used by
+     *  both /promote (optional) and /concept (required) so an unknown concept can never be
+     *  assigned, which would silently make a learning unprojectable forever. */
+    private void validateConceptKey(String conceptKey) {
+        boolean known = conceptKnowledgeMaterializationService.listConceptCatalog().stream()
+                .anyMatch(c -> conceptKey.equals(c.get("conceptKey")));
+        if (!known) {
+            throw new NexusException(HttpStatus.BAD_REQUEST, "Unknown concept key: " + conceptKey);
+        }
+    }
+
+    private String asNonBlank(Object value) {
+        if (value == null) return null;
+        String s = value.toString();
+        return s.isBlank() ? null : s;
     }
 
     private Map<String, Object> toLearningMap(LearnedMapping m) {
@@ -323,6 +428,7 @@ public class SemanticController {
         r.put("last_used_at",  m.lastUsedAt() != null ? m.lastUsedAt().toString() : null);
         r.put("promoted",      m.promoted());
         r.put("created_at",    m.createdAt() != null ? m.createdAt().toString() : null);
+        r.put("concept_key",   m.conceptKey());
         return r;
     }
 

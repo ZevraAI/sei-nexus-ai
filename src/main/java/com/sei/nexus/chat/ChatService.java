@@ -537,6 +537,10 @@ public class ChatService {
             List<Map<String, Object>> asyncOps        = new ArrayList<>();
             List<Map<String, Object>> queryData        = new ArrayList<>();
             List<Map<String, Object>> reasoningSteps   = new ArrayList<>();
+            // May now always be empty: LearningContextBuilder no longer injects Postgres-mapping
+            // vocabulary (that reaches the LLM exclusively via File Search over the tenant's
+            // Vector Store), and nothing else in this method attributes learnings today. Left in
+            // place pending a future File-Search-driven attribution mechanism.
             List<String>              learningsApplied  = new ArrayList<>();
             String resultSnapshot = null;
 
@@ -636,17 +640,21 @@ public class ChatService {
                             buildContextMs);
                     if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
-                    // ── Phase 3: inject learned business vocabulary into the planner context ──
+                    // ── Phase 3: inject known conversation corrections into the planner context ──
+                    // Promoted learned-mapping vocabulary is deliberately NOT injected here anymore —
+                    // it reaches the LLM exclusively via native File Search over the tenant's Vector
+                    // Store (see ConceptKnowledgeMaterializationService/
+                    // ConceptKnowledgeSynchronizationService). agentDomainKey is still needed below
+                    // for learnFromRun/captureLiteralBinding, independent of this injection.
                     String agentDomainKey = agent != null ? agent.domainKeys() : null;
                     long learningCtxStartNanos = System.nanoTime();
                     LearningContextBuilder.LearningContext learningCtx =
-                            learningContextBuilder.build(agentDomainKey, conversationId);
+                            learningContextBuilder.build(conversationId);
                     long learningCtxMs = (System.nanoTime() - learningCtxStartNanos) / 1_000_000;
                     log.info("RETRIEVAL_TIMING stage=learningContextBuilder wallClockMs={} note=noLlmCallInsideThisMethod",
                             learningCtxMs);
                     if (!learningCtx.isEmpty()) {
                         schemaCtx = schemaCtx + "\n\n" + learningCtx.contextText();
-                        learningsApplied.addAll(learningCtx.termsApplied());
                     }
 
                     // ── Conversation Memory → Chat (Phase 3): an isolated, dedicated

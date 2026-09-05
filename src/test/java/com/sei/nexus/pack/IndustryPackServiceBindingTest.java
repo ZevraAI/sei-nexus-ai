@@ -360,7 +360,7 @@ class IndustryPackServiceBindingTest {
         service = new IndustryPackService(packRepository, entityMapper,
                 new PackRecommendationService(packRepository), semanticService, enterpriseMapRepository,
                 connectionRepository, batchAnalyzer,
-                new ConceptKnowledgeSynchronizationService(null, null, null, null) {
+                new ConceptKnowledgeSynchronizationService(null, null, null, null, null) {
                     @Override public void triggerAsync() { }
                 });
     }

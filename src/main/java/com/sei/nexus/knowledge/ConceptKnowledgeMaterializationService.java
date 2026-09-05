@@ -7,6 +7,8 @@ import com.sei.nexus.pack.IndustryPack;
 import com.sei.nexus.pack.IndustryPackRepository;
 import com.sei.nexus.pack.PackEntity;
 import com.sei.nexus.pack.TenantPack;
+import com.sei.nexus.semantic.LearnedMapping;
+import com.sei.nexus.semantic.LearnedMappingRepository;
 import com.sei.nexus.semantic.SemanticService;
 import com.sei.nexus.tenant.Tenant;
 import com.sei.nexus.tenant.TenantContext;
@@ -51,22 +53,25 @@ public class ConceptKnowledgeMaterializationService {
 
     private static final Logger log = LoggerFactory.getLogger(ConceptKnowledgeMaterializationService.class);
 
-    private final TenantRepository       tenantRepository;
-    private final IndustryPackRepository packRepository;
-    private final SemanticService        semanticService;
-    private final AzureOpenAiClient      aiClient;
-    private final ObjectMapper           objectMapper;
+    private final TenantRepository         tenantRepository;
+    private final IndustryPackRepository   packRepository;
+    private final SemanticService          semanticService;
+    private final AzureOpenAiClient        aiClient;
+    private final ObjectMapper             objectMapper;
+    private final LearnedMappingRepository learnedMappingRepository;
 
     public ConceptKnowledgeMaterializationService(TenantRepository tenantRepository,
                                                    IndustryPackRepository packRepository,
                                                    SemanticService semanticService,
                                                    AzureOpenAiClient aiClient,
-                                                   ObjectMapper objectMapper) {
+                                                   ObjectMapper objectMapper,
+                                                   LearnedMappingRepository learnedMappingRepository) {
         this.tenantRepository = tenantRepository;
         this.packRepository   = packRepository;
         this.semanticService  = semanticService;
         this.aiClient         = aiClient;
         this.objectMapper     = objectMapper;
+        this.learnedMappingRepository = learnedMappingRepository;
     }
 
     /**
@@ -75,7 +80,8 @@ public class ConceptKnowledgeMaterializationService {
      * — same package, reusing this class's projection logic rather than duplicating it — can
      * consume the exact same authoritative units this materializer itself works from.
      */
-    record ConceptUnit(String connectionKey, String packKey, ConceptEntry entry) {
+    record ConceptUnit(String connectionKey, String packKey, ConceptEntry entry,
+                        List<LearnedMapping> learnedKnowledge) {
         String uid() { return connectionKey + "::" + packKey + "::" + entry.conceptKey(); }
     }
 
@@ -207,14 +213,22 @@ public class ConceptKnowledgeMaterializationService {
     /**
      * Deterministic SHA-256 content hash over exactly the fields that constitute this concept's
      * authoritative meaning ({@code conceptKey/name/aliases/description/operationalMeaning/
-     * packKey/connectionKey}) — deliberately excluding {@code generated_at} (a timestamp, not
+     * packKey/connectionKey}), plus this concept's promoted, classified learned knowledge
+     * ({@code mappingKey/businessTerm/sqlPattern/confidence} per entry, sorted by {@code
+     * mappingKey} for determinism) — deliberately excluding {@code generated_at} (a timestamp, not
      * content) so re-deriving the same Postgres+Pack state always produces the same hash,
-     * regardless of when it's computed. This is the missing piece that lets {@link
-     * ConceptKnowledgeSynchronizationService} tell "unchanged, skip" apart from "content changed,
-     * replace" — the identity key ({@link ConceptUnit#uid()}) alone cannot do this, since it does
-     * not change when only descriptive text changes.
+     * regardless of when it's computed. Folding in learned knowledge means promoting, editing, or
+     * demoting a learning changes the hash exactly like editing the concept's own metadata would.
+     * This is the missing piece that lets {@link ConceptKnowledgeSynchronizationService} tell
+     * "unchanged, skip" apart from "content changed, replace" — the identity key ({@link
+     * ConceptUnit#uid()}) alone cannot do this, since it does not change when only descriptive text
+     * or learned knowledge changes.
      */
     String contentHash(ConceptUnit unit) {
+        String learnedCanonical = unit.learnedKnowledge() == null ? "" : unit.learnedKnowledge().stream()
+                .sorted(java.util.Comparator.comparing(LearnedMapping::mappingKey))
+                .map(m -> nullToEmpty(m.businessTerm()) + nullToEmpty(m.sqlPattern()) + m.confidence())
+                .collect(java.util.stream.Collectors.joining());
         String canonical = String.join("",
                 nullToEmpty(unit.entry().conceptKey()),
                 nullToEmpty(unit.entry().name()),
@@ -222,7 +236,8 @@ public class ConceptKnowledgeMaterializationService {
                 nullToEmpty(unit.entry().description()),
                 nullToEmpty(unit.entry().operationalMeaning()),
                 nullToEmpty(unit.packKey()),
-                nullToEmpty(unit.connectionKey()));
+                nullToEmpty(unit.connectionKey()),
+                learnedCanonical);
         try {
             java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
@@ -253,6 +268,22 @@ public class ConceptKnowledgeMaterializationService {
         doc.put("aliases", unit.entry().aliases() != null ? unit.entry().aliases() : List.of());
         doc.put("description", unit.entry().description());
         doc.put("operational_meaning", unit.entry().operationalMeaning());
+        // "meaning" is deliberately NOT a separate field here: all Postgres holds for a learned
+        // mapping is its business_term ("surface") and the sql_pattern it binds to ("binding") —
+        // there is no distinct "what does this mean" text captured anywhere in the learning
+        // lifecycle. Fabricating one here would violate the "don't guess" principle this whole
+        // feature is built around, so surface/binding/confidence is the entire shape.
+        List<Map<String, Object>> learnedKnowledge = unit.learnedKnowledge() == null ? List.of()
+                : unit.learnedKnowledge().stream()
+                        .map(m -> {
+                            Map<String, Object> entry = new LinkedHashMap<String, Object>();
+                            entry.put("surface", m.businessTerm());
+                            entry.put("binding", m.sqlPattern());
+                            entry.put("confidence", m.confidence());
+                            return entry;
+                        })
+                        .toList();
+        doc.put("learned_knowledge", learnedKnowledge);
         doc.put("pack", unit.packKey());
         doc.put("connection", unit.connectionKey());
         doc.put("generated_at", Instant.now().toString());
@@ -303,10 +334,37 @@ public class ConceptKnowledgeMaterializationService {
                 if (!used.contains(e.conceptKey())) continue;
                 ConceptEntry entry = new ConceptEntry(e.conceptKey(), e.name(),
                         e.aliases() != null ? e.aliases() : List.of(), e.description(), e.operationalMeaning());
-                units.add(new ConceptUnit(connectionKey, tenantPack.packKey(), entry));
+                List<LearnedMapping> learnedKnowledge =
+                        learnedMappingRepository.findPromotedByConceptKey(e.conceptKey());
+                units.add(new ConceptUnit(connectionKey, tenantPack.packKey(), entry, learnedKnowledge));
             }
         }
         return units;
+    }
+
+    /**
+     * Read-only, admin-facing concept catalog — powers the Learnings panel's concept picker (an
+     * admin choosing which concept a learning belongs to via {@code SemanticController}'s
+     * promote/concept endpoints). Deliberately NOT part of any runtime Chat/Planner path: it exists
+     * purely so a human can see and choose a valid {@code concept_key}, built by deduplicating
+     * {@link #collectConceptUnits()} (which is itself per connection/pack, so the same concept can
+     * legitimately repeat across connections) down to one row per distinct {@code conceptKey}.
+     */
+    public List<Map<String, String>> listConceptCatalog() {
+        Map<String, String> byConceptKey = new java.util.LinkedHashMap<>();
+        for (ConceptUnit unit : collectConceptUnits()) {
+            byConceptKey.putIfAbsent(unit.entry().conceptKey(), unit.entry().name());
+        }
+        return byConceptKey.entrySet().stream()
+                .map(en -> {
+                    Map<String, String> row = new LinkedHashMap<String, String>();
+                    row.put("conceptKey", en.getKey());
+                    row.put("name", en.getValue());
+                    return row;
+                })
+                .sorted(java.util.Comparator.comparing(row -> row.get("name"),
+                        java.util.Comparator.nullsLast(String::compareTo)))
+                .toList();
     }
 
     /**

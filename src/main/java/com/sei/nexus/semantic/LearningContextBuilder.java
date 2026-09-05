@@ -7,104 +7,73 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * Builds a compact learning context string that is injected into the
- * SQL planner's schema context before every QUERY_LIVE_DATA run.
- *
- * <p>This is the mechanism that makes Zevra progressively smarter:
- * as the team uses it, their business vocabulary is learned and fed back
- * into the planner so future queries use correct terminology automatically.
+ * Builds a compact context string of recent conversation corrections, injected into the SQL
+ * planner's schema context before every QUERY_LIVE_DATA run.
  *
  * <p>Example output (appended to the schema context string):
  * <pre>
- * Business vocabulary learned from this team's usage:
- * - "overdue invoice" means: due_date < CURRENT_DATE AND status NOT IN ('PAID','VOID')  (used 14×, confidence 0.91)
- * - "active account" means: last_activity_at > NOW() - INTERVAL '30 days'  (used 9×, confidence 0.78)
- *
  * Known corrections for this team:
  * - "this week" means Monday–Sunday (not rolling 7 days)
  * </pre>
  *
- * <p>Returns an empty string when no learnings are available, so callers
- * don't need to guard against null.
+ * <p>Returns an empty string when no corrections are available, so callers don't need to guard
+ * against null.
+ *
+ * <p><b>What this class no longer does.</b> It used to also inject promoted/eligible learned-
+ * mapping vocabulary from {@code nexus_learned_mapping} into this same prompt — that responsibility
+ * has been removed entirely (this class has no {@link LearnedMappingRepository} dependency at
+ * all). Promoted learning vocabulary now reaches the LLM exclusively through native File Search
+ * over the tenant's OpenAI Vector Store: an admin-classified promoted learning is folded into its
+ * concept's Vector Store document by {@code ConceptKnowledgeMaterializationService} and kept
+ * converged there by {@code ConceptKnowledgeSynchronizationService}. Postgres remains authoritative
+ * for the learning lifecycle, but Java no longer reads that table into any LLM prompt.
  */
 @Component
 public class LearningContextBuilder {
 
     private static final Logger log = LoggerFactory.getLogger(LearningContextBuilder.class);
 
-    // Minimum quality bar to include a mapping in planner context
-    private static final double MIN_CONFIDENCE = 0.55;
-    private static final int    MIN_USES       = 2;
-    private static final int    MAX_TERMS      = 10;
-    private static final int    MAX_CORRECTIONS = 3;
+    private static final int MAX_CORRECTIONS = 3;
 
-    private final LearnedMappingRepository mappingRepository;
-    private final CorrectionRepository     correctionRepository;
+    private final CorrectionRepository correctionRepository;
 
-    public LearningContextBuilder(LearnedMappingRepository mappingRepository,
-                                  CorrectionRepository correctionRepository) {
-        this.mappingRepository    = mappingRepository;
+    public LearningContextBuilder(CorrectionRepository correctionRepository) {
         this.correctionRepository = correctionRepository;
     }
 
-    public record LearningContext(
-            String contextText,
-            List<String> termsApplied   // for the ChatResponse learnings_applied field
-    ) {
+    public record LearningContext(String contextText) {
         public boolean isEmpty() { return contextText.isBlank(); }
     }
 
     /**
-     * Builds the learning context for the given domain.
+     * Builds the correction context for the given conversation.
      *
-     * @param domainKey      Agent's domain key; null to use cross-domain learnings only.
      * @param conversationId Used to load conversation-specific corrections.
-     * @return A {@link LearningContext} with the text to inject and the terms applied.
+     * @return A {@link LearningContext} with the text to inject.
      */
-    public LearningContext build(String domainKey, String conversationId) {
+    public LearningContext build(String conversationId) {
         try {
-            List<LearnedMapping> mappings = mappingRepository.findForContextInjection(
-                    domainKey, MIN_CONFIDENCE, MIN_USES, MAX_TERMS);
-
             List<Correction> corrections = (conversationId != null && !conversationId.isBlank())
                     ? correctionRepository.findRecentForConversation(conversationId, MAX_CORRECTIONS)
                     : List.of();
 
-            if (mappings.isEmpty() && corrections.isEmpty()) {
-                return new LearningContext("", List.of());
+            if (corrections.isEmpty()) {
+                return new LearningContext("");
             }
 
             StringBuilder sb = new StringBuilder();
-
-            if (!mappings.isEmpty()) {
-                sb.append("Business vocabulary learned from this team's usage:\n");
-                for (LearnedMapping m : mappings) {
-                    sb.append(String.format("- \"%s\" means: %s  (used %d×, confidence %.2f)%n",
-                            m.businessTerm(),
-                            m.sqlPattern(),
-                            m.useCount(),
-                            m.confidence()));
+            sb.append("Known corrections for this team:\n");
+            for (Correction c : corrections) {
+                if (c.correctedInterpretation() != null && !c.correctedInterpretation().isBlank()) {
+                    sb.append(String.format("- \"%s\" was wrong; correct meaning: %s%n",
+                            c.originalInterpretation(), c.correctedInterpretation()));
                 }
             }
 
-            if (!corrections.isEmpty()) {
-                sb.append("\nKnown corrections for this team:\n");
-                for (Correction c : corrections) {
-                    if (c.correctedInterpretation() != null && !c.correctedInterpretation().isBlank()) {
-                        sb.append(String.format("- \"%s\" was wrong; correct meaning: %s%n",
-                                c.originalInterpretation(), c.correctedInterpretation()));
-                    }
-                }
-            }
-
-            List<String> termsApplied = mappings.stream()
-                    .map(LearnedMapping::businessTerm)
-                    .toList();
-
-            return new LearningContext(sb.toString().trim(), termsApplied);
+            return new LearningContext(sb.toString().trim());
         } catch (Exception e) {
             log.debug("LearningContextBuilder.build failed: {}", e.getMessage());
-            return new LearningContext("", List.of());
+            return new LearningContext("");
         }
     }
 }

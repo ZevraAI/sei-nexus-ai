@@ -134,7 +134,7 @@ class OpenPurchaseOrdersClarificationLearningRealTenantValidation {
                             rs.getString("mapping_key"), rs.getString("domain_key"), rs.getString("business_term"),
                             rs.getString("sql_pattern"), rs.getString("source_run_key"), rs.getString("source"),
                             rs.getDouble("confidence"), rs.getInt("use_count"), null,
-                            rs.getBoolean("promoted"), null, null),
+                            rs.getBoolean("promoted"), null, null, null),
                     runKey);
             System.out.println("Rows persisted for runKey=" + runKey + ": " + rows);
 
