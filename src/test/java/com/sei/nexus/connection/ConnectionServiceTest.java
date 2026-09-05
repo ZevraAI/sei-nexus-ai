@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService;
 import com.sei.nexus.pack.*;
 import com.sei.nexus.prompt.BusinessObjectBatchAnalyzer;
 import com.sei.nexus.semantic.SemanticService;
@@ -23,6 +24,14 @@ import static org.junit.jupiter.api.Assertions.*;
  * runs at connection-creation time — not a re-implementation of it. No Mockito, no DB.
  */
 class ConnectionServiceTest {
+
+    /** Postgres → Vector Store sync is out of scope for this test — a no-op double so
+     *  {@link IndustryPackService}'s constructor is satisfied without any real OpenAI/DB wiring. */
+    private static ConceptKnowledgeSynchronizationService noOpConceptKnowledgeSynchronizationService() {
+        return new ConceptKnowledgeSynchronizationService(null, null, null, null) {
+            @Override public void triggerAsync() { }
+        };
+    }
 
     // ── fakes (same shapes as IndustryPackServiceBindingTest) ───────────────────
 
@@ -124,7 +133,8 @@ class ConnectionServiceTest {
                 new FakeSemanticService(),
                 new FakeEnterpriseMapRepository(),
                 connectionRepository,
-                new FakeBusinessObjectBatchAnalyzer());
+                new FakeBusinessObjectBatchAnalyzer(),
+                noOpConceptKnowledgeSynchronizationService());
 
         connectionService = new ConnectionService(connectionRepository, packService);
     }
@@ -257,7 +267,8 @@ class ConnectionServiceTest {
         IndustryPackService packServiceDirect = new IndustryPackService(
                 packRepository, new PackEntityMapper(null, new ObjectMapper()),
                 new PackRecommendationService(packRepository), new FakeSemanticService(),
-                new FakeEnterpriseMapRepository(), connectionRepository, new FakeBusinessObjectBatchAnalyzer());
+                new FakeEnterpriseMapRepository(), connectionRepository, new FakeBusinessObjectBatchAnalyzer(),
+                noOpConceptKnowledgeSynchronizationService());
 
         packServiceDirect.removePack("retail-v1");
         assertTrue(packRepository.findActivePackForConnection(created.connectionKey()).isEmpty());

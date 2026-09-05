@@ -5,6 +5,7 @@ import com.sei.nexus.common.NexusException;
 import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService;
 import com.sei.nexus.prompt.BusinessObjectBatchAnalyzer;
 import com.sei.nexus.semantic.BusinessEntity;
 import com.sei.nexus.semantic.SemanticService;
@@ -55,6 +56,13 @@ public class IndustryPackService {
     // simply cannot be found here — tenant isolation falls out of the existing architecture,
     // it is not reimplemented.
     private final ConnectionRepository       connectionRepository;
+    // Postgres → Vector Store Concept Knowledge synchronization: Pack apply/remove are the two
+    // mutation paths proven (by prior investigation) to directly change the fields the Concept
+    // Knowledge projection reads (concept_key/pack_key/connection_key) — every other mutation
+    // path is deliberately left unwired for this feature. Triggered fire-and-forget, async, AFTER
+    // the Postgres changes below have already succeeded — a Vector Store failure must never roll
+    // back a successful Postgres commit (see ConceptKnowledgeSynchronizationService's own javadoc).
+    private final ConceptKnowledgeSynchronizationService conceptKnowledgeSynchronizationService;
     // Make Apply Pack Perform LLM Concept Classification: reuses the EXACT same batched
     // analysis/LLM conceptResolution mechanism Discover/Onboarding already use for newly
     // registered entities — no second resolver, no duplicated prompt/schema logic.
@@ -72,7 +80,8 @@ public class IndustryPackService {
                                SemanticService semanticService,
                                EnterpriseMapRepository enterpriseMapRepository,
                                ConnectionRepository connectionRepository,
-                               BusinessObjectBatchAnalyzer businessObjectBatchAnalyzer) {
+                               BusinessObjectBatchAnalyzer businessObjectBatchAnalyzer,
+                               ConceptKnowledgeSynchronizationService conceptKnowledgeSynchronizationService) {
         this.packRepository         = packRepository;
         this.entityMapper           = entityMapper;
         this.recommendationService  = recommendationService;
@@ -80,6 +89,7 @@ public class IndustryPackService {
         this.enterpriseMapRepository = enterpriseMapRepository;
         this.connectionRepository   = connectionRepository;
         this.businessObjectBatchAnalyzer = businessObjectBatchAnalyzer;
+        this.conceptKnowledgeSynchronizationService = conceptKnowledgeSynchronizationService;
     }
 
     // ── Pack catalogue ────────────────────────────────────────────────────────
@@ -318,6 +328,11 @@ public class IndustryPackService {
                 packKey, connectionKey, entitiesAssociated, classification.classified(),
                 classification.unresolved(), vocabAdded, Math.round(coverage * 100));
 
+        // Fire-and-forget, AFTER every Postgres change above has already succeeded — a Vector
+        // Store failure here must never roll back the pack assignment/classification/vocabulary
+        // that was just committed.
+        conceptKnowledgeSynchronizationService.triggerAsync();
+
         return new PackApplicationResult(
                 packKey, pack.displayName(),
                 0, vocabAdded,
@@ -416,6 +431,11 @@ public class IndustryPackService {
 
                 Map<String, Map<String, Object>> analyzed;
                 try {
+                    // Cost baseline instrumentation (measurement-only): tag this call so its
+                    // LLM_METRIC line and nexus_usage_event row attribute to "industry_pack"
+                    // rather than the default "chat" feature bucket. No effect on the call itself.
+                    com.sei.nexus.ai.LlmCallTag.set("PACK_CONCEPT_CLASSIFICATION");
+                    com.sei.nexus.usage.UsageContext.set("industry_pack", null);
                     analyzed = businessObjectBatchAnalyzer.analyzeBatch(connectionKey, schemaName, domainKey, tableNames);
                 } catch (Exception e) {
                     log.warn("Concept classification batch failed for connection '{}' schema '{}' ({} objects): {}",
@@ -560,6 +580,11 @@ public class IndustryPackService {
         log.info("Pack '{}' removed: {} entities archived, deactivation attempted for {} vocabulary terms "
                         + "(deactivateTerm is a no-op for any that don't exist — see javadoc)",
                 packKey, entitiesArchived, vocabDeactivated);
+
+        // Fire-and-forget, AFTER every Postgres change above has already succeeded. This is what
+        // actually makes stale Retail/whatever-Pack concept documents disappear from the Vector
+        // Store — nothing else in this method touches OpenAI.
+        conceptKnowledgeSynchronizationService.triggerAsync();
     }
 
     /**

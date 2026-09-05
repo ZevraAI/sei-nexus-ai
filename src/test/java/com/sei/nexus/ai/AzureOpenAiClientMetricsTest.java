@@ -37,11 +37,15 @@ class AzureOpenAiClientMetricsTest {
 
     /** Records every {@link UsageService#record} invocation without touching a real repository. */
     static class RecordingUsageService extends UsageService {
-        record Call(String model, int promptTokens, int completionTokens) {}
+        record Call(String model, int promptTokens, int completionTokens, int cachedTokens) {}
         final List<Call> calls = new java.util.ArrayList<>();
         RecordingUsageService() { super(null); }
-        @Override public void record(String model, int promptTokens, int completionTokens) {
-            calls.add(new Call(model, promptTokens, completionTokens));
+        // Cost baseline instrumentation: AzureOpenAiClient.recordUsage() now calls the 4-arg
+        // overload (added so cached tokens can be priced at the discounted rate) instead of the
+        // 3-arg one — override that actual seam, not the one it delegates from, or these calls
+        // fall through to the real (un-fakeable, DB-backed) implementation and go unrecorded here.
+        @Override public void record(String model, int promptTokens, int completionTokens, int cachedTokens) {
+            calls.add(new Call(model, promptTokens, completionTokens, cachedTokens));
         }
     }
 
@@ -101,10 +105,9 @@ class AzureOpenAiClientMetricsTest {
         // pre-existing test-construction property unrelated to this instrumentation.
         assertEquals(1234, usage.calls.get(0).promptTokens());
         assertEquals(56, usage.calls.get(0).completionTokens());
-        // cached_tokens is read purely for the LLM_METRIC log line — it never reaches
-        // usageService.record (billing logic is untouched), so there is nothing further to
-        // assert on the RecordingUsageService for that field; its presence in the scripted
-        // response is exercised here only to prove the parsing path doesn't throw.
+        // Cost baseline instrumentation: cached_tokens now also reaches usageService.record (so
+        // the discounted cached-input rate can be applied), in addition to the LLM_METRIC log line.
+        assertEquals(900, usage.calls.get(0).cachedTokens());
     }
 
     @Test

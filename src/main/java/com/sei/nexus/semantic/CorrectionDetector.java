@@ -86,6 +86,10 @@ public class CorrectionDetector {
                     "Previous answer (summary): " + truncate(priorAnswer, 500) + "\n\n" +
                     "New message from user: " + currentQuestion;
 
+            // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC
+            // line attributes to correction detection rather than inheriting whatever tag was
+            // last set on this (async learning) thread. No effect on the call itself.
+            com.sei.nexus.ai.LlmCallTag.set("CORRECTION_DETECTION");
             String raw  = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});

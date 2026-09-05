@@ -104,7 +104,9 @@ public class AzureOpenAiClient {
         requestBody.put("model", embeddingModel);
         requestBody.put("input", text);
 
+        long startNanos = System.nanoTime();
         String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
 
         try {
             JsonNode root = objectMapper.readTree(responseBody);
@@ -114,6 +116,12 @@ public class AzureOpenAiClient {
                 embedding[i] = (float) embeddingArray.get(i).asDouble();
             }
             int tokenCount = root.path("usage").path("total_tokens").asInt(0);
+            // Cost baseline instrumentation (measurement-only): embeddings previously computed a
+            // token count that every caller discarded — nothing about this call was ever logged
+            // or billed. recordUsage() reads "usage.prompt_tokens" (embeddings responses put the
+            // whole cost there, "completion_tokens" is simply absent/0) so this reuses the exact
+            // same LLM_METRIC/nexus_usage_event path every other call already goes through.
+            recordUsage(root, embeddingModel, latencyMs, text != null ? text.length() : 0);
             return new EmbeddingResult(embedding, tokenCount);
         } catch (Exception e) {
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
@@ -269,6 +277,72 @@ public class AzureOpenAiClient {
                     "Failed to parse vector store file list response: " + e.getMessage());
         }
         return refs;
+    }
+
+    /**
+     * Detaches a file from one Vector Store ({@code DELETE /v1/vector_stores/{vectorStoreId}/files/{fileId}}).
+     *
+     * <p><b>This is the operation that actually makes a stale document disappear from {@link
+     * #listVectorStoreFiles} and from {@code file_search}</b> — confirmed against the real OpenAI
+     * API (not merely assumed): deleting the underlying File object via {@link #deleteFile} alone
+     * does NOT remove its entry from a vector store's file list; the entry remains listed
+     * (pointing at a now-nonexistent file) until this vector-store-scoped detach call is made.
+     * Callers that want the stale document gone from search AND to stop it counting toward OpenAI
+     * storage must call this first, then {@link #deleteFile} — see {@code
+     * ConceptKnowledgeSynchronizationService}, which does exactly that. Idempotent: a file id no
+     * longer attached is treated as success.
+     *
+     * @param vectorStoreId the Vector Store to detach from
+     * @param fileId        the OpenAI file id to detach (e.g. {@code "file_..."})
+     */
+    public void detachFileFromVectorStore(String vectorStoreId, String fileId) {
+        String url = BASE_URL + "/vector_stores/" + vectorStoreId + "/files/" + fileId;
+        try {
+            executeDeleteWithRetry(url);
+        } catch (NexusException e) {
+            if (e.getMessage() != null && e.getMessage().contains("HTTP 404")) {
+                return; // already detached — this call's own goal is already satisfied
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Deletes an OpenAI file object outright ({@code DELETE /v1/files/{id}}) — stops it counting
+     * toward OpenAI storage. <b>Does NOT remove it from any Vector Store's file list</b> (see
+     * {@link #detachFileFromVectorStore}'s javadoc for why, confirmed against the real API) — call
+     * {@link #detachFileFromVectorStore} first if the file is attached to one. Idempotent from the
+     * caller's perspective: a file id that no longer exists (already deleted) is treated as
+     * success, not a failure, so a retried delete can never itself become a stuck failure mode.
+     *
+     * @param fileId the OpenAI file id to delete (e.g. {@code "file_..."})
+     */
+    public void deleteFile(String fileId) {
+        String url = BASE_URL + "/files/" + fileId;
+        try {
+            executeDeleteWithRetry(url);
+        } catch (NexusException e) {
+            // sendWithRetryLocked surfaces every non-200/429 status as INTERNAL_SERVER_ERROR with
+            // "HTTP <code> - ..." in the message (it does not itself distinguish status codes) —
+            // sniffing for "HTTP 404" here is this client's own existing idiom for that (see
+            // summarizeErrorBody's callers), not a new pattern. A file id that no longer exists is
+            // treated as success, not a failure, so a retried delete can never itself get stuck.
+            if (e.getMessage() != null && e.getMessage().contains("HTTP 404")) {
+                return;
+            }
+            throw e;
+        }
+    }
+
+    /** {@code DELETE} variant — no request body, same throttle/retry/backoff/rate-awareness path. */
+    private String executeDeleteWithRetry(String url) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + apiKey)
+                .timeout(Duration.ofSeconds(60))
+                .DELETE()
+                .build();
+        return throttledSendWithRetry(request);
     }
 
     /**
@@ -462,6 +536,7 @@ public class AzureOpenAiClient {
      * additive method is the smaller change.
      */
     private void recordFileSearchUsage(String responseBody, String vectorStoreId, long latencyMs) {
+        String tag = LlmCallTag.get(); // captured before any recordUsage()-triggered clear() below
         try {
             JsonNode root = objectMapper.readTree(responseBody);
             boolean fileSearchCallPresent = false;
@@ -477,11 +552,34 @@ public class AzureOpenAiClient {
                 }
             }
             log.info("FILE_SEARCH_METRIC callType={} model={} vectorStoreId={} latencyMs={} "
-                            + "fileSearchCallPresent={} status={} resultCount={}",
-                    LlmCallTag.get(), chatModel, vectorStoreId, latencyMs,
-                    fileSearchCallPresent, status, resultCount);
+                            + "fileSearchCallPresent={} status={} resultCount={} operationId={}",
+                    tag, chatModel, vectorStoreId, latencyMs,
+                    fileSearchCallPresent, status, resultCount, OperationCorrelationId.get());
         } catch (Exception ignored) {
             // Metrics logging is measurement-only — never break the main flow
+        }
+        // Cost baseline instrumentation (measurement-only): the Responses API's own "usage" object
+        // ({"input_tokens":.., "output_tokens":.., "input_tokens_details":{"cached_tokens":..}})
+        // was never read here, so every chatWithFileSearch() call was previously invisible to
+        // LLM_METRIC/nexus_usage_event entirely (FILE_SEARCH_METRIC above logs tool-invocation
+        // diagnostics only, no tokens/cost). Re-tag and reuse the exact same recordUsage() path —
+        // it already tolerates Chat-Completions-shaped field names being absent (defaults to 0)
+        // and Responses-shaped ones need their own read since the field names differ.
+        try {
+            JsonNode root  = objectMapper.readTree(responseBody);
+            JsonNode usage = root.path("usage");
+            if (!usage.isMissingNode()) {
+                int inputTokens  = usage.path("input_tokens").asInt(0);
+                int outputTokens = usage.path("output_tokens").asInt(0);
+                int cachedTokens = usage.path("input_tokens_details").path("cached_tokens").asInt(0);
+                usageService.record(chatModel, inputTokens, outputTokens, cachedTokens);
+                log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
+                                + "cachedTokens={} requestChars={} operationId={}",
+                        tag, chatModel, latencyMs, inputTokens, outputTokens, cachedTokens, -1,
+                        OperationCorrelationId.get());
+            }
+        } catch (Exception ignored) {
+            // Usage tracking/metrics logging is measurement-only — never break the main flow
         } finally {
             LlmCallTag.clear();
         }
@@ -752,9 +850,10 @@ public class AzureOpenAiClient {
         JsonNode usage = root.path("usage");
         try {
             if (!usage.isMissingNode()) {
-                int prompt     = usage.path("prompt_tokens").asInt(0);
-                int completion = usage.path("completion_tokens").asInt(0);
-                usageService.record(model, prompt, completion);
+                int prompt       = usage.path("prompt_tokens").asInt(0);
+                int completion   = usage.path("completion_tokens").asInt(0);
+                int cachedTokens = usage.path("prompt_tokens_details").path("cached_tokens").asInt(0);
+                usageService.record(model, prompt, completion, cachedTokens);
             }
         } catch (Exception ignored) {
             // Usage tracking is non-fatal — never break the main flow
@@ -764,8 +863,9 @@ public class AzureOpenAiClient {
             int completion     = usage.path("completion_tokens").asInt(0);
             int cachedTokens   = usage.path("prompt_tokens_details").path("cached_tokens").asInt(0);
             log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
-                            + "cachedTokens={} requestChars={}",
-                    LlmCallTag.get(), model, latencyMs, prompt, completion, cachedTokens, requestChars);
+                            + "cachedTokens={} requestChars={} operationId={}",
+                    LlmCallTag.get(), model, latencyMs, prompt, completion, cachedTokens, requestChars,
+                    OperationCorrelationId.get());
         } catch (Exception ignored) {
             // Metrics logging is measurement-only — never break the main flow
         } finally {

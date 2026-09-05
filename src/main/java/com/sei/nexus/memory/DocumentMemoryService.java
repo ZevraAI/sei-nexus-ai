@@ -226,6 +226,11 @@ public class DocumentMemoryService {
         if (question == null || question.isBlank()) {
             return List.of();
         }
+        // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC line
+        // and nexus_usage_event row attribute to memory-embedding retrieval instead of being
+        // silently dropped (embed()'s token count was previously computed but never recorded).
+        // No effect on the call itself.
+        com.sei.nexus.ai.LlmCallTag.set("MEMORY_EMBEDDING");
         float[] embedding = azureOpenAiClient.embed(question).embedding();
         if (domainKeys == null || domainKeys.isEmpty()) {
             // No agent/domain scoping — search across all indexed documents in

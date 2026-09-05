@@ -69,14 +69,19 @@ public class ConceptKnowledgeMaterializationService {
         this.objectMapper     = objectMapper;
     }
 
-    /** One concept's provenance-qualified identity — never derived from a physical table/column name. */
-    private record ConceptUnit(String connectionKey, String packKey, ConceptEntry entry) {
+    /**
+     * One concept's provenance-qualified identity — never derived from a physical table/column
+     * name. Package-visible (not {@code private}) so {@link ConceptKnowledgeSynchronizationService}
+     * — same package, reusing this class's projection logic rather than duplicating it — can
+     * consume the exact same authoritative units this materializer itself works from.
+     */
+    record ConceptUnit(String connectionKey, String packKey, ConceptEntry entry) {
         String uid() { return connectionKey + "::" + packKey + "::" + entry.conceptKey(); }
     }
 
     /** Mirrors {@code ConceptScopedMetadataResolver.ConceptCatalogEntry} — same fields, same source. */
-    private record ConceptEntry(String conceptKey, String name, List<String> aliases,
-                                 String description, String operationalMeaning) {}
+    record ConceptEntry(String conceptKey, String name, List<String> aliases,
+                         String description, String operationalMeaning) {}
 
     public record ConceptResult(String conceptUid, String fileId, boolean skippedAlreadyPresent) {}
 
@@ -162,6 +167,19 @@ public class ConceptKnowledgeMaterializationService {
 
     /** Builds the JSON, uploads it as an in-memory byte[] (never a file), attaches it, returns the file id. */
     private ConceptResult materializeOneConcept(String vectorStoreId, ConceptUnit unit) {
+        String fileId = uploadAndAttach(vectorStoreId, unit);
+        return new ConceptResult(unit.uid(), fileId, false);
+    }
+
+    /**
+     * Uploads this unit's current Concept Knowledge JSON and attaches it to the Vector Store,
+     * carrying the deterministic identity attributes plus {@code content_hash}/{@code
+     * projection_version} for {@link ConceptKnowledgeSynchronizationService}'s change detection.
+     * Package-visible so the synchronization service reuses this exact upload path for both a
+     * brand-new concept and a changed one (delete-old-then-call-this, never a second, divergent
+     * upload implementation).
+     */
+    String uploadAndAttach(String vectorStoreId, ConceptUnit unit) {
         byte[] json = buildConceptKnowledgeJson(unit);
         String filename = deterministicFilename(unit);
 
@@ -173,10 +191,52 @@ public class ConceptKnowledgeMaterializationService {
         attributes.put("knowledge_type", "business-concept");
         attributes.put("pack_key", unit.packKey());
         attributes.put("connection_key", unit.connectionKey());
+        attributes.put("content_hash", contentHash(unit));
+        attributes.put("projection_version", PROJECTION_VERSION);
         aiClient.attachFileToVectorStore(vectorStoreId, fileId, attributes);
-
-        return new ConceptResult(unit.uid(), fileId, false);
+        return fileId;
     }
+
+    /** Current shape version of the Concept Knowledge document/attribute contract itself (not the
+     *  concept's own content) — bumped only if the document/attribute SHAPE changes, never per
+     *  concept edit. Lets a future reconciliation distinguish "content changed" from "the whole
+     *  projection format changed" if that's ever needed; unused by anything today beyond being
+     *  stamped on every file. */
+    static final String PROJECTION_VERSION = "1";
+
+    /**
+     * Deterministic SHA-256 content hash over exactly the fields that constitute this concept's
+     * authoritative meaning ({@code conceptKey/name/aliases/description/operationalMeaning/
+     * packKey/connectionKey}) — deliberately excluding {@code generated_at} (a timestamp, not
+     * content) so re-deriving the same Postgres+Pack state always produces the same hash,
+     * regardless of when it's computed. This is the missing piece that lets {@link
+     * ConceptKnowledgeSynchronizationService} tell "unchanged, skip" apart from "content changed,
+     * replace" — the identity key ({@link ConceptUnit#uid()}) alone cannot do this, since it does
+     * not change when only descriptive text changes.
+     */
+    String contentHash(ConceptUnit unit) {
+        String canonical = String.join("",
+                nullToEmpty(unit.entry().conceptKey()),
+                nullToEmpty(unit.entry().name()),
+                String.join(",", unit.entry().aliases() != null ? unit.entry().aliases() : List.of()),
+                nullToEmpty(unit.entry().description()),
+                nullToEmpty(unit.entry().operationalMeaning()),
+                nullToEmpty(unit.packKey()),
+                nullToEmpty(unit.connectionKey()));
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            // SHA-256 is guaranteed present on every JVM — this branch is unreachable in practice.
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "SHA-256 unavailable: " + e.getMessage());
+        }
+    }
+
+    private String nullToEmpty(String s) { return s == null ? "" : s; }
 
     /**
      * The structured representation itself — the SAME fields {@code
@@ -186,7 +246,7 @@ public class ConceptKnowledgeMaterializationService {
      * a generation timestamp. No speculative fields, no physical column metadata beyond what's
      * already here (there is none — this is concept-level knowledge only).
      */
-    private byte[] buildConceptKnowledgeJson(ConceptUnit unit) {
+    byte[] buildConceptKnowledgeJson(ConceptUnit unit) {
         Map<String, Object> doc = new LinkedHashMap<>();
         doc.put("concept_key", unit.entry().conceptKey());
         doc.put("name", unit.entry().name());
@@ -205,7 +265,7 @@ public class ConceptKnowledgeMaterializationService {
         }
     }
 
-    private String deterministicFilename(ConceptUnit unit) {
+    String deterministicFilename(ConceptUnit unit) {
         return "concept-" + sanitize(unit.connectionKey()) + "-" + sanitize(unit.packKey())
                 + "-" + sanitize(unit.entry().conceptKey()) + ".json";
     }
@@ -222,7 +282,7 @@ public class ConceptKnowledgeMaterializationService {
      * {@link TenantPack} with no {@code connectionKey} (pre-Global-Pack-Foundation data) is
      * skipped — the same resolver this mirrors cannot concept-scope it either.
      */
-    private List<ConceptUnit> collectConceptUnits() {
+    List<ConceptUnit> collectConceptUnits() {
         List<ConceptUnit> units = new ArrayList<>();
         for (TenantPack tenantPack : packRepository.findAppliedPacks()) {
             String connectionKey = tenantPack.connectionKey();
@@ -248,4 +308,38 @@ public class ConceptKnowledgeMaterializationService {
         }
         return units;
     }
+
+    /**
+     * AI Knowledge Vector Store sync watermark support: the concept-level Business Entity rows
+     * whose {@code created_at}/{@code updated_at} is after {@code since} — i.e. changed since the
+     * tenant's last successful synchronization. Package-visible so {@link
+     * ConceptKnowledgeSynchronizationService} can build its "pending changes" status without a
+     * second, divergent connection/pack iteration — mirrors {@link #collectConceptUnits()}'s exact
+     * pack/connection scoping (same {@code findAppliedPacks}/{@code connectionKey} loop), swapping
+     * the concept-key-membership query for the timestamp one.
+     *
+     * <p><b>Scope note:</b> this reports concept-level (Business Entity) changes only, since that
+     * is the only granularity {@link #collectConceptUnits()} itself ever materializes — a
+     * column-only edit (a {@code nexus_data_column} change with no corresponding Business Entity
+     * update) is not visible here, and is not something this sync feature detects at all today (see
+     * this feature's own report). Deliberately Postgres-only: no OpenAI/Vector Store call.
+     */
+    List<PendingConceptChange> findChangedConceptEntities(Instant since) {
+        List<PendingConceptChange> changes = new ArrayList<>();
+        for (TenantPack tenantPack : packRepository.findAppliedPacks()) {
+            String connectionKey = tenantPack.connectionKey();
+            if (connectionKey == null || connectionKey.isBlank()) continue;
+            for (com.sei.nexus.semantic.BusinessEntity entity :
+                    semanticService.findEntitiesChangedAfterForConnection(connectionKey, since)) {
+                Instant changedAt = entity.updatedAt() != null ? entity.updatedAt() : entity.createdAt();
+                changes.add(new PendingConceptChange(connectionKey, entity.conceptKey(),
+                        entity.entityName(), changedAt));
+            }
+        }
+        return changes;
+    }
+
+    /** One concept-level metadata change observed after a given watermark — see {@link
+     *  #findChangedConceptEntities}. Package-visible for the same reason as {@link ConceptUnit}. */
+    record PendingConceptChange(String connectionKey, String conceptKey, String entityName, Instant changedAt) {}
 }

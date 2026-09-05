@@ -91,6 +91,11 @@ public class SemanticLearningService {
         if (question == null || question.isBlank() || executedSql == null || executedSql.isBlank()) {
             return;
         }
+        // Cost baseline instrumentation (measurement-only): this method runs @Async on a
+        // dedicated executor thread, distinct from the request thread ChatService.ask() already
+        // tagged — re-set here so TermExtractor's/CorrectionDetector's LLM_METRIC lines still
+        // group back to the chat question that triggered this learning run.
+        com.sei.nexus.ai.OperationCorrelationId.set("CHAT:" + runKey);
         try {
             // 1a. Extract business terms from this run
             List<TermExtractor.ExtractedTerm> terms = termExtractor.extract(question, executedSql);
@@ -114,6 +119,8 @@ public class SemanticLearningService {
             }
         } catch (Exception e) {
             log.warn("SemanticLearningService.learnFromRun failed for run {}: {}", runKey, e.getMessage());
+        } finally {
+            com.sei.nexus.ai.OperationCorrelationId.clear();
         }
     }
 

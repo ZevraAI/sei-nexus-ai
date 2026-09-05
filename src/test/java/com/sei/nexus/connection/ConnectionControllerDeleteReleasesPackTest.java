@@ -3,6 +3,7 @@ package com.sei.nexus.connection;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService;
 import com.sei.nexus.pack.*;
 import com.sei.nexus.prompt.BusinessObjectBatchAnalyzer;
 import com.sei.nexus.semantic.SemanticService;
@@ -104,7 +105,10 @@ class ConnectionControllerDeleteReleasesPackTest {
 
         packService = new IndustryPackService(packRepository, new PackEntityMapper(null, new ObjectMapper()),
                 new PackRecommendationService(packRepository), new FakeSemanticService(),
-                new FakeEnterpriseMapRepository(), connectionRepository, new FakeBusinessObjectBatchAnalyzer());
+                new FakeEnterpriseMapRepository(), connectionRepository, new FakeBusinessObjectBatchAnalyzer(),
+                new ConceptKnowledgeSynchronizationService(null, null, null, null) {
+                    @Override public void triggerAsync() { }
+                });
         connectionService = new ConnectionService(connectionRepository, packService);
         controller = new ConnectionController(connectionRepository, null, null, connectionService,
                 packRepository, packService);

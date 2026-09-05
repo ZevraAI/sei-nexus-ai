@@ -405,6 +405,33 @@ public class SemanticRepository {
         return jdbc.query(sql, entityMapper(), params.toArray());
     }
 
+    // AI Knowledge Vector Store sync watermark: the cheap, Postgres-only half of "what changed
+    // since the last successful synchronization" (see ConceptKnowledgeSynchronizationService /
+    // ConceptKnowledgeMaterializationService#findChangedConceptEntities). Deliberately the same
+    // ACTIVE + concept_key IS NOT NULL + connection-scoping shape as
+    // findDistinctConceptKeysForConnection/findEntitiesByConnectionAndConcepts above (the same
+    // authoritative catalog those already narrow to) — this just adds a timestamp filter instead
+    // of a concept-key filter. No OpenAI/Vector Store call involved.
+    private static final String FIND_ENTITIES_CHANGED_AFTER_FOR_CONNECTION = """
+            SELECT entity_key, domain_key, entity_name, description, primary_object_key,
+                   operational_meaning, investigation_hints, status, created_by, created_at, updated_at,
+                   entity_type, group_label, pack_key, concept_key
+              FROM nexus_business_entity
+             WHERE status = 'ACTIVE'
+               AND concept_key IS NOT NULL
+               AND primary_object_key IN (
+                   SELECT object_key FROM nexus_data_object WHERE connection_key = ?
+               )
+               AND (created_at > ? OR updated_at > ?)
+             ORDER BY updated_at DESC
+            """;
+
+    public List<BusinessEntity> findEntitiesChangedAfterForConnection(String connectionKey, Instant since) {
+        Timestamp watermark = toTimestamp(since);
+        return jdbc.query(FIND_ENTITIES_CHANGED_AFTER_FOR_CONNECTION, entityMapper(),
+                connectionKey, watermark, watermark);
+    }
+
     // Downstream Context Boundary for Concept-Scoped Metadata Narrowing: retrieves the ACTIVE
     // Business Entities bound to an already Stage-2-resolved set of physical object keys —
     // purely a retrieval keyed on primary_object_key membership, no domain_key, no ranking, no

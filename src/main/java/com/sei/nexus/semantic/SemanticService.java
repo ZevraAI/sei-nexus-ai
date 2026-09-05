@@ -263,6 +263,12 @@ public class SemanticService {
         return repository.findEntitiesByConnectionAndConcepts(connectionKey, conceptKeys);
     }
 
+    /** Thin pass-through — AI Knowledge sync watermark: see {@link
+     *  SemanticRepository#findEntitiesChangedAfterForConnection}. */
+    public List<BusinessEntity> findEntitiesChangedAfterForConnection(String connectionKey, java.time.Instant since) {
+        return repository.findEntitiesChangedAfterForConnection(connectionKey, since);
+    }
+
     /**
      * Downstream Context Boundary for Concept-Scoped Metadata Narrowing: the same rendered
      * {@link SemanticContext} shape as {@link #semanticContextWithBindings}, but sourced ONLY

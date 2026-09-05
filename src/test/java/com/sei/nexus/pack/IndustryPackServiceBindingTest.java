@@ -6,6 +6,7 @@ import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.connection.NexusConnection;
 import com.sei.nexus.enterprise.DataObject;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService;
 import com.sei.nexus.prompt.BusinessObjectBatchAnalyzer;
 import com.sei.nexus.semantic.BusinessEntity;
 import com.sei.nexus.semantic.OperationalVocabulary;
@@ -358,7 +359,10 @@ class IndustryPackServiceBindingTest {
         entityMapper = new PackEntityMapper(null, new ObjectMapper());
         service = new IndustryPackService(packRepository, entityMapper,
                 new PackRecommendationService(packRepository), semanticService, enterpriseMapRepository,
-                connectionRepository, batchAnalyzer);
+                connectionRepository, batchAnalyzer,
+                new ConceptKnowledgeSynchronizationService(null, null, null, null) {
+                    @Override public void triggerAsync() { }
+                });
     }
 
     private static NexusConnection testConnection(String connectionKey) {

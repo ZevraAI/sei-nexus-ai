@@ -236,6 +236,11 @@ public class EnterpriseMapService {
         // uncontrolled parallel LLM calls").
         for (int i = 0; i < tableNames.size(); i += Math.max(1, discoverBatchSize)) {
             List<String> batch = tableNames.subList(i, Math.min(i + Math.max(1, discoverBatchSize), tableNames.size()));
+            // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC
+            // line and nexus_usage_event row attribute to "discover" rather than the default
+            // "chat" feature bucket. No effect on the call itself.
+            com.sei.nexus.ai.LlmCallTag.set("DISCOVER_BATCH_ANALYSIS");
+            com.sei.nexus.usage.UsageContext.set("discover", null);
             Map<String, Map<String, Object>> analyzed =
                     batchAnalyzer.analyzeBatch(connectionKey, schemaName, domainKey, batch);
 
@@ -280,6 +285,11 @@ public class EnterpriseMapService {
                 """;
 
         String userMessage = "Draft schema:\n" + toJson(draft) + "\n\nUser prompt: " + prompt;
+        // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC line
+        // and nexus_usage_event row attribute to "enterprise_map" rather than the default "chat"
+        // feature bucket. No effect on the call itself.
+        com.sei.nexus.ai.LlmCallTag.set("ENTERPRISE_MAP_SIMULATE");
+        com.sei.nexus.usage.UsageContext.set("enterprise_map", null);
         String responseJson = aiClient.chatWithJson(List.of(ChatMessage.user(userMessage)), systemPrompt);
         Map<String, Object> parsed = parseJson(responseJson);
 

@@ -336,6 +336,12 @@ public class OnboardingService {
 
         List<Map<String, Object>> recommended;
         try {
+            // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC
+            // line and nexus_usage_event row attribute to onboarding instead of the default "chat"
+            // feature bucket. No effect on the call itself.
+            com.sei.nexus.ai.LlmCallTag.set("ONBOARDING_RECOMMEND");
+            com.sei.nexus.usage.UsageContext.set("onboarding", null);
+            com.sei.nexus.ai.OperationCorrelationId.set("ONBOARDING_RECOMMEND:" + cacheKey);
             String aiResponse = aiClient.chatWithJson(
                     List.of(ChatMessage.user(userMessage)), systemPrompt);
             Map<String, Object> parsed = parseJson(aiResponse);
@@ -355,6 +361,11 @@ public class OnboardingService {
                         return entry;
                     })
                     .collect(Collectors.toList());
+        } finally {
+            // OperationCorrelationId (unlike LlmCallTag) is not auto-cleared by AzureOpenAiClient —
+            // it's meant to span multiple calls within one operation, so this call site owns
+            // clearing it once the operation it labeled is actually finished.
+            com.sei.nexus.ai.OperationCorrelationId.clear();
         }
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -444,6 +455,12 @@ public class OnboardingService {
      */
     private Map<String, Map<String, Object>> analyzeTableBatch(String connectionKey, String schemaName,
                                                                  String domainKey, List<String> tableNames) {
+        // Cost baseline instrumentation (measurement-only): tag this call so its LLM_METRIC line
+        // and nexus_usage_event row attribute to onboarding instead of the default "chat" feature
+        // bucket. No effect on the call itself — BusinessObjectBatchAnalyzer.analyzeBatch() is
+        // shared with Discover/Industry Pack, which set their own tag/feature at their call sites.
+        com.sei.nexus.ai.LlmCallTag.set("ONBOARDING_BATCH_ANALYSIS");
+        com.sei.nexus.usage.UsageContext.set("onboarding", null);
         Map<String, Map<String, Object>> analyzed = batchAnalyzer.analyzeBatch(
                 connectionKey, schemaName, domainKey, tableNames,
                 SUGGESTED_QUESTIONS_FIELD_SCHEMA, SUGGESTED_QUESTIONS_RULE);
@@ -595,6 +612,11 @@ public class OnboardingService {
                             return;
                         }
                         TenantContext.set(tenantSchema);
+                        // Cost baseline instrumentation (measurement-only): re-set on this
+                        // worker-pool thread (a fresh thread per CompletableFuture.runAsync task,
+                        // same reason TenantContext is re-set just above) so every LLM_METRIC line
+                        // this batch produces can be grouped back to this one onboarding job.
+                        com.sei.nexus.ai.OperationCorrelationId.set("ONBOARDING:" + jobId);
                         try {
                             for (String tableName : batch) {
                                 eventBus.publish(jobId, "table_started", Map.of("table", tableName));
@@ -610,6 +632,7 @@ public class OnboardingService {
                             }
                         } finally {
                             TenantContext.clear();
+                            com.sei.nexus.ai.OperationCorrelationId.clear();
                             laneLimit.release();
                         }
                     }, onboardingJobExecutor))

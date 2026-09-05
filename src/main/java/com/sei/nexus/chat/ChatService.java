@@ -286,6 +286,14 @@ public class ChatService {
                 ? request.clientRunKey() : Keys.runKey();
         boolean runPersisted = false;
 
+        // Cost baseline instrumentation (measurement-only): every LLM_METRIC line emitted while
+        // handling this question — strategy selection, embedding, Stage 1, routing, planner/
+        // evaluator loop, answer composition — will carry this run's own runKey, so they can be
+        // grouped back to one chat question. ask() runs synchronously on this request thread, so
+        // no explicit clear() is needed: the next request handled by this pooled thread overwrites
+        // it here before making any LLM call of its own (same reasoning as LlmCallTag's javadoc).
+        com.sei.nexus.ai.OperationCorrelationId.set("CHAT:" + runKey);
+
         // Runtime Progress Projection: intent classification + agent routing (above) already
         // ran by the time runKey exists, so this phase is reported as a single started+completed
         // pair rather than fabricating a mid-flight "started" moment that never happened.
