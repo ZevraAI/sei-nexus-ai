@@ -177,8 +177,12 @@ class ResponseArtifactsBuilderTest {
         assertTrue(a.keyFindings().contains("Only one region returned; broadening the query."));
     }
 
+    // quickRefinements is a SEPARATE tactical-actions concept, transported directly via
+    // ChatResponse#quickRefinements — it must never be merged into nextSteps, which is
+    // exclusively Agent Brain's own decision. An empty model nextSteps is an honest "no next
+    // step" signal, not a trigger to substitute Java's canned tactical actions.
     @Test
-    void nextStepsCarryThroughQuickRefinementsUnchanged() {
+    void quickRefinementsAreNeverMergedIntoNextStepsEvenWhenModelNextStepsIsEmpty() {
         List<Map<String, Object>> quickRefs = List.of(
                 row("label", "Show exceptions only", "prompt", "orders — show only exceptions",
                         "requires_input", false));
@@ -186,9 +190,24 @@ class ResponseArtifactsBuilderTest {
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "Show orders", "Here are the open orders.", List.of(), List.of(), List.of(), quickRefs, null, null);
 
-        assertEquals(1, a.nextSteps().size());
-        assertEquals("Show exceptions only", a.nextSteps().get(0).label());
-        assertEquals("orders — show only exceptions", a.nextSteps().get(0).prompt());
+        assertTrue(a.nextSteps().isEmpty(),
+                "quickRefinements must never populate nextSteps — an absent llmSemantics/empty "
+                        + "model nextSteps must stay empty, not be silently replaced");
+    }
+
+    @Test
+    void quickRefinementsAreNeverMergedIntoNextStepsWhenLlmSemanticsProvidesNone() {
+        StructuredAnswer semantics = new StructuredAnswer("answer", "understanding",
+                List.of(), List.of(), null, List.of());
+        List<Map<String, Object>> quickRefs = List.of(
+                row("label", "Filter by date", "prompt", "orders — for date:", "requires_input", true));
+
+        ResponseArtifacts a = ResponseArtifactsBuilder.build(
+                "Show orders", "answer", List.of(), List.of(), List.of(), quickRefs, null, semantics);
+
+        assertTrue(a.nextSteps().isEmpty(),
+                "the model explicitly provided an empty nextSteps list — that must be honored "
+                        + "as-is, never backfilled from quickRefinements");
     }
 
     @Test

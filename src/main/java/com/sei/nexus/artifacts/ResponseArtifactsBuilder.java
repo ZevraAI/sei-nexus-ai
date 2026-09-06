@@ -85,13 +85,14 @@ public final class ResponseArtifactsBuilder {
             nextSteps = List.of();
         }
 
-        // Tactical UI actions (decision-type-driven, e.g. "Show exceptions only") are a separate,
-        // legitimate concept from the model's own investigative suggestions — real backend-
-        // computed affordances, not fabricated. Used whenever the model didn't suggest anything
-        // more specific, regardless of whether other semantic fields came from the model.
-        if (nextSteps.isEmpty()) {
-            nextSteps = nextSteps(quickRefinements);
-        }
+        // Tactical UI actions (decision-type-driven, e.g. "Show exceptions only") are a SEPARATE
+        // concept from the model's own NEXT_STEPS decision — never merged into `nextSteps` here,
+        // even when the model's own list is empty. An empty `nextSteps` is an honest signal ("the
+        // model decided no next step is warranted, or produced none") that must reach the
+        // frontend as-is; substituting Java's canned quickRefinements into this same field would
+        // make Java the author of a semantic decision that belongs to Agent Brain alone.
+        // `quickRefinements` is transported separately (see ChatResponse#quickRefinements) for
+        // the frontend's own, clearly separate tactical-actions surface.
 
         return new ResponseArtifacts(
                 understanding,
