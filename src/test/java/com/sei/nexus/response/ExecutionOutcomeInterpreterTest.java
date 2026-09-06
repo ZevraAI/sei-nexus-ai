@@ -60,12 +60,16 @@ class ExecutionOutcomeInterpreterTest {
     }
 
     @Test
-    void idColumnsAreExcludedFromNumericSummary() {
+    void idColumnsAreExcludedFromNumericSummaryButStillRenderedAsValuesForASmallResult() {
         List<Map<String, Object>> rows = List.of(
                 row("id", 1, "product_id", 100), row("id", 2, "product_id", 200));
 
-        // `id` and `*_id` are excluded; no distribution (all distinct) → identity columns only, no lines
-        assertEquals("Total rows: 2\nColumns: id, product_id\n", interp.summarizeRows(rows));
+        // `id`/`*_id` are excluded from the numeric sum/avg branch, and not low-cardinality
+        // (2 distinct out of 2 rows) — but a small result (<= SMALL_RESULT_ROW_LIMIT) must still
+        // surface their actual values via the Values: block, not drop them silently.
+        assertEquals(
+                "Total rows: 2\nColumns: id, product_id\nValues:\n  id = 1, 2\n  product_id = 100, 200\n",
+                interp.summarizeRows(rows));
     }
 
     @Test
@@ -84,11 +88,60 @@ class ExecutionOutcomeInterpreterTest {
     }
 
     @Test
-    void allSameValueIsNeitherDistributionNorNumericSummary() {
+    void allSameValueIsNeitherDistributionNorNumericSummaryButStillRenderedAsValues() {
         List<Map<String, Object>> rows = List.of(
                 row("kind", "A"), row("kind", "A"), row("kind", "A"));
 
-        // one distinct value → not low-cardinality (needs ≥ 2), not numeric → header only
-        assertEquals("Total rows: 3\nColumns: kind\n", interp.summarizeRows(rows));
+        // one distinct value → not low-cardinality (needs >= 2), not numeric — but still a small
+        // result, so the actual value(s) are rendered rather than dropped.
+        assertEquals("Total rows: 3\nColumns: kind\nValues:\n  kind = A, A, A\n", interp.summarizeRows(rows));
+    }
+
+    // ── The fix: single-row descriptive/identifying values must reach the composition LLM ──────
+    // (previously silently dropped — neither the distribution branch, which requires >= 2
+    // distinct values, nor the numeric branch, which excludes id-suffixed columns, could ever
+    // fire for a 1-row result's string/id columns).
+
+    @Test
+    void singleRowDescriptiveStringValuesReachTheSummaryNotJustColumnNames() {
+        List<Map<String, Object>> rows = List.of(row("name", "Widget ABC", "sku", "SKU-123"));
+
+        String out = interp.summarizeRows(rows);
+        assertTrue(out.contains("name = Widget ABC"), out);
+        assertTrue(out.contains("sku = SKU-123"), out);
+    }
+
+    @Test
+    void singleRowIdentifierColumnValueReachesTheSummary() {
+        // product_id is `_id`-suffixed (excluded from numeric sum/avg) and, with 1 row, can never
+        // be "low cardinality" (that branch requires >= 2 distinct values) — previously dropped
+        // entirely.
+        List<Map<String, Object>> rows = List.of(row("product_id", "50000000-0001", "total_ordered_qty", 1500));
+
+        String out = interp.summarizeRows(rows);
+        assertTrue(out.contains("product_id = 50000000-0001"), out);
+        assertTrue(out.contains("total_ordered_qty: sum=1500.00, avg=1500.00"), out);
+    }
+
+    @Test
+    void largeResultDoesNotRenderAValuesBlockForAnUncoveredColumn() {
+        // Conciseness for large results must be unaffected by this fix — the Values: block is
+        // only for small results (<= SMALL_RESULT_ROW_LIMIT rows).
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < 20; i++) rows.add(row("sku", "SKU-" + i));
+
+        String out = interp.summarizeRows(rows);
+        assertFalse(out.contains("Values:"), out);
+    }
+
+    // Domain neutrality — the fix is driven purely by row count and column shape, never by
+    // column name or business domain; a healthcare-shaped single row behaves identically.
+    @Test
+    void domainNeutral_singleRowDescriptiveValueInHealthcareContext() {
+        List<Map<String, Object>> rows = List.of(row("patient_name", "J. Rivera", "diagnosis_code", "R51"));
+
+        String out = interp.summarizeRows(rows);
+        assertTrue(out.contains("patient_name = J. Rivera"), out);
+        assertTrue(out.contains("diagnosis_code = R51"), out);
     }
 }

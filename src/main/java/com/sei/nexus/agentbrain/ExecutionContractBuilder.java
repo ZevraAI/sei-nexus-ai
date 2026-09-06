@@ -42,8 +42,51 @@ public class ExecutionContractBuilder {
         Map<String, ExecutionBindings.ExecutionTarget> attributeBindings = new LinkedHashMap<>();
         Set<ExecutionBindings.ApprovedAsset>           approvedAssets    = new LinkedHashSet<>();
 
-        for (BusinessObject object : model.objects()) {
-            PhysicalTable table = model.objectTargets().get(object.objectKey());
+        // Prompt-rendering plane: exactly `model.objects()` — Concept-Scoped Metadata Narrowing's
+        // (possibly narrower) selection. Unchanged from before this method's execution-scope
+        // extension below; SemanticView continues to reflect only this set.
+        bind(model.objects(), model.objectTargets(), model.attributeTargets(),
+                objectBindings, attributeBindings, approvedAssets);
+
+        // Execution-authorization plane: `model.executionScope()`, when present, is the full,
+        // deterministic, domain/connection-scoped object set — see ResolvedBusinessModel's own
+        // javadoc on this field. Bound into the SAME objectBindings/attributeBindings/
+        // approvedAssets (a pure union — Map.put/Set.add on identical keys is a no-op) so
+        // execution authorization is never narrower than this LLM-independent baseline,
+        // regardless of what Concept-Scoped Narrowing selected for THIS question's prompt.
+        // Absent (every pre-existing caller) ⇒ no-op, and approvedAssets is exactly what it was
+        // before this field existed — byte-identical backward compatibility.
+        model.executionScope().ifPresent(scope ->
+                bind(scope.objects(), scope.objectTargets(), scope.attributeTargets(),
+                        objectBindings, attributeBindings, approvedAssets));
+
+        SemanticView      semanticView = new SemanticView(model.objects());
+        ExecutionBindings bindings     = new ExecutionBindings(objectBindings, attributeBindings, approvedAssets);
+
+        return new ExecutionContract(
+                Keys.uniqueKey("ctr"),
+                Instant.now(),
+                model.agentId(),
+                model.connectionKeys(),
+                computeSemanticHash(model.agentId(), approvedAssets),
+                semanticView,
+                bindings);
+    }
+
+    /**
+     * Binds one object set's physical identity into the given (mutable, accumulating) bindings —
+     * shared by both the prompt-rendering plane and the execution-authorization plane in {@link
+     * #compile}, so the two identical-shaped loops that existed before this method was extracted
+     * stay byte-for-byte the same, just reusable. Pure accumulation: called twice with
+     * overlapping keys is a no-op for the overlap (Map.put/Set.add), never a conflict.
+     */
+    private void bind(List<BusinessObject> objects, Map<String, PhysicalTable> objectTargets,
+                      Map<String, PhysicalColumn> attributeTargets,
+                      Map<String, ExecutionBindings.ExecutionTarget> objectBindings,
+                      Map<String, ExecutionBindings.ExecutionTarget> attributeBindings,
+                      Set<ExecutionBindings.ApprovedAsset> approvedAssets) {
+        for (BusinessObject object : objects) {
+            PhysicalTable table = objectTargets.get(object.objectKey());
             if (table != null) {
                 objectBindings.put(object.objectKey(), new ExecutionBindings.ExecutionTarget(
                         "SQL", table.connectionKey(), table.schema(), table.table(), null));
@@ -62,7 +105,7 @@ public class ExecutionContractBuilder {
                 }
             }
             for (BusinessAttribute attribute : object.attributes()) {
-                PhysicalColumn column = model.attributeTargets().get(attribute.attributeKey());
+                PhysicalColumn column = attributeTargets.get(attribute.attributeKey());
                 if (column != null) {
                     attributeBindings.put(attribute.attributeKey(), new ExecutionBindings.ExecutionTarget(
                             "SQL", column.connectionKey(), column.schema(), column.table(),
@@ -70,18 +113,6 @@ public class ExecutionContractBuilder {
                 }
             }
         }
-
-        SemanticView      semanticView = new SemanticView(model.objects());
-        ExecutionBindings bindings     = new ExecutionBindings(objectBindings, attributeBindings, approvedAssets);
-
-        return new ExecutionContract(
-                Keys.uniqueKey("ctr"),
-                Instant.now(),
-                model.agentId(),
-                model.connectionKeys(),
-                computeSemanticHash(model.agentId(), approvedAssets),
-                semanticView,
-                bindings);
     }
 
     /** Deterministic for equal inputs: a stable hash over the agent and its approved surface. */

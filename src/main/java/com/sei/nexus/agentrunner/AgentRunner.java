@@ -166,8 +166,15 @@ public class AgentRunner {
 
                 String answer = extractFinalAnswer(response);
                 if (answer != null) {
+                    // The model's own semantic decomposition of `answer`, when it called
+                    // final_answer with the optional fields (see AgentToolRegistry's schema) —
+                    // never fabricated by the runtime; empty when the model didn't provide them
+                    // (e.g. a plain-text termination, which carries no tool-call args at all).
+                    Map<String, Object> stepArgs = new LinkedHashMap<>();
+                    stepArgs.put("answer", answer);
+                    stepArgs.putAll(extractFinalSemantics(response));
                     steps.add(step("FINAL_ANSWER",
-                            Map.of("answer", answer),
+                            stepArgs,
                             null, System.currentTimeMillis() - callStart));
 
                     String stepsJson = mapper.writeValueAsString(steps);
@@ -270,6 +277,29 @@ public class AgentRunner {
             return answer != null ? answer.toString() : "";
         }
         return null;
+    }
+
+    /**
+     * The model's own semantic decomposition, read straight from the {@code final_answer}
+     * tool-call arguments (see AgentToolRegistry's schema) — only present when the model actually
+     * called the tool with those optional fields populated; empty for a plain-text termination
+     * (no tool-call args exist in that branch) or when the model chose not to populate them.
+     * Never computed/inferred here — this is a read, not a derivation.
+     */
+    private Map<String, Object> extractFinalSemantics(AgentToolResponse response) {
+        if (response.args() == null) return Map.of();
+        Map<String, Object> semantics = new LinkedHashMap<>();
+        Object understanding = response.args().get("understanding");
+        if (understanding instanceof String s && !s.isBlank()) semantics.put("understanding", s);
+        Object keyFindings = response.args().get("key_findings");
+        if (keyFindings instanceof List<?> l && !l.isEmpty()) semantics.put("key_findings", keyFindings);
+        Object relatedFacts = response.args().get("related_facts");
+        if (relatedFacts instanceof List<?> l && !l.isEmpty()) semantics.put("related_facts", relatedFacts);
+        Object recommendation = response.args().get("recommendation");
+        if (recommendation instanceof String s && !s.isBlank()) semantics.put("recommendation", s);
+        Object nextSteps = response.args().get("next_steps");
+        if (nextSteps instanceof List<?> l && !l.isEmpty()) semantics.put("next_steps", nextSteps);
+        return semantics;
     }
 
     /**

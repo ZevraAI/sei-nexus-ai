@@ -89,35 +89,61 @@ public class ReasoningEvaluator {
 
             2. decision — is the evidence answerable and enough to proceed?
 
+            A correct result-set shape is not the whole test. The evidence must also be
+            SEMANTICALLY ANSWERABLE: sufficient to answer the question as phrased, not merely
+            shaped like the right rows. An identifier that locates a record or entity is not
+            necessarily sufficient to identify that entity in the form the user asked for. If
+            the question asks you to identify, name, or describe an entity, and the evidence
+            gathered contains only an opaque identifier for that entity — with no human-readable
+            descriptive value for it — the evidence is not yet sufficient, even when its row
+            shape is otherwise exactly correct. This applies however that identifier was
+            learned, including from a JOIN/relationship reference — an identifier surfaced that
+            way is still just an identifier, never a substitute for that entity's own descriptive
+            evidence. Do not assume a conventional column name exists or invent one to fill this
+            gap; this is about whether the evidence you actually have contains a presentable
+            answer, not about guessing at a column. Do not require further evidence merely because
+            an identifier is present — only require it when the question specifically asks to
+            identify, name, or describe that entity and no descriptive value for it has actually
+            been gathered yet.
+
             Decision guide:
             - SUFFICIENT    : the evidence collected is actually about what THIS question asks
                               (same entity/metric/business process), AND the rows already
                               gathered are themselves the correct result set for this question —
                               nothing about the question implies a different, filtered,
                               re-grouped, re-sorted, re-limited, or re-scoped set of rows than
-                              what's already there. A pure count, total, description, or
-                              explanation OF the existing rows, unchanged, still qualifies.
+                              what's already there — AND, when the question asks to identify,
+                              name, or describe an entity, the evidence includes a presentable
+                              value for it, not merely an opaque identifier. A pure count, total,
+                              description, or explanation OF the existing rows, unchanged, still
+                              qualifies.
             - NEED_MORE_DATA: the evidence is on-topic but either (a) a further targeted query
                               would materially improve the answer, (b) no evidence gathered so
                               far actually addresses this question's subject yet, so a first
-                              query toward it is needed, OR (c) the question requires a
-                              different result set (a filter, subset, grouping, sort order,
-                              limit, or scope different from what's already gathered) even
-                              though the existing evidence is about the right subject and could
-                              be read to compute an answer.
+                              query toward it is needed, (c) the question requires a different
+                              result set (a filter, subset, grouping, sort order, limit, or scope
+                              different from what's already gathered) even though the existing
+                              evidence is about the right subject and could be read to compute an
+                              answer, OR (d) the question asks to identify, name, or describe an
+                              entity and the evidence gathered contains only an opaque identifier
+                              for it, with no descriptive value yet gathered.
             - DEAD_END      : queries have been run TOWARD THIS QUESTION's subject — including,
-                              when applicable, toward the specific result set it requires — and
-                              the data needed is confirmed not available or not accessible.
-                              Evidence that is simply about a different subject, or that has the
-                              right subject but the wrong result-set shape and has not yet been
-                              re-queried, is not a dead end — that has not been queried yet.
+                              when applicable, toward the specific result set or descriptive
+                              evidence it requires — and the data needed is confirmed not
+                              available or not accessible. Evidence that is simply about a
+                              different subject, that has the right subject but the wrong
+                              result-set shape, or that identifies an entity only by an opaque
+                              identifier and has not yet been re-queried for its descriptive
+                              evidence, is not a dead end — that has not been queried yet.
 
             Be decisive. Prefer SUFFICIENT over NEED_MORE_DATA when evidence that is actually
             about this question, AND is already the correct result set for it, is good enough
             for a meaningful business answer, even if not exhaustive. Being decisive is never a
-            reason to accept off-topic evidence or the wrong result-set shape. If
-            resultSetMatches is false, decision can never be SUFFICIENT — say NEED_MORE_DATA
-            (or DEAD_END only if that different result set is confirmed unobtainable).
+            reason to accept off-topic evidence, the wrong result-set shape, or — when the
+            question asks to identify, name, or describe an entity — an opaque identifier in
+            place of that entity's own descriptive evidence. If resultSetMatches is false,
+            decision can never be SUFFICIENT — say NEED_MORE_DATA (or DEAD_END only if that
+            different result set is confirmed unobtainable).
             """;
 
     private final AzureOpenAiClient aiClient;

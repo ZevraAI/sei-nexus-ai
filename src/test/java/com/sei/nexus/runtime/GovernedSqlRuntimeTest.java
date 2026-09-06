@@ -43,6 +43,8 @@ class GovernedSqlRuntimeTest {
 
     private static final String CONN = "conn-1";
     private static final SqlTableReferenceExtractor EXTRACTOR = new SqlTableReferenceExtractor();
+    private static final com.sei.nexus.sql.SqlColumnReferenceExtractor COLUMN_EXTRACTOR =
+            new com.sei.nexus.sql.SqlColumnReferenceExtractor();
 
     // ── fakes ─────────────────────────────────────────────────────────────────
 
@@ -133,7 +135,7 @@ class GovernedSqlRuntimeTest {
         execRepo       = new FakeExecutionRepo();
         connectionRepo = new FakeConnectionRepo();
         refRepo        = new FakeExecutionReferenceRepo();
-        runtime = new GovernedSqlRuntime(pipeline, dynamicSql, audit, EXTRACTOR,
+        runtime = new GovernedSqlRuntime(pipeline, dynamicSql, audit, EXTRACTOR, COLUMN_EXTRACTOR,
                 execRepo, connectionRepo, refRepo, new ObjectMapper());
     }
 
@@ -148,6 +150,31 @@ class GovernedSqlRuntimeTest {
         }
         return new ExecutionContract("ctr-1", Instant.now(), "agent-1", List.of(CONN), "hash",
                 new SemanticView(List.of()), new ExecutionBindings(objectBindings, Map.of(), assets));
+    }
+
+    /**
+     * A contract with one real {@code BusinessObject}/attribute pair per (table, column...)
+     * group — unlike {@link #contractApproving}'s empty {@link SemanticView}, this fixture
+     * exercises {@link ExecutionContract#columnsByTable} for the column-existence gate
+     * (defense-in-depth).
+     */
+    private static ExecutionContract contractWithColumns(String table, String... columns) {
+        List<com.sei.nexus.semanticmodel.BusinessAttribute> attributes = new ArrayList<>();
+        Map<String, ExecutionBindings.ExecutionTarget> attributeBindings = new LinkedHashMap<>();
+        for (String c : columns) {
+            String attrKey = table + "." + c;
+            attributes.add(new com.sei.nexus.semanticmodel.BusinessAttribute(
+                    attrKey, c, com.sei.nexus.semanticmodel.AttributeRole.ATTRIBUTE));
+            attributeBindings.put(attrKey, new ExecutionBindings.ExecutionTarget("SQL", CONN, "public", table, c));
+        }
+        com.sei.nexus.semanticmodel.BusinessObject object = new com.sei.nexus.semanticmodel.BusinessObject(
+                table, table, null, attributes, List.of());
+        Map<String, ExecutionBindings.ExecutionTarget> objectBindings =
+                Map.of(table, new ExecutionBindings.ExecutionTarget("SQL", CONN, "public", table, null));
+        Set<ExecutionBindings.ApprovedAsset> assets =
+                Set.of(new ExecutionBindings.ApprovedAsset(CONN, EXTRACTOR.canonical(table)));
+        return new ExecutionContract("ctr-cols", Instant.now(), "agent-1", List.of(CONN), "hash",
+                new SemanticView(List.of(object)), new ExecutionBindings(objectBindings, attributeBindings, assets));
     }
 
     private static GovernanceOutcome executeOutcome(String governedSql, int rowLimit) {
@@ -537,5 +564,83 @@ class GovernedSqlRuntimeTest {
                 null, false, "conv-1", null));
 
         assertTrue(pipeline.seenForceAsync, "the planner's forceAsync choice reaches governance");
+    }
+
+    // ── Column-existence gate (defense-in-depth, Missing-Column Metadata Request) ──────────────
+    // Deterministic identifier verification only: rejects an invalid column reference, never
+    // substitutes or guesses a replacement — the exact production defect (a hallucinated
+    // "quantity" column on a table whose real measure column was "ordered_qty") reaching the
+    // database undetected.
+
+    @Test
+    void invalidColumnReferenceIsRejectedBeforeGovernanceOrExecution() {
+        ExecutionContract contract = contractWithColumns("order_lines", "id", "ordered_qty", "product_id");
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT SUM(order_lines.quantity) FROM order_lines", contract, false);
+
+        assertEquals(GovernedSqlRuntime.Status.INVALID_COLUMNS, o.status());
+        assertTrue(o.message().contains("order_lines.quantity"),
+                "the rejection names the exact invalid reference, never a substituted column");
+        assertFalse(pipeline.invoked, "an invalid column must never reach governance");
+        assertTrue(o.rows().isEmpty());
+    }
+
+    @Test
+    void validColumnReferencesAreNotRejected() {
+        ExecutionContract contract = contractWithColumns("order_lines", "id", "ordered_qty", "product_id");
+        pipeline.outcome = executeOutcome("SELECT SUM(order_lines.ordered_qty) FROM order_lines", 10);
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT SUM(order_lines.ordered_qty) FROM order_lines", contract, false);
+
+        assertEquals(GovernedSqlRuntime.Status.EXECUTED, o.status(),
+                "a column that genuinely exists on its table must never be rejected");
+    }
+
+    @Test
+    void columnGateNeverSubstitutesAReplacementColumn() {
+        // A near-miss ("orderd_qty" vs the real "ordered_qty") must be rejected exactly like any
+        // other invalid column — Java must never "helpfully" correct it to the similarly-named
+        // real column. That correction, if any, belongs entirely to Agent Brain re-planning.
+        ExecutionContract contract = contractWithColumns("order_lines", "id", "ordered_qty");
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT SUM(order_lines.orderd_qty) FROM order_lines", contract, false);
+
+        assertEquals(GovernedSqlRuntime.Status.INVALID_COLUMNS, o.status());
+        assertTrue(o.message().contains("orderd_qty"));
+        assertFalse(o.message().contains("ordered_qty"),
+                "the rejection must name only what was invalid, never propose or silently apply a fix");
+    }
+
+    @Test
+    void columnGateFailsOpenOnATableOutsideTheKnownSet() {
+        // A dot-reference whose table this fixture has no column knowledge of (e.g. a subquery
+        // alias, or a table this check simply was not given data for) must never be flagged —
+        // the gate only ever rejects what it is certain about.
+        ExecutionContract contract = contractWithColumns("order_lines", "id", "ordered_qty");
+        pipeline.outcome = executeOutcome("SELECT other_table.whatever FROM order_lines "
+                + "JOIN other_table ON other_table.id = order_lines.id", 10);
+
+        GovernedSqlRuntime.Outcome o = runPlannerGated(
+                "SELECT other_table.whatever FROM order_lines "
+                        + "JOIN other_table ON other_table.id = order_lines.id", contract, false);
+
+        assertEquals(GovernedSqlRuntime.Status.EXECUTED, o.status(),
+                "an unresolvable/unknown table's column reference fails open, never a false rejection");
+    }
+
+    @Test
+    void columnGateIsInertWithoutAContract() {
+        // Mirrors plannerWithoutContractIsUngated for the table gate: no contract means no known
+        // columns to validate against, so the column gate is a no-op — exactly as before this
+        // gate existed.
+        pipeline.outcome = executeOutcome("SELECT anything.whatever FROM anything", 10);
+
+        GovernedSqlRuntime.Outcome o = runPlanner("SELECT anything.whatever FROM anything", "obj-1",
+                Map.of(), new HashSet<>());
+
+        assertEquals(GovernedSqlRuntime.Status.EXECUTED, o.status());
     }
 }

@@ -157,8 +157,8 @@ class ChatServiceHardeningTest {
     @Test
     void evidenceToExecResultsEmitsErrorForAFailedStep() {
         EvidenceStore evidence = new EvidenceStore();
-        evidence.add(1, "step", "SELECT po.order_date FROM retail_core.purchase_orders po",
-                "conn-1", List.of(), null, "ERROR",
+        evidence.addOutcome(1, "step", "SELECT po.order_date FROM retail_core.purchase_orders po",
+                "conn-1", null, "ERROR",
                 "ERROR: column po.order_date does not exist", 5L);
 
         List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
@@ -172,8 +172,8 @@ class ChatServiceHardeningTest {
     @Test
     void evidenceToExecResultsEmitsBlockedForAGovernanceBlockedStep() {
         EvidenceStore evidence = new EvidenceStore();
-        evidence.add(1, "step", "SELECT * FROM retail_core.purchase_orders",
-                "conn-1", List.of(), null, "BLOCKED",
+        evidence.addOutcome(1, "step", "SELECT * FROM retail_core.purchase_orders",
+                "conn-1", null, "BLOCKED",
                 "SELECT * is not allowed; specify column names explicitly", 5L);
 
         List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
@@ -201,7 +201,7 @@ class ChatServiceHardeningTest {
     @Test
     void evidenceToExecResultsEmitsClarificationForADeclinedStepDistinctFromBlocked() {
         EvidenceStore evidence = new EvidenceStore();
-        evidence.add(1, "step", "", "", List.of(), null, "CLARIFICATION_NEEDED",
+        evidence.addOutcome(1, "step", "", "", null, "CLARIFICATION_NEEDED",
                 "'open' is not one of purchase_orders.status's legal values "
                         + "(draft, submitted, acknowledged, partially_received, received, cancelled, closed).", 0L);
 
@@ -267,5 +267,60 @@ class ChatServiceHardeningTest {
             assertFalse(m.toLowerCase().contains(forbidden),
                     "user-facing error must not contain '" + forbidden + "'");
         }
+    }
+
+    // ── Investigation-Step Semantics: final answer composition receives ALL successful query
+    //     evidence across the whole investigation, not just the last step or one selected
+    //     dataset — even when intermediate steps were followed by further reasoning/metadata
+    //     requests. Generic: no domain-specific object/column names drive this behavior. ────────
+
+    @Test
+    void evidenceToExecResultsPreservesEverySuccessfulQuerySteps_notJustTheLastOne() {
+        EvidenceStore evidence = new EvidenceStore();
+        // Step 1: an initial dataset (e.g. "5 open orders") — later followed by more reasoning.
+        evidence.add(1, "List open orders", "SELECT id FROM orders", "conn-1",
+                List.of(Map.of("id", "O-1"), Map.of("id", "O-2")), null, "NEED_MORE_DATA",
+                "need item detail too", 5L);
+        // Step 2: metadata retrieval — contributes no rows, must not appear as a dataset.
+        evidence.addMetadataStep(2, "Retrieve line-item columns", "r", "METADATA_RETRIEVED",
+                "Retrieved 15 column(s).");
+        // Step 3: an intermediate result identifying something (e.g. "the top item").
+        evidence.add(3, "Top item", "SELECT item_id, qty FROM order_lines", "conn-1",
+                List.of(Map.of("item_id", "X-1", "qty", 12)), null, "NEED_MORE_DATA",
+                "need item details too", 5L);
+        // Step 4: another metadata retrieval.
+        evidence.addMetadataStep(4, "Retrieve item columns", "r", "METADATA_RETRIEVED",
+                "Retrieved 16 column(s).");
+        // Step 5: intermediate detail for the item identified in step 3 (e.g. name/SKU).
+        evidence.add(5, "Item detail", "SELECT name, sku FROM items", "conn-1",
+                List.of(Map.of("name", "Widget", "sku", "W-1")), null, "SUFFICIENT", "answered", 5L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        // Every step that actually returned rows is present — steps 1, 3, and 5 — regardless of
+        // whether the evaluator asked for more evidence after steps 1 and 3. The metadata steps
+        // (2 and 4) contribute no dataset entries, as required — metadata is reasoning evidence,
+        // never a user-facing dataset on its own.
+        List<Integer> stepsWithRows = results.stream()
+                .filter(r -> r.containsKey("rows"))
+                .map(r -> (Integer) r.get("step"))
+                .toList();
+        assertEquals(List.of(1, 3, 5), stepsWithRows,
+                "final answer composition must see every successful query step's evidence, "
+                        + "not just the last one");
+
+        // Step 5's item detail (the "product details retrieved in an intermediate step" case)
+        // is genuinely present and intact for the composer to use.
+        Map<String, Object> step5 = results.stream()
+                .filter(r -> Integer.valueOf(5).equals(r.get("step"))).findFirst().orElseThrow();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> step5Rows = (List<Map<String, Object>>) step5.get("rows");
+        assertEquals("Widget", step5Rows.get(0).get("name"));
+        assertEquals("W-1", step5Rows.get(0).get("sku"));
+
+        // No dataset entries exist for the metadata-only steps.
+        assertTrue(results.stream().noneMatch(r -> Integer.valueOf(2).equals(r.get("step"))
+                || Integer.valueOf(4).equals(r.get("step"))),
+                "metadata retrieval is reasoning evidence, not a user-facing dataset");
     }
 }

@@ -101,6 +101,23 @@ public class PromptAssembler {
     }
 
     /**
+     * Renders full, unbounded Tier-1 + Tier-2 detail for exactly ONE object — the Concept-Scoped
+     * Metadata Narrowing "missing column detail" extension point (Agent Brain explicitly
+     * requesting the columns of an object the presentation budget already omitted from an
+     * {@link #assemble} call). Reuses the same identity/detail renderers as {@link #assemble},
+     * with an unbounded {@link RenderOptions} — the character budget applies only to the
+     * up-front assembly of the whole schema listing, never to a single, already-approved
+     * object's detail retrieved on demand.
+     */
+    public String assembleObject(PromptContext.PromptObject o) {
+        RenderOptions unbounded = new RenderOptions(true, true, true, 0);
+        StringBuilder sb = new StringBuilder();
+        sb.append(renderIdentity(o, unbounded));
+        sb.append(renderDetail(o, unbounded));
+        return sb.toString();
+    }
+
+    /**
      * Tier 1 — the object's executable identity, always rendered regardless of budget:
      * schema-qualified table (when the policy qualifies), connection key, and purpose.
      * Compact options reproduce the historical bytes exactly (bare table, no connection/purpose).

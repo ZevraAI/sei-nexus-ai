@@ -198,7 +198,8 @@ class AgentReadOnlyFlowIntegrationTest {
                 };
         com.sei.nexus.runtime.GovernedSqlRuntime runtime =
                 new com.sei.nexus.runtime.GovernedSqlRuntime(govPipeline, dynamicSql,
-                        new NoopAudit(), extractor, null, null, refRepo, mapper);
+                        new NoopAudit(), extractor, new com.sei.nexus.sql.SqlColumnReferenceExtractor(),
+                        null, null, refRepo, mapper);
         AgentToolRegistry registry = new AgentToolRegistry(openAi, mapper, runtime);
         return new AgentRunner(openAi, registry, repository, mapper, runRepo,
                 new FakeAgentBrain(), new ExecutionContractBuilder(extractor),

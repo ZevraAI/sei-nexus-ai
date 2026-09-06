@@ -44,7 +44,7 @@ class ReasoningEngineClarificationTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 runtimeCalled.set(true);
@@ -61,12 +61,15 @@ class ReasoningEngineClarificationTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         String question = "show purchase orders with status open";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-test", "user@test.com",
-                false, null, null, false, "conv-test", null, null);
+                false, null, null, false, "conv-test", null, null, null);
 
         assertEquals(1, plannerCalls.get(), "the loop must stop after the first clarification — never re-plan on its own");
         assertFalse(runtimeCalled.get());
@@ -74,7 +77,9 @@ class ReasoningEngineClarificationTest {
 
         List<EvidenceStore.StepEvidence> steps = result.evidence().getSteps();
         assertEquals(1, steps.size());
-        assertEquals("CLARIFICATION_NEEDED", steps.get(0).evaluatorDecision());
+        assertEquals("CLARIFICATION_NEEDED", steps.get(0).outcome());
+        assertNull(steps.get(0).evaluatorDecision(),
+                "a declined step never reached evaluation — no sufficiency verdict applies");
         assertTrue(steps.get(0).evaluatorRationale().contains("draft"),
                 "the actual legal values must be present in the recorded evidence, unmodified");
         assertTrue(steps.get(0).sql() == null || steps.get(0).sql().isBlank());
@@ -104,7 +109,7 @@ class ReasoningEngineClarificationTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 return new Outcome(Status.EXECUTED, null, null,
@@ -120,17 +125,20 @@ class ReasoningEngineClarificationTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         String question = "show open purchase orders for our main supplier";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-test", "user@test.com",
-                false, null, null, false, "conv-test", null, null);
+                false, null, null, false, "conv-test", null, null, null);
 
         assertEquals(2, plannerCalls.get());
         List<EvidenceStore.StepEvidence> steps = result.evidence().getSteps();
         assertEquals(2, steps.size(), "the earlier successful step's evidence must survive the later clarification");
         assertEquals("s1", steps.get(0).rows().get(0).get("id"));
-        assertEquals("CLARIFICATION_NEEDED", steps.get(1).evaluatorDecision());
+        assertEquals("CLARIFICATION_NEEDED", steps.get(1).outcome());
     }
 }

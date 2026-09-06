@@ -1,5 +1,7 @@
 package com.sei.nexus.chat;
 
+import com.sei.nexus.artifacts.ResponseArtifacts;
+
 import java.util.List;
 import java.util.Map;
 
@@ -17,9 +19,21 @@ public record ChatResponse(
         String suggestedAction,
         List<Map<String, Object>> quickRefinements,
         List<Map<String, Object>> asyncOperations,
-        // Raw rows from the most data-rich sync step — used by the frontend
-        // for data visualisation. Capped at 100 rows; null when no live query ran.
+        // LEGACY COMPATIBILITY PATH — a single dataset chosen by a Java-side heuristic (see
+        // ReasoningEngine#reason), kept only for existing consumers (DataTable/DataViz/
+        // SuggestedQuestions, ScheduledReportService). The authoritative UI-content mechanism is
+        // `artifacts.sections` (the model's own plan, each DATASET entry carrying its resolved
+        // rows) — new capability must be built on that, never on this field. Capped at 100 rows;
+        // null when no live query ran.
         List<Map<String, Object>> queryData,
+        // Every row-bearing investigation step's own rows, preserved independently (each entry:
+        // {stepNo, description, rows, rowCount}) — never merged, never ranked, never reduced to
+        // one "winning" step the way `queryData` above is. Additive, for backward compatibility:
+        // `queryData` is unchanged and remains the primary single-dataset field; this field is the
+        // complete set of successful business-data results the investigation produced. Empty
+        // (never null) when the run produced no row-bearing steps (e.g. the Zevra Agent path,
+        // which does not use this reasoning engine).
+        List<Map<String, Object>> investigationDatasets,
         // Reasoning steps produced by the iterative engine (Phase 2).
         // Each entry: {stepNo, description, rowCount, rowSummary, evaluatorDecision,
         //              evaluatorRationale, sql, executionMs}
@@ -32,5 +46,12 @@ public record ChatResponse(
         // Zevra Agent session id when the answer came from an autonomous agent.
         // Lets the UI fetch and display the executed tool-call trace.
         // Null for all other decision types.
-        String agentSessionId
+        String agentSessionId,
+        // Generalized, optional decomposition of what Zevra actually produced while answering —
+        // understanding, findings, evidence, metrics, recommendations, and a normalized
+        // investigation/execution trail. Shared by every execution path (direct chat, Zevra
+        // Agent, future workflows); null when nothing meaningful was produced to report (e.g.
+        // a knowledge-gap acknowledgement). See ResponseArtifactsBuilder — nothing here is
+        // fabricated to fill a UI section.
+        ResponseArtifacts artifacts
 ) {}

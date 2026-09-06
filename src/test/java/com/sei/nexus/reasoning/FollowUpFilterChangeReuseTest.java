@@ -93,7 +93,7 @@ class FollowUpFilterChangeReuseTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 executedRequests.add(r);
@@ -111,12 +111,15 @@ class FollowUpFilterChangeReuseTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         String question = "I want only submitted";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-q2", "user@test.com",
-                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution);
+                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution, null);
 
         // ── 3. Planner invoked for the filtered follow-up ────────────────────────────────
         assertEquals(1, plannerCalls.get(), "Planner must be invoked when the follow-up requires a different result set");
@@ -165,7 +168,7 @@ class FollowUpFilterChangeReuseTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 executedRequests.add(r);
@@ -181,12 +184,15 @@ class FollowUpFilterChangeReuseTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         String question = "How many purchase orders are there?";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-q2", "user@test.com",
-                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution);
+                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution, null);
 
         assertEquals(0, plannerCalls.get(), "a genuinely answerable follow-up must still reuse evidence, not re-plan");
         assertEquals(0, executedRequests.size());
@@ -226,7 +232,7 @@ class FollowUpFilterChangeReuseTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 List<Map<String, Object>> rows = List.of(Map.of("po_number", "PO-1011", "status", "closed"));
@@ -243,12 +249,15 @@ class FollowUpFilterChangeReuseTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         String question = "What about the closed ones?";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-q2", "user@test.com",
-                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution);
+                false, null, null, false, "conv-test", "exec-q1-pos", priorExecution, null);
 
         assertEquals(1, plannerCalls.get());
         assertEquals(1, result.queryData().size(),

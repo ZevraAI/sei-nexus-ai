@@ -63,7 +63,10 @@ class ReasoningEngineEvidenceReuseObservabilityTest {
             @Override public void saveStep(ReasoningStep step) { }
         };
         return new ReasoningEngine(planner, evaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, runtime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, runtime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
     }
 
     private String lastMessage() {
@@ -86,14 +89,14 @@ class ReasoningEngineEvidenceReuseObservabilityTest {
                 throw new AssertionError("planner must not be invoked when evidence is reused");
             }
         };
-        GovernedSqlRuntime runtime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime runtime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override public Outcome execute(Request r) { throw new AssertionError("must not execute"); }
         };
 
         engineWith(evaluator, planner, runtime).reason(
                 "SECRET_USER_QUESTION_TEXT", "SECRET_USER_QUESTION_TEXT", "rsession", "schema",
                 "run-1", "user@test.com", false, null, null, false,
-                "conv-observability-test", "exec-q1-pos", priorExecution());
+                "conv-observability-test", "exec-q1-pos", priorExecution(), null);
 
         String logged = lastMessage();
         assertTrue(logged.contains("conversationId=conv-observability-test"));
@@ -121,7 +124,7 @@ class ReasoningEngineEvidenceReuseObservabilityTest {
                 return null;
             }
         };
-        GovernedSqlRuntime runtime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime runtime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override public Outcome execute(Request r) {
                 return new Outcome(Status.EXECUTED, null, null,
                         List.of(Map.of("po_number", "PO-1010")),
@@ -132,7 +135,7 @@ class ReasoningEngineEvidenceReuseObservabilityTest {
         engineWith(evaluator, planner, runtime).reason(
                 "I want only submitted", "I want only submitted", "rsession", "schema",
                 "run-2", "user@test.com", false, null, null, false,
-                "conv-observability-test", "exec-q1-pos", priorExecution());
+                "conv-observability-test", "exec-q1-pos", priorExecution(), null);
 
         String logged = lastMessage();
         assertTrue(logged.contains("decision=NEED_MORE_DATA"));

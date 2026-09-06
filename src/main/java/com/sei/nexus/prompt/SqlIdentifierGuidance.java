@@ -45,5 +45,10 @@ public final class SqlIdentifierGuidance {
             + "a conventional variant like quantity_on_hand.\n"
             + "• Use only the tables and columns listed in the schema. If a column you need is not listed, "
             + "do not invent one — state that the schema does not contain the requested field instead of "
-            + "guessing.";
+            + "guessing.\n"
+            + "• Never assume a table has a column under a conventional name — e.g. quantity, amount, date, "
+            + "status, id, name — merely because that name is common for the concept you need. This applies "
+            + "even when the table itself is known to be relevant: a table whose column list is missing "
+            + "entirely, or marked as omitted for space, gives you NO column names to use — not even "
+            + "conventional ones. Only a column physically listed for that table is ever valid.";
 }

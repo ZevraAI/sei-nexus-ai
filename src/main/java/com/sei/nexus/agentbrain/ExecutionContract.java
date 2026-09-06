@@ -30,4 +30,37 @@ public record ExecutionContract(
     public boolean isEmpty() {
         return executionBindings.approvedAssets().isEmpty();
     }
+
+    /**
+     * Physical columns known for each table this connection resolves — a purely structural
+     * projection of {@link #semanticView}'s object→attribute association through {@link
+     * #executionBindings}, computed here (not by the Runtime) so the Runtime's column-existence
+     * gate (defense-in-depth) never reads {@link #semanticView} itself: it consumes only this
+     * table→columns map, the same physical-identifier vocabulary {@link ExecutionBindings}
+     * already speaks. This keeps the Runtime deterministic and unaware of business meaning,
+     * exactly as {@link SemanticView}'s own javadoc requires ("the Runtime never reads it").
+     *
+     * @return lower-cased bare table name → lower-cased column names, restricted to objects
+     *         bound to {@code connectionKey}.
+     */
+    public java.util.Map<String, java.util.Set<String>> columnsByTable(String connectionKey) {
+        java.util.Map<String, java.util.Set<String>> byTable = new java.util.LinkedHashMap<>();
+        for (com.sei.nexus.semanticmodel.BusinessObject object : semanticView.businessObjects()) {
+            ExecutionBindings.ExecutionTarget objectTarget =
+                    executionBindings.objectBindings().get(object.objectKey());
+            if (objectTarget == null || objectTarget.table() == null) continue;
+            if (connectionKey != null && !connectionKey.equals(objectTarget.connectionKey())) continue;
+
+            String tableKey = objectTarget.table().toLowerCase(java.util.Locale.ROOT);
+            java.util.Set<String> columns = byTable.computeIfAbsent(tableKey, k -> new java.util.HashSet<>());
+            for (com.sei.nexus.semanticmodel.BusinessAttribute attribute : object.attributes()) {
+                ExecutionBindings.ExecutionTarget attrTarget =
+                        executionBindings.attributeBindings().get(attribute.attributeKey());
+                if (attrTarget != null && attrTarget.column() != null) {
+                    columns.add(attrTarget.column().toLowerCase(java.util.Locale.ROOT));
+                }
+            }
+        }
+        return byTable;
+    }
 }

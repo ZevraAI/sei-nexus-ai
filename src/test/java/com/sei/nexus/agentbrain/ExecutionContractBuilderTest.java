@@ -4,6 +4,7 @@ import com.sei.nexus.semanticmodel.BusinessAttribute;
 import com.sei.nexus.semanticmodel.BusinessObject;
 import com.sei.nexus.semanticmodel.PhysicalColumn;
 import com.sei.nexus.semanticmodel.PhysicalTable;
+import com.sei.nexus.semanticmodel.SemanticModel;
 import com.sei.nexus.semanticmodel.AttributeRole;
 import com.sei.nexus.sql.SqlTableReferenceExtractor;
 import org.junit.jupiter.api.Test;
@@ -83,5 +84,98 @@ class ExecutionContractBuilderTest {
                 builder.compile(model("q one")).semanticHash(),
                 builder.compile(model("a different question")).semanticHash(),
                 "hash is over the agent and its approved surface, not the question or contractId");
+    }
+
+    // ── Execution-authorization scope, kept separate from prompt content (the regression fix:
+    //     Concept-Scoped Metadata Narrowing must control prompt rendering only, never execution
+    //     authorization) ─────────────────────────────────────────────────────────────────────
+
+    private static BusinessObject purchaseOrders() {
+        return new BusinessObject("obj-po", "Purchase Orders", "orders",
+                List.of(new BusinessAttribute("col-po-id", "Id", AttributeRole.IDENTIFIER)), List.of());
+    }
+
+    @Test
+    void executionScopeExtendsApprovedAssetsBeyondTheNarrowedPromptSelection() {
+        // "objects" (prompt content) contains ONLY inventory — e.g. what Concept-Scoped
+        // Narrowing selected for this question's rendering. "executionScope" is the full,
+        // connection-scoped catalog, which ALSO includes purchase_orders — an object the
+        // narrowed prompt selection never mentioned.
+        SemanticModel fullConnectionCatalog = new SemanticModel(
+                List.of(inventory(), purchaseOrders()),
+                Map.of("obj-inv", new PhysicalTable("conn-1", "retail_core", "inventory_balances"),
+                       "obj-po",  new PhysicalTable("conn-1", "retail_core", "purchase_orders")),
+                Map.of("col-onhand", new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "on_hand_qty"),
+                       "col-id",     new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "id"),
+                       "col-po-id",  new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id")));
+
+        ResolvedBusinessModel narrowedWithFullExecutionScope = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "how much stock do we have?",
+                List.of(inventory()),
+                Map.of("obj-inv", new PhysicalTable("conn-1", "retail_core", "inventory_balances")),
+                Map.of("col-onhand", new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "on_hand_qty"),
+                       "col-id",     new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "id")),
+                null, Map.of(), true, java.util.Optional.empty(),
+                java.util.Optional.of(fullConnectionCatalog));
+
+        ExecutionContract c = builder.compile(narrowedWithFullExecutionScope);
+
+        // Prompt content (SemanticView) stays exactly the narrowed selection — unchanged.
+        assertEquals(1, c.semanticView().businessObjects().size(),
+                "prompt rendering must still reflect only the narrowed (concept-scoped) selection");
+        assertEquals("Inventory Balance", c.semanticView().businessObjects().get(0).businessName());
+
+        // Execution authorization is NOT narrowed — purchase_orders, present only in
+        // executionScope (never in the narrowed prompt selection), is still approved.
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"),
+                "an object outside the narrowed prompt selection, but present in the full "
+                        + "connection-scoped executionScope, must remain executable");
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.INVENTORY_BALANCES"),
+                "the narrowed object itself remains approved too");
+        assertEquals("purchase_orders", c.executionBindings().objectBindings().get("obj-po").table(),
+                "objectBindings carries the union — GovernedSqlRuntime's 'Approved tables' listing "
+                        + "must be able to name this object too, not just the narrowed set");
+    }
+
+    @Test
+    void emptyNarrowedSelectionWithNonEmptyExecutionScopeStillApprovesTheExecutionScopeObjects() {
+        // The exact regression scenario: Concept-Scoped Narrowing legitimately selected ZERO
+        // objects for this question's prompt (a real, honest "nothing relevant to render"
+        // outcome), but the connection has real, approved business data. Execution authorization
+        // must reflect that real data, not the empty narrowed selection.
+        SemanticModel fullConnectionCatalog = new SemanticModel(
+                List.of(purchaseOrders()),
+                Map.of("obj-po", new PhysicalTable("conn-1", "retail_core", "purchase_orders")),
+                Map.of("col-po-id", new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id")));
+
+        ResolvedBusinessModel emptyNarrowedModel = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "show me all open purchase orders",
+                List.of(), Map.of(), Map.of(),
+                null, Map.of(), true, java.util.Optional.empty(),
+                java.util.Optional.of(fullConnectionCatalog));
+
+        ExecutionContract c = builder.compile(emptyNarrowedModel);
+
+        assertTrue(c.semanticView().businessObjects().isEmpty(),
+                "prompt content is legitimately empty — narrowing found nothing to render");
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"),
+                "THE FIX: execution authorization must not collapse to empty merely because "
+                        + "narrowing rendered nothing for this question's initial prompt");
+        assertFalse(c.executionBindings().approvedAssets().isEmpty(),
+                "approvedAssets must not be [] when the connection has real, approved business data");
+    }
+
+    @Test
+    void absentExecutionScopeFallsBackToObjectsExactlyAsBeforeThisFieldExisted() {
+        // Backward compatibility: every pre-existing caller (executionScope absent) must compile
+        // byte-identically to before this field existed — proven by reusing the pre-existing
+        // model(...) helper and its pre-existing assertions in
+        // compilesSemanticViewExecutionBindingsAndApprovedAssets above; this test only pins that
+        // no *extra* approvedAssets leak in from nowhere when executionScope is genuinely absent.
+        ExecutionContract c = builder.compile(model("how many inventory balances"));
+
+        assertEquals(1, c.executionBindings().objectBindings().size(),
+                "with no executionScope, objectBindings must contain exactly the narrowed set — "
+                        + "nothing extra");
     }
 }

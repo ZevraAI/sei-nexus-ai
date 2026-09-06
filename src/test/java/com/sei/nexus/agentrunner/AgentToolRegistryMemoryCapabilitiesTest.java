@@ -167,7 +167,8 @@ class AgentToolRegistryMemoryCapabilitiesTest {
         graphRepo = new FakeKnowledgeGraphRepository();
 
         GovernedSqlRuntime runtime = new GovernedSqlRuntime(pipeline, dynamicSql, new FakeAudit(),
-                EXTRACTOR, new ForbiddenExecutionRepo(), null, execRefRepo, new ObjectMapper());
+                EXTRACTOR, new com.sei.nexus.sql.SqlColumnReferenceExtractor(),
+                new ForbiddenExecutionRepo(), null, execRefRepo, new ObjectMapper());
 
         ConversationMemoryService memoryService = new ConversationMemoryService(rosterRepo);
         BusinessWorldToolAdapter businessWorldAdapter = new BusinessWorldToolAdapter(enterpriseRepo);

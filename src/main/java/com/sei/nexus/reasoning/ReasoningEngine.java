@@ -2,6 +2,7 @@ package com.sei.nexus.reasoning;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sei.nexus.agentbrain.ExecutionContract;
 import com.sei.nexus.common.Keys;
 import com.sei.nexus.runtime.ExecutionReference;
 import com.sei.nexus.runtime.GovernedSqlRuntime;
@@ -41,19 +42,22 @@ public class ReasoningEngine {
     private final ReasoningRepository      reasoningRepository;
     private final GovernedSqlRuntime       runtime;
     private final ObjectMapper             objectMapper;
+    private final ColumnMetadataRequestHandler metadataRequestHandler;
 
     public ReasoningEngine(ReasoningPlanner planner,
                            ReasoningEvaluator evaluator,
                            ReasoningEventBus eventBus,
                            ReasoningRepository reasoningRepository,
                            GovernedSqlRuntime runtime,
-                           ObjectMapper objectMapper) {
+                           ObjectMapper objectMapper,
+                           ColumnMetadataRequestHandler metadataRequestHandler) {
         this.planner               = planner;
         this.evaluator             = evaluator;
         this.eventBus              = eventBus;
         this.reasoningRepository   = reasoningRepository;
         this.runtime               = runtime;
         this.objectMapper          = objectMapper;
+        this.metadataRequestHandler = metadataRequestHandler;
     }
 
     /**
@@ -61,6 +65,14 @@ public class ReasoningEngine {
      *
      * @param evidence          All step evidence accumulated.
      * @param queryData         Rows from the most productive step (for frontend visualisation).
+     * @param investigationDatasets Every row-bearing step's own rows, preserved independently and
+     *                          in step order — mechanically derived from {@code evidence}, never
+     *                          filtered by {@code evaluatorDecision}, never merged, never ranked
+     *                          against each other. Distinct from {@code queryData} above: that
+     *                          field remains the single last-SUFFICIENT-step selection (unchanged,
+     *                          kept for backward compatibility); this field is the complete set of
+     *                          successful business-data results the investigation produced. See
+     *                          {@link InvestigationDataset}.
      * @param resultSnapshot    JSON of the last sync result (for conversation memory).
      * @param crossSource       True when data from more than one database was used.
      * @param validatedBindings Literal bindings the planner declared that passed
@@ -71,6 +83,7 @@ public class ReasoningEngine {
     public record ReasoningResult(
             EvidenceStore          evidence,
             List<Map<String, Object>> queryData,
+            List<InvestigationDataset> investigationDatasets,
             String                 resultSnapshot,
             boolean                crossSource,
             List<ValidatedBinding> validatedBindings,
@@ -101,6 +114,15 @@ public class ReasoningEngine {
      *                       whether it already answers THIS question before any planning
      *                       happens. Planner never sees whether evidence was seeded or
      *                       produced by this loop — it only ever sees an EvidenceStore.
+     * @param resolvedObjects The run's compiled {@link ExecutionContract} — always the full,
+     *                        already-resolved object set, independent of {@code
+     *                        enforceContractGate}/{@code contract} (which may be {@code null}
+     *                        under the "off" gate migration mode). Used exclusively to validate
+     *                        and resolve Missing-Column Metadata Requests (see {@link
+     *                        ColumnMetadataRequestHandler}) — never for gating/enforcement,
+     *                        which remains entirely governed by {@code contract} as before this
+     *                        parameter existed. {@code null} degrades every metadata request to a
+     *                        rejection (nothing to validate against), never a guess.
      */
     public ReasoningResult reason(String question, String enrichedQ, String sessionKey,
                                   String schemaCtx, String runKey, String userEmail,
@@ -109,7 +131,8 @@ public class ReasoningEngine {
                                   com.sei.nexus.agentbrain.ExecutionContract contract,
                                   boolean enforceContractGate,
                                   String conversationId, String parentExecutionId,
-                                  ExecutionReference priorExecution) {
+                                  ExecutionReference priorExecution,
+                                  ExecutionContract resolvedObjects) {
 
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
@@ -177,13 +200,58 @@ public class ReasoningEngine {
             if (plan.isClarification()) {
                 log.info("Planner requests clarification at step {} for run '{}': {}",
                         stepNo, runKey, plan.clarificationQuestion());
-                evidence.add(stepNo, plan.description(), "", "", List.of(), plan.rationale(),
+                evidence.addOutcome(stepNo, plan.description(), "", "", plan.rationale(),
                         "CLARIFICATION_NEEDED", plan.clarificationQuestion(), 0L);
                 saveStep(sessionKey, stepNo, plan, "CLARIFICATION_NEEDED", plan.clarificationQuestion(),
                         evidence, List.of(), null);
                 eventBus.publish(runKey, "step_blocked",
                         Map.of("stepNo", stepNo, "reason", plan.clarificationQuestion()));
                 break;
+            }
+
+            // Missing-Column Metadata Request: the planner already knows this object is relevant
+            // (it named it from "Approved schema") but was not shown its columns — see
+            // ReasoningPlanner's SYSTEM_PROMPT. Java's only role is to validate the requested
+            // object against the resolved object set and, on a match, retrieve its authoritative
+            // columns — never to search, rank, or guess on the planner's behalf. Re-plannable,
+            // like UNAPPROVED_OBJECTS: consumes one step of the existing MAX_STEPS budget so this
+            // cannot loop indefinitely, then the next planner call sees the outcome (columns, or
+            // a rejection) and continues.
+            if (plan.isMetadataRequest()) {
+                ReasoningPlanner.MetadataRequest req = plan.metadataRequest();
+                Optional<String> columns = metadataRequestHandler.resolveColumns(resolvedObjects, req.object());
+                String decision;
+                String detail;
+                if (columns.isPresent()) {
+                    schemaCtx = schemaCtx + "\n\nRequested column metadata for \"" + req.object() + "\":\n"
+                            + columns.get();
+                    decision = "METADATA_RETRIEVED";
+                    // Mechanical count of this object's own rendered column bullets (PromptAssembler's
+                    // fixed "    • `col`" format) — not a semantic reading of the columns, purely a
+                    // count of how many bullet lines Java's own renderer produced, for a clearer
+                    // evidence label than a bare "retrieved" with no size indication.
+                    int columnCount = countOccurrences(columns.get(), "    • `");
+                    detail = columnCount > 0
+                            ? "Retrieved " + columnCount + " column(s) of metadata for '" + req.object() + "'."
+                            : "Retrieved metadata for '" + req.object() + "' (no columns on record).";
+                    log.info("Step {} retrieved metadata for object '{}' (run '{}')", stepNo, req.object(), runKey);
+                } else {
+                    decision = "METADATA_UNAVAILABLE";
+                    detail   = "'" + req.object() + "' does not exist in Zevra's enterprise metadata "
+                            + "for this investigation's approved connections — metadata request rejected. "
+                            + "Re-check the exact table name or business name shown for the intended "
+                            + "object under \"Approved schema\" and retry with that exact identity — "
+                            + "not a Knowledge Graph entity or concept label.";
+                    log.info("Step {} metadata request for object '{}' rejected — not found in the "
+                            + "resolved scope or the enterprise metadata catalog (run '{}')",
+                            stepNo, req.object(), runKey);
+                }
+                evidence.addMetadataStep(stepNo, plan.description(), plan.rationale(), decision, detail);
+                saveStep(sessionKey, stepNo, plan, decision, detail, evidence, List.of(), null);
+                eventBus.publish(runKey, "step_metadata_request",
+                        Map.of("stepNo", stepNo, "object", req.object(), "decision", decision));
+                stepNo++;
+                continue;
             }
 
             log.info("Reasoning step {}/{} for run '{}': {}", stepNo, MAX_STEPS, runKey, plan.description());
@@ -221,13 +289,28 @@ public class ReasoningEngine {
                 String reason = "Query references table(s) not in the approved execution contract: "
                         + ro.unapprovedTables() + ". Approved tables: [" + ro.approvedTables() + "].";
                 log.info("Step {} gated for run '{}': {}", stepNo, runKey, reason);
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "UNAPPROVED_OBJECTS", reason, 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "UNAPPROVED_OBJECTS", reason, 0L);
                 saveStep(sessionKey, stepNo, plan, "UNAPPROVED_OBJECTS", reason,
                         evidence, List.of(), null);
                 eventBus.publish(runKey, "step_error", Map.of("stepNo", stepNo, "reason", reason));
                 stepNo++;
                 continue;   // the planner sees the approved list and re-plans
+            }
+
+            // Column-existence gate (defense-in-depth) — a referenced column does not exist on
+            // its table. Same re-plannable treatment as UNAPPROVED_OBJECTS: a deterministic,
+            // physical observation, never a fatal fault — the planner sees the exact invalid
+            // reference(s) and can re-plan (e.g. via a metadata request, or by using a column it
+            // already has) rather than the query reaching the database and failing there.
+            if (ro.status() == GovernedSqlRuntime.Status.INVALID_COLUMNS) {
+                log.info("Step {} gated for run '{}': {}", stepNo, runKey, ro.message());
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "INVALID_COLUMNS", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "INVALID_COLUMNS", ro.message(), evidence, List.of(), null);
+                eventBus.publish(runKey, "step_error", Map.of("stepNo", stepNo, "reason", ro.message()));
+                stepNo++;
+                continue;   // the planner sees which column(s) were invalid and re-plans
             }
 
             // Shadow mode: the gate would have rejected this step but is not enforcing.
@@ -239,8 +322,8 @@ public class ReasoningEngine {
 
             // Literal hard block — a repeat violation on an authoritative domain.
             if (ro.status() == GovernedSqlRuntime.Status.LITERAL_BLOCKED) {
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "LITERAL_BLOCKED", ro.message(), 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "LITERAL_BLOCKED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "LITERAL_BLOCKED", ro.message(),
                         evidence, List.of(), null);
                 eventBus.publish(runKey, "step_blocked",
@@ -252,8 +335,8 @@ public class ReasoningEngine {
             // through this same loop as evidence for one bounded re-plan.
             if (ro.status() == GovernedSqlRuntime.Status.LITERAL_REJECTED) {
                 log.info("Step {} literal-rejected for run '{}': {}", stepNo, runKey, ro.message());
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "LITERAL_REJECTED", ro.message(), 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "LITERAL_REJECTED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "LITERAL_REJECTED", ro.message(),
                         evidence, List.of(), null);
                 eventBus.publish(runKey, "step_error",
@@ -264,8 +347,8 @@ public class ReasoningEngine {
 
             // Governance BLOCK (safety / allow-list / joins) — not audited today.
             if (ro.status() == GovernedSqlRuntime.Status.GOVERNANCE_BLOCKED) {
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "BLOCKED", ro.message(), 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "BLOCKED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "BLOCKED", ro.message(), evidence, List.of(), null);
                 eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", ro.message()));
                 break;
@@ -279,8 +362,8 @@ public class ReasoningEngine {
 
             // Contract BLOCK — already audited (blocked=true) by the runtime.
             if (ro.status() == GovernedSqlRuntime.Status.CONTRACT_BLOCKED) {
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "CONTRACT_BLOCKED", ro.message(), 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "CONTRACT_BLOCKED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "CONTRACT_BLOCKED", ro.message(),
                         evidence, List.of(), null);
                 eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", ro.message()));
@@ -290,8 +373,8 @@ public class ReasoningEngine {
             // Execution failed — already audited by the runtime.
             if (ro.status() == GovernedSqlRuntime.Status.FAILED) {
                 log.error("Step {} execution failed: {}", stepNo, ro.message(), ro.failure());
-                evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                        List.of(), plan.rationale(), "ERROR", ro.message(), 0L);
+                evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
+                        plan.rationale(), "ERROR", ro.message(), 0L);
                 break;
             }
 
@@ -335,13 +418,17 @@ public class ReasoningEngine {
             stepNo++;
         }
 
-        // Choose the rows for frontend visualisation. The step that concluded the
-        // investigation (marked SUFFICIENT) is the answer and wins outright — even a
-        // single-row SUFFICIENT step must be shown over an earlier lookup step that
-        // ties or exceeds it in row count (e.g. a Step 1 ID lookup vs. a Step 2 answer,
-        // both returning exactly one row). Only when no step was marked SUFFICIENT
-        // (the loop trailed off without a conclusive step) does this fall back to the
-        // prior heuristic: the most rows returned by any step.
+        // LEGACY COMPATIBILITY PATH — NOT the authoritative UI-content mechanism. This is the
+        // pre-existing single-dataset selection heuristic (last-SUFFICIENT-step, else most rows),
+        // kept ONLY so ChatResponse.queryData (and its existing consumers: the frontend's
+        // DataTable/DataViz/SuggestedQuestions, ScheduledReportService/ReportHtmlComposer) keep
+        // working unchanged. It is exactly the kind of Java-side semantic dataset selection the
+        // sections-based contract exists to replace — see StructuredAnswer.Section /
+        // ChatService#resolveSections, which is the authoritative mechanism going forward and
+        // does NOT read this field or this method's selection logic at all; `investigationDatasets`
+        // below (every row-bearing step, unfiltered, unselected) is what the sections contract
+        // is built from. Do not extend this heuristic further; do not let any new capability
+        // depend on it. Candidate for removal once the frontend migrates to rendering `sections`.
         List<Map<String, Object>> queryData = evidence.getSteps().stream()
                 .filter(s -> "SUFFICIENT".equals(s.evaluatorDecision()))
                 .reduce((first, last) -> last)
@@ -352,15 +439,41 @@ public class ReasoningEngine {
                         .map(s -> s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows())
                         .orElse(List.of()));
 
+        // Information-preservation fix: every row-bearing step, independent of the single
+        // "primary visualisation" selection above — mechanically copied from EvidenceStore, in
+        // step order, with no filtering by evaluatorDecision, no ranking, and no merging of one
+        // step's rows into another's. A step whose evaluator verdict was NEED_MORE_DATA is
+        // preserved here exactly like a SUFFICIENT step — its own query still succeeded (see
+        // EvidenceStore's outcome-vs-evaluatorDecision javadoc). Which of these datasets answers
+        // which part of the question remains entirely Agent Brain's concern; Java only stops
+        // discarding evidence it already has.
+        List<InvestigationDataset> investigationDatasets = evidence.getSteps().stream()
+                .filter(s -> !s.rows().isEmpty())
+                .map(s -> new InvestigationDataset(s.stepNo(), s.description(),
+                        s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows()))
+                .toList();
+
         // Update session with final stats
         boolean crossSource = evidence.connectionKeys().size() > 1;
         reasoningRepository.updateSessionStatus(sessionKey, "CONCLUDED", null, 0.8, Instant.now());
 
-        return new ReasoningResult(evidence, queryData, resultSnapshot, crossSource,
+        return new ReasoningResult(evidence, queryData, investigationDatasets, resultSnapshot, crossSource,
                 List.copyOf(validatedBindings), List.copyOf(shadowGateFindings));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /** Mechanical substring-occurrence count — used only to size the metadata-retrieved evidence
+     *  label from Java's own fixed rendering format, never to interpret column meaning. */
+    private static int countOccurrences(String text, String marker) {
+        if (text == null || marker.isEmpty()) return 0;
+        int count = 0, idx = 0;
+        while ((idx = text.indexOf(marker, idx)) != -1) {
+            count++;
+            idx += marker.length();
+        }
+        return count;
+    }
 
     /** Parses an ExecutionReference's resultJson back into rows for evidence seeding. */
     private List<Map<String, Object>> parseRows(String resultJson) {

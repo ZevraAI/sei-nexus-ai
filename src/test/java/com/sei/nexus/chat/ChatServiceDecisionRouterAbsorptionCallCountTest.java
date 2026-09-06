@@ -149,15 +149,22 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
     /** Reproduces exactly the shape a real investigation with no evidence produces — proves
      *  this test's fake never needs Planner/Evaluator/GovernedSqlRuntime to be real. */
     static class NoOpReasoningEngine extends ReasoningEngine {
-        NoOpReasoningEngine() { super(null, null, new ReasoningEventBus(new ObjectMapper()), null, null, new ObjectMapper()); }
+        NoOpReasoningEngine() {
+            super(null, null, new ReasoningEventBus(new ObjectMapper()), null, null, new ObjectMapper(),
+                    new com.sei.nexus.reasoning.ColumnMetadataRequestHandler(
+                            new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                            new com.sei.nexus.agentbrain.PromptAssembler(),
+                            new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
+        }
         @Override
         public ReasoningResult reason(String question, String enrichedQ, String sessionKey, String schemaCtx,
                                        String runKey, String userEmail, boolean forceAsync,
                                        Map<String, com.sei.nexus.semanticmodel.ColumnValueDomain> literalScope,
                                        com.sei.nexus.agentbrain.ExecutionContract contract, boolean enforceContractGate,
                                        String conversationId, String parentExecutionId,
-                                       ExecutionReference priorExecution) {
-            return new ReasoningResult(new EvidenceStore(), List.of(), null, false, List.of(), List.of());
+                                       ExecutionReference priorExecution,
+                                       com.sei.nexus.agentbrain.ExecutionContract resolvedObjects) {
+            return new ReasoningResult(new EvidenceStore(), List.of(), List.of(), null, false, List.of(), List.of());
         }
     }
 

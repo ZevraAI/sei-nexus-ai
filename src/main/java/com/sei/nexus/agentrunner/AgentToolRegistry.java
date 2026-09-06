@@ -137,12 +137,31 @@ public class AgentToolRegistry {
                         )),
                 tool("final_answer",
                         "Provide the complete final response once you have gathered sufficient information. " +
-                        "Call this when you have enough data to answer the user's request.",
+                        "Call this when you have enough data to answer the user's request. Beyond `answer`, " +
+                        "decompose your OWN reasoning into the optional semantic fields below when they " +
+                        "genuinely add something `answer` doesn't already say — never fill them merely " +
+                        "because they exist, and never repeat the same statement across two fields.",
                         Map.of(
                                 "type", "object",
-                                "properties", Map.of(
-                                        "answer", Map.of("type", "string",
-                                                "description", "The complete response, analysis, or recommendation")
+                                "properties", Map.ofEntries(
+                                        Map.entry("answer", Map.of("type", "string",
+                                                "description", "The complete response, analysis, or recommendation")),
+                                        Map.entry("understanding", Map.of("type", "string",
+                                                "description", "Your own paraphrase of what the evidence shows. "
+                                                        + "Omit if it would just restate `answer`.")),
+                                        Map.entry("key_findings", Map.of("type", "array", "items", Map.of("type", "string"),
+                                                "description", "Genuine, materially significant discoveries NOT "
+                                                        + "already fully stated in `answer`. Empty if none.")),
+                                        Map.entry("related_facts", Map.of("type", "array", "items", Map.of("type", "string"),
+                                                "description", "Additional context that helps explain the finding "
+                                                        + "(e.g. a caveat, what the data does/doesn't cover). Empty if none.")),
+                                        Map.entry("recommendation", Map.of("type", "string",
+                                                "description", "One sentence on what the business should consider "
+                                                        + "doing, grounded in the evidence you actually gathered. "
+                                                        + "Omit if none is warranted.")),
+                                        Map.entry("next_steps", Map.of("type", "array", "items", Map.of("type", "string"),
+                                                "description", "Concrete follow-up investigations specific to this "
+                                                        + "question — not generic filler. Empty if none apply."))
                                 ),
                                 "required", List.of("answer")
                         ))
@@ -336,6 +355,11 @@ public class AgentToolRegistry {
                             + connKey + "': " + outcome.unapprovedTables() + ". Approved physical tables: ["
                             + outcome.approvedTables() + "]. Use an approved business object, or state via "
                             + "final_answer that the requested data is not available.")));
+
+            case INVALID_COLUMNS -> plain(mapper.writeValueAsString(Map.of(
+                    "error", outcome.message() + " Use only the columns listed for that table in your "
+                            + "grounding — never a column from a different table, and never a conventional "
+                            + "name that is not actually listed.")));
 
             case GOVERNANCE_BLOCKED, CONTRACT_BLOCKED -> plain(mapper.writeValueAsString(Map.of(
                     "error", "Query rejected: " + outcome.message()

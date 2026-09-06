@@ -148,6 +148,20 @@ public class AgentBrain {
         }
         SemanticModel model = conceptScoped.orElseGet(() -> assembleByFallback(connectionKeys, domainKeys));
 
+        // Execution-authorization scope (kept separate from `model`/prompt rendering — see
+        // ResolvedBusinessModel#executionScope). Concept-Scoped Metadata Narrowing exists to
+        // reduce PROMPT content, never to redefine what is safe to execute — this class's own
+        // javadoc already states "ranking never narrows the approved surface." When narrowing
+        // actually ran (conceptScoped.isPresent()), executionScope is computed the SAME way this
+        // class already computes the object set whenever narrowing does NOT apply
+        // (assembleByFallback) — i.e. the full, deterministic, domain/connection-scoped catalog,
+        // entirely independent of which concepts the Stage-1 LLM call selected for THIS
+        // question's prompt. When narrowing did not apply at all, `model` already IS that full
+        // baseline, so no second, redundant assembly is performed.
+        SemanticModel executionScope = conceptScoped.isPresent()
+                ? assembleByFallback(connectionKeys, domainKeys)
+                : model;
+
         // Rank the resolved objects by relevance to the request (business reasoning) so
         // grounding leads with what the user most likely means — without narrowing the surface.
         // Canonical tokens from the resolutions join the keywords, so a resolved term selects
@@ -159,7 +173,8 @@ public class AgentBrain {
 
         return new ResolvedBusinessModel(agentId, connectionKeys, question,
                 ranked, model.objectTargets(), model.attributeTargets(),
-                resolution, literalScopeOf(resolution), conceptScoped.isPresent(), routingDecision);
+                resolution, literalScopeOf(resolution), conceptScoped.isPresent(), routingDecision,
+                Optional.of(executionScope));
     }
 
     // ── Business scope (owned here from Phase 3) ───────────────────────────────

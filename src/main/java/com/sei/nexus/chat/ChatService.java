@@ -1,8 +1,11 @@
 package com.sei.nexus.chat;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.agent.AgentPlaybook;
+import com.sei.nexus.artifacts.ResponseArtifacts;
+import com.sei.nexus.artifacts.ResponseArtifactsBuilder;
 import com.sei.nexus.agent.AgentRepository;
 import com.sei.nexus.agent.NexusAgent;
 import com.sei.nexus.ai.AzureOpenAiClient;
@@ -40,6 +43,7 @@ import com.sei.nexus.agentbrain.ExecutionContractBuilder;
 import com.sei.nexus.agentbrain.PromptAssembler;
 import com.sei.nexus.response.ExecutionOutcomeInterpreter;
 import com.sei.nexus.response.NaturalLanguageComposer;
+import com.sei.nexus.response.StructuredAnswer;
 import com.sei.nexus.agentbrain.PromptContext;
 import com.sei.nexus.agentbrain.PromptContextBuilder;
 import com.sei.nexus.agentbrain.ResolvedBusinessModel;
@@ -346,10 +350,18 @@ public class ChatService {
                 OrchestratorDecision decision = new OrchestratorDecision(
                         "ZEVRA_AGENT", requestAnalysis.intentType().name(), "LIVE_DATA",
                         true, false, false);
+                List<Map<String, Object>> agentSteps = agentReasoningSteps(session.stepsJson());
+                StructuredAnswer agentSemantics = extractAgentSemantics(session.stepsJson(), answer);
+                // The Zevra Agent path uses its own ReAct loop (AgentRunner), not ReasoningEngine —
+                // it has no EvidenceStore/InvestigationDataset to preserve; empty, never null.
+                ResponseArtifacts artifacts = ResponseArtifactsBuilder.build(raw, answer, agentSteps,
+                        agentRows, List.of(), List.of(), new ResponseArtifacts.AgentContext(
+                                za.slug(), za.name(), session.id(), session.iterationsUsed()),
+                        agentSemantics);
                 return new ChatResponse(conversationId, runKey, answer, List.of(), decision,
                         za.slug(), za.name(), null, 0.9, false, "",
-                        List.of(), List.of(), agentRows, agentReasoningSteps(session.stepsJson()), List.of(),
-                        session.id());
+                        List.of(), List.of(), agentRows, List.of(), agentSteps, List.of(),
+                        session.id(), artifacts);
             } catch (Exception e) {
                 log.warn("ZevraAgent '{}' failed, falling through to normal chat: {}",
                         za.name(), e.getMessage());
@@ -534,8 +546,21 @@ public class ChatService {
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
+            // The model's own semantic decomposition of `answer` (see composeAnswer) — null for
+            // every decision type except QUERY_LIVE_DATA/HYBRID_DOC_AND_DATA/ANSWER_FROM_PRIOR_RESULTS
+            // with real rows, where structured composition actually ran. ResponseArtifactsBuilder
+            // treats null as "no LLM semantics available" and falls back to its legacy heuristic.
+            StructuredAnswer llmSemantics = null;
             List<Map<String, Object>> asyncOps        = new ArrayList<>();
             List<Map<String, Object>> queryData        = new ArrayList<>();
+            // Every row-bearing investigation step's own rows, preserved independently — see
+            // ReasoningEngine.ReasoningResult#investigationDatasets. Empty for every decision type
+            // that doesn't run the reasoning loop (nothing to preserve), never null.
+            List<com.sei.nexus.reasoning.InvestigationDataset> investigationDatasets = List.of();
+            // The model's UI-content plan, resolved against `investigationDatasets` above (see
+            // ChatService#resolveSections) — empty for every decision type that doesn't run
+            // composeAnswer's sections-based contract, never null.
+            List<ResponseArtifacts.Section> resolvedSections = List.of();
             List<Map<String, Object>> reasoningSteps   = new ArrayList<>();
             // May now always be empty: LearningContextBuilder no longer injects Postgres-mapping
             // vocabulary (that reaches the LLM exclusively via File Search over the tenant's
@@ -681,7 +706,11 @@ public class ChatService {
                             raw, enrichedQuestion, sessionKey, schemaCtx, runKey, userEmail, forceAsync,
                             buildLiteralScope(resolved),
                             gateOff ? null : executionContract, gateEnforced,
-                            conversationId, parentExecutionId, prevExecution.orElse(null));
+                            conversationId, parentExecutionId, prevExecution.orElse(null),
+                            // Missing-Column Metadata Request validation always sees the full
+                            // resolved object set, independent of the gate migration mode above —
+                            // see ReasoningEngine#reason's resolvedObjects javadoc.
+                            executionContract);
                     reasoningEventBus.phaseCompleted(runKey, ProgressPhase.EXECUTION);
 
                     // Conversation Memory write-side (Phase 4): mechanical, post-execution
@@ -692,13 +721,21 @@ public class ChatService {
 
                     resultSnapshot = reasonResult.resultSnapshot();
                     queryData      = reasonResult.queryData();
+                    investigationDatasets = reasonResult.investigationDatasets();
 
                     // Convert EvidenceStore steps to the execResults format composeAnswer expects
                     List<Map<String, Object>> execResults = evidenceToExecResults(reasonResult.evidence());
 
                     reasoningEventBus.phaseStarted(runKey, ProgressPhase.REASONING);
-                    answer = composeAnswer(raw, attachmentSummary, execResults, memChunks, semCtx,
+                    StructuredAnswer composed = composeAnswer(raw, attachmentSummary, execResults,
+                            investigationDatasets, memChunks, semCtx,
                             findings, anomalyCtx, agent, "HYBRID_DOC_AND_DATA".equals(decisionType));
+                    answer = composed.answer();
+                    llmSemantics = composed;
+                    // The ONLY Java decision in this path: does a claimed "step-N" reference
+                    // exist? Never which dataset to reference, never whether to display it — see
+                    // resolveSections' javadoc.
+                    resolvedSections = resolveSections(composed.sections(), investigationDatasets, runKey);
                     reasoningEventBus.phaseCompleted(runKey, ProgressPhase.REASONING);
                     reasoningEventBus.phaseStarted(runKey, ProgressPhase.COMPOSITION);
 
@@ -768,6 +805,14 @@ public class ChatService {
                                 "sql",                s.sql()         != null ? s.sql()         : "",
                                 "rowCount",           s.rows().size(),
                                 "rowSummary",         s.rowSummary()          != null ? s.rowSummary()          : "",
+                                // This step's own result — successful query / metadata retrieval /
+                                // declined / rejected / failed — never blended with the separate
+                                // "should we keep investigating" signal below (Investigation-Step
+                                // Semantics; see EvidenceStore's outcome-vs-evaluatorDecision javadoc).
+                                "outcome",             s.outcome()             != null ? s.outcome()             : "",
+                                // The evaluator's verdict on OVERALL accumulated sufficiency — present
+                                // only for a step actually evaluated; the reason for the NEXT action,
+                                // not this step's own success/failure.
                                 "evaluatorDecision",  s.evaluatorDecision()   != null ? s.evaluatorDecision()   : "",
                                 "evaluatorRationale", s.evaluatorRationale()  != null ? s.evaluatorRationale()  : "",
                                 "executionMs",        s.executionMs()));
@@ -807,8 +852,9 @@ public class ChatService {
             List<Map<String, Object>> quickRefs = buildQuickRefinements(decisionType, raw);
             return buildResponse(conversationId, runKey, answer, decisionType,
                     agent, routingConfidence, "KNOWLEDGE_GAP".equals(decisionType),
-                    quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied,
-                    requestAnalysis.intentType());
+                    quickRefs, asyncOps, queryData, investigationDatasetsToMaps(investigationDatasets),
+                    reasoningSteps, learningsApplied, requestAnalysis.intentType(), llmSemantics,
+                    resolvedSections);
 
         } catch (Exception e) {
             // The raw exception (SQL, table names, driver detail) is kept for operators only —
@@ -1164,23 +1210,67 @@ public class ChatService {
                 "Unable to retrieve answer from memory at this time."));
     }
 
-    private String composeAnswer(String question, String attachmentSummary,
+    /**
+     * Produces the answer and, when there is real evidence to reason about (rows genuinely
+     * returned), asks the SAME LLM call to also decompose its own answer into semantic roles
+     * (understanding / key findings / related facts / recommendation / next steps) — see
+     * {@link #DATA_ANSWER_JSON_SYSTEM_PROMPT}. No second LLM call: this is the existing
+     * answer-composition call switched from TEXT to JSON mode for this one outcome.
+     *
+     * <p>The four non-data outcomes (error / blocked / clarification / zero rows) stay in TEXT
+     * mode — there is no evidence for the model to find "key findings" or "related facts" in an
+     * error message, so asking for structured decomposition there would only invite it to
+     * invent content to fill the schema. Those cases return {@link StructuredAnswer#plain},
+     * which downstream ({@code ResponseArtifactsBuilder}) means no fabricated semantics — an
+     * honest empty state, not a heuristic pretending to be one.
+     */
+    /**
+     * Renders every row-bearing investigation dataset with explicit boundaries — a {@code
+     * Dataset: step-N} identifier, its description (verbatim from the planner's own step
+     * description), and (via {@link ExecutionOutcomeInterpreter#summarizeRows}) its columns and
+     * actual values. This is what lets the composition LLM tell which stats belong to which
+     * investigation step, and reference a step back by its exact {@code step-N} identifier (see
+     * {@code StructuredAnswer.Section#datasetRef} / {@link #resolveSections}).
+     *
+     * <p>Package-private static seam: a pure function of its inputs. Every dataset is included,
+     * unconditionally, in step order — no selection, ranking, or filtering by row count,
+     * evaluator status, or any other signal happens here.
+     */
+    static String buildInvestigationDatasetsBlock(
+            List<com.sei.nexus.reasoning.InvestigationDataset> investigationDatasets,
+            ExecutionOutcomeInterpreter outcomeInterpreter) {
+        if (investigationDatasets == null || investigationDatasets.isEmpty()) return "";
+        StringBuilder ctx = new StringBuilder("INVESTIGATION DATASETS\n\n");
+        for (com.sei.nexus.reasoning.InvestigationDataset ds : investigationDatasets) {
+            ctx.append("Dataset: step-").append(ds.stepNo()).append("\n");
+            ctx.append("Description: ").append(ds.description() != null ? ds.description() : "").append("\n");
+            ctx.append(outcomeInterpreter.summarizeRows(ds.rows()));
+            ctx.append("\n");
+        }
+        return ctx.toString();
+    }
+
+    private StructuredAnswer composeAnswer(String question, String attachmentSummary,
             List<Map<String, Object>> execResults,
+            List<com.sei.nexus.reasoning.InvestigationDataset> investigationDatasets,
             List<DocumentChunk> memChunks, String semCtx, List<OperationalFinding> findings,
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
             StringBuilder ctx = new StringBuilder();
 
-            boolean anyRows          = false;
+            boolean anyRows          = investigationDatasets != null && !investigationDatasets.isEmpty();
             boolean anyError         = false;
             boolean anyBlocked       = false;
             boolean anyClarification = false;
 
+            if (anyRows) {
+                ctx.append(buildInvestigationDatasetsBlock(investigationDatasets, outcomeInterpreter));
+            }
+
             for (Map<String, Object> r : execResults) {
                 if (r.containsKey("rows")) {
-                    @SuppressWarnings("unchecked")
-                    List<Map<String, Object>> rows = (List<Map<String, Object>>) r.get("rows");
-                    ctx.append(outcomeInterpreter.summarizeRows(rows));
-                    if (!rows.isEmpty()) anyRows = true;
+                    // Already rendered above, per-dataset, with explicit boundaries — skip here
+                    // to avoid rendering the same step's rows twice.
+                    continue;
                 } else if (r.containsKey("error")) {
                     ctx.append("Query error: ").append(r.get("error")).append("\n");
                     anyError = true;
@@ -1218,8 +1308,146 @@ public class ChatService {
             // Presentation policy (system prompt) and evidence context are chat's; only the
             // model call + failure handling are delegated to the shared composer.
             String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification);
-            return nlComposer.compose(
-                    NaturalLanguageComposer.CompositionRequest.text(prompt, systemPrompt, fallback));
+
+            if (!anyRows) {
+                // No evidence to decompose — TEXT mode, exactly as before this change.
+                return StructuredAnswer.plain(nlComposer.compose(
+                        NaturalLanguageComposer.CompositionRequest.text(prompt, systemPrompt, fallback)));
+            }
+
+            // Real evidence exists — ask the SAME call for the model's own semantic decomposition
+            // instead of a second call. On any parse failure, degrade to plain text (never throw,
+            // never block the answer on the JSON shape being perfect).
+            String json = nlComposer.compose(
+                    NaturalLanguageComposer.CompositionRequest.json(prompt, DATA_ANSWER_JSON_SYSTEM_PROMPT, fallback));
+            return parseStructuredAnswer(json, objectMapper, fallback);
+    }
+
+    /**
+     * Parses the answer-composition JSON response into {@link StructuredAnswer}. Package-private
+     * static seam — pure function, no instance state — so contract tests can exercise it directly
+     * (this repo's convention; mirrors {@code ConceptScopedMetadataResolver.parseSelection}'s
+     * two-layer defense: a malformed/non-JSON response degrades to a plain-text answer rather
+     * than throwing or fabricating semantics).
+     */
+    static StructuredAnswer parseStructuredAnswer(String json, ObjectMapper mapper, String fallbackAnswer) {
+        try {
+            String extracted = extractJsonObject(json);
+            JsonNode node = mapper.readTree(extracted);
+            String answerText = node.path("answer").asText("");
+            String answer = answerText.isBlank() ? fallbackAnswer : answerText;
+
+            JsonNode sectionsNode = node.get("sections");
+            if (sectionsNode != null && sectionsNode.isArray() && !sectionsNode.isEmpty()) {
+                // The sections-based contract — the model's UI-content plan. Each entry parses
+                // straight into StructuredAnswer.Section (Jackson's global snake_case naming
+                // strategy maps "dataset_ref" -> datasetRef automatically); the legacy flat
+                // fields are then mechanically derived by StructuredAnswer.fromSections, never
+                // independently read from this JSON.
+                List<StructuredAnswer.Section> sections = new java.util.ArrayList<>();
+                for (JsonNode sectionNode : sectionsNode) {
+                    sections.add(mapper.treeToValue(sectionNode, StructuredAnswer.Section.class));
+                }
+                return StructuredAnswer.fromSections(answer, sections);
+            }
+
+            // Legacy shape — no `sections` in the response (an older/degraded model turn).
+            // Lenient JSON-shape handling, exactly as this parser has always tolerated a
+            // response missing optional fields; not a semantic fallback.
+            StructuredAnswer parsed = mapper.treeToValue(node, StructuredAnswer.class);
+            return new StructuredAnswer(answer, parsed.understanding(), parsed.keyFindings(),
+                    parsed.relatedFacts(), parsed.recommendation(), parsed.nextSteps());
+        } catch (Exception e) {
+            log.warn("Failed to parse structured answer; falling back to plain text: {}", e.getMessage());
+            return StructuredAnswer.plain(fallbackAnswer);
+        }
+    }
+
+    /**
+     * Resolves each {@code StructuredAnswer.Section}'s {@code datasetRefs} (a list of bare
+     * {@code step-N} strings, present on ANY section type that carries one — not only {@code
+     * DATASET}, e.g. a {@code HIGHLIGHT} grounding its narrative in the one or more datasets its
+     * facts actually come from) against this investigation's own preserved datasets — exact
+     * string match only, one reference at a time, nothing else. This is the ONLY thing Java
+     * decides in this path: whether each claimed reference exists. Which dataset(s) to
+     * reference, why, how many, and whether to display them were already decided by the model
+     * when it authored {@code sections} — Java does not determine that two referenced datasets
+     * are related to each other, does not inspect {@code content} to guess which datasets should
+     * have been referenced, and never validates that a narrative's stated values actually appear
+     * in the resolved rows (that remains entirely the model's responsibility).
+     *
+     * <p>A section any of whose {@code datasetRefs} does not exactly match a known {@code step-N}
+     * — including a step that exists in the investigation but has zero rows, since such a step
+     * was never included in {@code datasets} to begin with — is a model-contract defect: the
+     * ENTIRE section is dropped (narrative content included — an ungroundable claim is never
+     * shown half-verified), never partially accepted by resolving only the valid references, and
+     * never repaired by substituting another dataset, the largest dataset, {@code queryData}, or
+     * the last successful step. Logged loudly so the defect stays visible. A section with no
+     * {@code datasetRefs} at all needs no resolution and passes through unchanged — it never had
+     * a dataset to ground.
+     *
+     * <p>Package-private static seam: a pure function of its inputs (no {@code queryData}, no
+     * question text, no evaluator/row-count/step-order/column-name signal is even in scope here
+     * — {@code InvestigationDataset} itself carries none of that), no Spring/instance state, no
+     * ranking, no fuzzy matching, no fallback of any kind.
+     */
+    static List<ResponseArtifacts.Section> resolveSections(List<StructuredAnswer.Section> sections,
+            List<com.sei.nexus.reasoning.InvestigationDataset> datasets, String runKey) {
+        if (sections == null || sections.isEmpty()) return List.of();
+
+        Map<String, com.sei.nexus.reasoning.InvestigationDataset> byRef = new java.util.LinkedHashMap<>();
+        if (datasets != null) {
+            for (com.sei.nexus.reasoning.InvestigationDataset d : datasets) {
+                byRef.put("step-" + d.stepNo(), d);
+            }
+        }
+
+        List<ResponseArtifacts.Section> out = new java.util.ArrayList<>();
+        for (StructuredAnswer.Section s : sections) {
+            List<String> refs = s.datasetRefs();
+            if (refs == null || refs.isEmpty()) {
+                // No dataset(s) to ground — passes through unchanged, no resolution attempted.
+                out.add(new ResponseArtifacts.Section(s.type(), s.title(), s.purpose(), s.display(),
+                        s.items(), s.content(), List.of()));
+                continue;
+            }
+
+            // Resolve every declared reference independently, preserving each under its own step
+            // identity (never merged/flattened together) — exactly the datasets the model named,
+            // in the order it named them.
+            List<ResponseArtifacts.Section.ResolvedDataset> resolved = new java.util.ArrayList<>();
+            boolean allValid = true;
+            for (String ref : refs) {
+                com.sei.nexus.reasoning.InvestigationDataset ds = byRef.get(ref);
+                if (ds == null) {
+                    // ANY invalid reference invalidates the whole section — a claim citing one
+                    // real and one fake dataset is exactly as unverifiable as one citing only a
+                    // fake dataset, so it is never partially accepted.
+                    log.warn("MODEL_CONTRACT_DEFECT runKey={} invalidDatasetRef={} declaredRefs={} "
+                            + "knownDatasetRefs={} sectionType={} — section '{}' dropped entirely, "
+                            + "never partially accepted, never substituted with another dataset",
+                            runKey, ref, refs, byRef.keySet(), s.type(), s.title());
+                    allValid = false;
+                    break;
+                }
+                resolved.add(new ResponseArtifacts.Section.ResolvedDataset(ds.stepNo(), ds.rows()));
+            }
+            if (!allValid) continue;
+
+            out.add(new ResponseArtifacts.Section(s.type(), s.title(), s.purpose(), s.display(),
+                    s.items(), s.content(), resolved));
+        }
+        return out;
+    }
+
+    /** Same tolerant extraction used elsewhere for LLM JSON responses (e.g.
+     *  {@code ConceptScopedMetadataResolver.extractJson}) — strips any stray prose/fencing a
+     *  model adds around the JSON object despite {@code response_format: json_object}. */
+    private static String extractJsonObject(String text) {
+        if (text == null) return "{}";
+        int start = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        return (start >= 0 && end > start) ? text.substring(start, end + 1) : text;
     }
 
 
@@ -1339,6 +1567,116 @@ public class ChatService {
             - Bold the key figures. Plain prose only; no markdown headings or bullet lists unless
               there are several genuinely distinct, independent findings.
             - Be brief: 2 to 5 sentences total. Stop once the point is made.
+            """;
+
+    /**
+     * The JSON-mode sibling of {@link #DATA_ANSWER_SYSTEM_PROMPT} — used only when real query
+     * rows exist to reason about. Asks the SAME model call that used to return prose-only to also
+     * plan the complete UI content: which investigation dataset(s) answer which part of the
+     * question, which should be displayed, and what belongs in findings / related facts /
+     * recommendation / next steps. This is the ownership boundary: the model decides all of this
+     * — Java never selects, ranks, or infers any of it (see ChatService#resolveSections, which
+     * only resolves an exact {@code step-N} reference the model already chose).
+     */
+    private static final String DATA_ANSWER_JSON_SYSTEM_PROMPT = """
+            You are Zevra, an enterprise operational intelligence AI briefing a busy executive.
+            Answer like a chief of staff, not a database. Respond with a single JSON object —
+            no markdown fences, no prose outside the JSON — with exactly these fields:
+
+            {
+              "answer": string,        // the full prose answer (see rules below)
+              "sections": [             // your complete UI-content plan — see rules below
+                {
+                  "type": string,        // "DATASET" | "HIGHLIGHT" | "FINDINGS" | "RELATED_FACTS" |
+                                          // "RECOMMENDATION" | "NEXT_STEPS" | "TEXT"
+                  "title": string|null,
+                  "purpose": string|null,
+                  "dataset_refs": string[]|null,  // REQUIRED (at least one) for type="DATASET";
+                                                   // optional (for grounding) on any other type —
+                                                   // see below. A LIST: one entry, or several when
+                                                   // this section's content genuinely depends on
+                                                   // more than one dataset.
+                  "display": boolean|null,     // type="DATASET" only
+                  "items": string[]|null,      // type="FINDINGS" | "RELATED_FACTS" | "NEXT_STEPS"
+                  "content": string|null       // type="HIGHLIGHT" | "RECOMMENDATION" | "TEXT"
+                }
+              ]
+            }
+
+            RULES FOR "answer":
+            - LEAD with a single-sentence VERDICT: the conclusion itself, as one plain declarative
+              sentence that ends with a period and can stand alone
+              (e.g. "Margins are healthy overall, but two beauty products are priced below cost.").
+            - Then give 1-2 short sentences on WHY it matters — the driver or the exception.
+            - If the question has more than one substantive part (e.g. "show me all open orders
+              AND which item I ordered the most"), the answer must address every part — do not
+              silently drop one of them.
+            - Do NOT reproduce row-level values here — that is what a DATASET section is for.
+              Summarise; do not transcribe.
+            - Bold the key figures. Plain prose only. Be brief: 2 to 5 sentences total.
+
+            RULES FOR "sections" — YOU decide the complete UI-content plan. Below you will be
+            shown one or more INVESTIGATION DATASETS, each with an explicit "Dataset: step-N"
+            identifier, its description, row count, columns, and actual values. You decide:
+            - Which dataset(s) directly answer a part of the question the user asked to SEE
+              (e.g. "show me...", "list...", "which orders...") — for each, emit a section with
+              "type": "DATASET", "dataset_refs" set to that dataset's EXACT "step-N" identifier as
+              shown (character-for-character — never invent, abbreviate, or guess one), "display":
+              true, and a "title"/"purpose" you write describing what it shows.
+            - A dataset that exists but is not directly responsive to the question may be omitted
+              from "sections" entirely, or included with "display": false — your judgment.
+            - "HIGHLIGHT": a specific, dataset-grounded observation worth calling out on its own —
+              e.g. "Widget A (SKU ABC-123) is the most ordered item with 1,500 units ordered."
+              Put the narrative in "content" AND set "dataset_refs" to EVERY dataset that
+              narrative's facts actually come from. This is frequently more than one dataset — for
+              example, a name/SKU may come from one dataset and a quantity from another; if so,
+              list BOTH ("dataset_refs": ["step-3", "step-5"]). Never omit a dataset merely
+              because another dataset in the list contains the more descriptive portion of the
+              statement. One dataset is equally valid ("dataset_refs": ["step-1"]) when that's
+              genuinely all the claim depends on — you decide the count, based only on what the
+              claim actually draws from. Every factual value in "content" (a name, a number, an
+              id) MUST come from a dataset listed in "dataset_refs" (or from "answer") — never
+              state a value that isn't actually present in a dataset shown to you, and never claim
+              a relationship between values (e.g. "this id belongs to this quantity") unless the
+              supplied evidence itself supports it.
+            - "FINDINGS": genuine, materially significant discoveries from the evidence that are
+              NOT already fully stated in "answer" — put them in "items". Omit this section type
+              if nothing meets that bar.
+            - "RELATED_FACTS": additional context that helps explain a finding but isn't itself a
+              finding or recommendation. Omit if there is none.
+            - "RECOMMENDATION": a SINGLE sentence in "content" stating what the business should
+              consider doing, grounded in evidence you actually have. Omit if unwarranted — do not
+              invent one merely because the type exists.
+            - "NEXT_STEPS": concrete follow-up investigations specific to THIS question and
+              evidence, as "items" — not generic filler. Omit if none apply.
+            - "TEXT": free-form narrative content that doesn't fit any type above — use sparingly.
+
+            CRITICAL — NEVER ask the user to retrieve information you already have. Before writing
+            "next_steps" or a caveat like "identify the item by name/SKU", check every INVESTIGATION
+            DATASET shown to you — if the descriptive value you need (a name, a SKU, an id) already
+            appears there, use it directly in "answer" or a DATASET/HIGHLIGHT section instead of
+            asking the user to go find it.
+
+            CRITICAL — every entry in "dataset_refs" MUST exactly match one of the "Dataset:
+            step-N" identifiers you were actually shown. Never invent a step number, never
+            reference a dataset that wasn't shown to you, never invent rows, columns, or values
+            that aren't in it. Narrative content must use only facts present in the supplied
+            investigation evidence — do not use outside knowledge, and do not fabricate values.
+            If ANY reference in "dataset_refs" is invalid, the ENTIRE section is rejected —
+            narrative included, not partially accepted — so a HIGHLIGHT's "content" is only shown
+            to the user when every dataset it names is real.
+
+            CRITICAL — AVOID DUPLICATION: each section must add NEW information or a distinct
+            decision-oriented angle over "answer" and over every other section. Never repeat the
+            same sentence (or a trivial rewording of it) across two places.
+
+            CRITICAL — DO NOT FABRICATE: use only the evidence actually shown to you below. Do not
+            assume the business domain (this may be retail, finance, healthcare, manufacturing, HR,
+            or any other domain) — never impose domain-specific assumptions the data doesn't
+            support. If the evidence is insufficient to answer part of the question, say so
+            explicitly in "answer" rather than guessing. Return an empty "sections" array rather
+            than manufacturing content — a section type existing in the schema is not a reason to
+            use it.
             """;
 
     /**
@@ -1668,16 +2006,22 @@ public class ChatService {
         // Auxiliary callers (read-only boundary, source request, knowledge gap) keep the historical
         // intent label — behaviour unchanged. The main conversational path uses the overload below
         // to surface the canonical, front-door intentType (computed once, reused — never re-derived).
+        // None of these auxiliary callers ever produced structured LLM semantics (they're plain
+        // administrative/text answers), so llmSemantics is null — ResponseArtifactsBuilder's
+        // legacy fallback applies, which is honest here since there's no evidence to decompose.
+        // None of them run the reasoning loop either, so there is nothing to preserve per-step.
         return buildResponse(conversationId, runKey, answer, decisionType, agent, confidence,
-                needsKnowledge, quickRefs, asyncOps, queryData, reasoningSteps, learningsApplied,
-                IntentType.OPERATIONAL_INVESTIGATION);
+                needsKnowledge, quickRefs, asyncOps, queryData, List.of(), reasoningSteps, learningsApplied,
+                IntentType.OPERATIONAL_INVESTIGATION, null, List.of());
     }
 
     private ChatResponse buildResponse(String conversationId, String runKey, String answer,
             String decisionType, NexusAgent agent, double confidence, boolean needsKnowledge,
             List<Map<String, Object>> quickRefs, List<Map<String, Object>> asyncOps,
-            List<Map<String, Object>> queryData, List<Map<String, Object>> reasoningSteps,
-            List<String> learningsApplied, IntentType intentType) {
+            List<Map<String, Object>> queryData, List<Map<String, Object>> investigationDatasets,
+            List<Map<String, Object>> reasoningSteps,
+            List<String> learningsApplied, IntentType intentType, StructuredAnswer llmSemantics,
+            List<ResponseArtifacts.Section> resolvedSections) {
         String evidenceMode = (decisionType.contains("QUERY") || decisionType.contains("HYBRID"))
                 ? "LIVE_DATA" : "MEMORY";
         OrchestratorDecision decision = new OrchestratorDecision(
@@ -1687,6 +2031,9 @@ public class ChatService {
                 decisionType.contains("QUERY") || decisionType.contains("HYBRID"),
                 !decisionType.contains("QUERY"),
                 "ASK_CLARIFICATION".equals(decisionType));
+        ResponseArtifacts artifacts = ResponseArtifactsBuilder.build(
+                null, answer, reasoningSteps, queryData, investigationDatasets, quickRefs, null, llmSemantics,
+                resolvedSections);
         return new ChatResponse(
                 conversationId, runKey, answer, List.of(), decision,
                 agent != null ? agent.agentKey() : null,
@@ -1695,30 +2042,59 @@ public class ChatService {
                 confidence, needsKnowledge, "",
                 quickRefs, asyncOps,
                 queryData        != null ? queryData        : List.of(),
+                investigationDatasets != null ? investigationDatasets : List.of(),
                 reasoningSteps   != null ? reasoningSteps   : List.of(),
                 learningsApplied != null ? learningsApplied : List.of(),
-                null);
+                null, artifacts);
+    }
+
+    /** Converts {@link com.sei.nexus.reasoning.InvestigationDataset}s (the reasoning engine's
+     *  internal, per-step transport shape) into the {@code List<Map<String,Object>>} shape used
+     *  by {@code ChatResponse}/{@code ResponseArtifactsBuilder} — the same convention every other
+     *  list on those contracts already uses (see {@code reasoningSteps}). Package-private static
+     *  seam: pure, mechanical field copy — {@code stepNo}/{@code description} verbatim, {@code
+     *  rows} verbatim, {@code rowCount} a plain size() — no interpretation of any kind. */
+    static List<Map<String, Object>> investigationDatasetsToMaps(
+            List<com.sei.nexus.reasoning.InvestigationDataset> datasets) {
+        if (datasets == null || datasets.isEmpty()) return List.of();
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (com.sei.nexus.reasoning.InvestigationDataset d : datasets) {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("stepNo", d.stepNo());
+            m.put("description", d.description() != null ? d.description() : "");
+            m.put("rows", d.rows());
+            m.put("rowCount", d.rows().size());
+            out.add(m);
+        }
+        return out;
     }
 
     /** Converts EvidenceStore steps to the execResults format expected by composeAnswer.
-     *  Package-private static seam: pure function of evidence, no instance state. */
+     *  Package-private static seam: pure function of evidence, no instance state.
+     *
+     *  <p>Every step whose query actually returned rows is included — regardless of what a
+     *  LATER step went on to do, and regardless of the evaluator's "keep investigating" verdict
+     *  on this or any step (Investigation-Step Semantics: a step's own success is independent of
+     *  whether reasoning continued past it). Checks {@code outcome} — this step's own result —
+     *  never {@code evaluatorDecision}, which does not describe this step's own outcome at all
+     *  for a non-evaluated step (metadata, clarification, rejection, error). */
     static List<Map<String, Object>> evidenceToExecResults(EvidenceStore evidence) {
         List<Map<String, Object>> results = new java.util.ArrayList<>();
         for (EvidenceStore.StepEvidence s : evidence.getSteps()) {
             if (!s.rows().isEmpty()) {
                 results.add(Map.of("step", s.stepNo(), "rows", s.rows(),
                         "sql", s.sql() != null ? s.sql() : ""));
-            } else if ("ERROR".equals(s.evaluatorDecision())) {
+            } else if ("ERROR".equals(s.outcome())) {
                 results.add(Map.of("step", s.stepNo(), "error",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step failed"));
-            } else if ("CLARIFICATION_NEEDED".equals(s.evaluatorDecision())) {
+            } else if ("CLARIFICATION_NEEDED".equals(s.outcome())) {
                 // Semantic Reasoning Over Authoritative Value Domains: the planner declined to
                 // generate SQL for a term it could not defensibly resolve — distinct from a
                 // governance "blocked" outcome, so composeAnswer can phrase it as a genuine
                 // clarifying question rather than a policy-denial message.
                 results.add(Map.of("step", s.stepNo(), "clarification", true, "question",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Clarification needed"));
-            } else if (s.evaluatorDecision() != null && s.evaluatorDecision().contains("BLOCK")) {
+            } else if (s.outcome() != null && s.outcome().contains("BLOCK")) {
                 results.add(Map.of("step", s.stepNo(), "blocked", true, "reason",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step blocked"));
             }
@@ -1839,6 +2215,41 @@ public class ChatService {
         } catch (Exception e) {
             return List.of();
         }
+    }
+
+    /**
+     * Reads the Zevra Agent's own semantic decomposition straight from its FINAL_ANSWER step
+     * (see AgentRunner.extractFinalSemantics / AgentToolRegistry's final_answer schema) — never
+     * computed here. Returns {@link StructuredAnswer#plain} when the agent didn't populate the
+     * optional fields (e.g. a plain-text termination, or an older session predating this
+     * contract), which downstream (ResponseArtifactsBuilder) means the legacy fallback applies.
+     */
+    @SuppressWarnings("unchecked")
+    private StructuredAnswer extractAgentSemantics(String stepsJson, String fallbackAnswer) {
+        if (stepsJson == null || stepsJson.isBlank()) return StructuredAnswer.plain(fallbackAnswer);
+        try {
+            List<Map<String, Object>> steps = objectMapper.readValue(stepsJson, List.class);
+            for (Map<String, Object> step : steps) {
+                if (!"FINAL_ANSWER".equals(step.get("type"))) continue;
+                String understanding = step.get("understanding") instanceof String s ? s : null;
+                List<String> keyFindings = toStringList(step.get("key_findings"));
+                List<String> relatedFacts = toStringList(step.get("related_facts"));
+                String recommendation = step.get("recommendation") instanceof String s ? s : null;
+                List<String> nextSteps = toStringList(step.get("next_steps"));
+                return new StructuredAnswer(fallbackAnswer, understanding, keyFindings,
+                        relatedFacts, recommendation, nextSteps);
+            }
+            return StructuredAnswer.plain(fallbackAnswer);
+        } catch (Exception e) {
+            return StructuredAnswer.plain(fallbackAnswer);
+        }
+    }
+
+    private static List<String> toStringList(Object value) {
+        if (!(value instanceof List<?> list) || list.isEmpty()) return null;
+        List<String> out = new ArrayList<>();
+        for (Object o : list) { if (o != null) out.add(String.valueOf(o)); }
+        return out;
     }
 
     /** Phrases that mark an answer as a non-finding (missing data/schema/knowledge). */

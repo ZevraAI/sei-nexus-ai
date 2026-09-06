@@ -94,7 +94,7 @@ class FollowUpInvestigationContinuationTest {
             }
         };
 
-        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null) {
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override
             public Outcome execute(Request r) {
                 executedRequests.add(r);
@@ -113,13 +113,16 @@ class FollowUpInvestigationContinuationTest {
         };
 
         ReasoningEngine engine = new ReasoningEngine(fakePlanner, fakeEvaluator,
-                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper());
+                new ReasoningEventBus(new ObjectMapper()), fakeRepository, fakeRuntime, new ObjectMapper(),
+                new ColumnMetadataRequestHandler(new com.sei.nexus.agentbrain.PromptContextBuilder(),
+                        new com.sei.nexus.agentbrain.PromptAssembler(),
+                        new com.sei.nexus.semanticmodel.EnterpriseSemanticAssembler(null)));
 
         // ── Act: Q2, seeded with Q1's unrelated evidence ─────────────────────────────────
         String question = "when was our lkast order for Luxury Peptide products";
         ReasoningEngine.ReasoningResult result = engine.reason(
                 question, question, "rsession-test", "schema context", "run-q2", "user@test.com",
-                false, null, null, false, "conv-test", "exec-q1-inventory", priorExecution);
+                false, null, null, false, "conv-test", "exec-q1-inventory", priorExecution, null);
 
         // ── Assert: Planner ran ───────────────────────────────────────────────────────
         assertEquals(1, plannerCalls.get(),

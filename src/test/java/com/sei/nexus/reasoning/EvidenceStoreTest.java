@@ -113,4 +113,154 @@ class EvidenceStoreTest {
     void emptyResultIsUnchanged() {
         assertEquals("Query returned 0 rows.", summaryFor(List.of()));
     }
+
+    // ── addMetadataStep: a Missing-Column Metadata Request step is not a query — its evidence
+    //     must never claim "Query returned 0 rows." (the exact defect this method fixes) ──────
+
+    @Test
+    void metadataStepNeverRendersAsAnEmptyQueryResult() {
+        EvidenceStore store = new EvidenceStore();
+        store.addMetadataStep(1, "Retrieve columns", "columns were omitted",
+                "METADATA_RETRIEVED", "Retrieved 3 column(s) of metadata for 'order_lines'.");
+
+        String summary = store.getSteps().get(0).rowSummary();
+
+        assertFalse(summary.contains("Query returned"),
+                "a metadata retrieval must never be described as a query, empty or otherwise");
+        assertFalse(summary.contains("0 rows"));
+        assertEquals("Retrieved 3 column(s) of metadata for 'order_lines'.", summary);
+    }
+
+    @Test
+    void metadataStepCarriesNoRowsAndNoSql() {
+        EvidenceStore store = new EvidenceStore();
+        store.addMetadataStep(1, "Retrieve columns", "r", "METADATA_RETRIEVED", "Retrieved 2 column(s).");
+
+        EvidenceStore.StepEvidence step = store.getSteps().get(0);
+        assertTrue(step.rows().isEmpty(), "a metadata step never executed a query — it has no rows");
+        assertEquals("", step.sql());
+    }
+
+    @Test
+    void metadataUnavailableStepIsAlsoRenderedDescriptivelyNotAsAnEmptyQuery() {
+        EvidenceStore store = new EvidenceStore();
+        store.addMetadataStep(1, "Retrieve columns", "r", "METADATA_UNAVAILABLE",
+                "'unknown_table' is not part of the already-resolved/approved object set for this "
+                        + "question — metadata request rejected.");
+
+        String summary = store.getSteps().get(0).rowSummary();
+        assertFalse(summary.contains("Query returned"));
+        assertTrue(summary.contains("not part of the already-resolved/approved object set"));
+    }
+
+    @Test
+    void metadataStepAppearsCorrectlyInTheLlmFacingEvidenceTranscript() {
+        EvidenceStore store = new EvidenceStore();
+        store.addMetadataStep(2, "Retrieve columns for order_lines", "columns were omitted",
+                "METADATA_RETRIEVED", "Retrieved 3 column(s) of metadata for 'order_lines'.");
+
+        String transcript = store.buildContextForLlm();
+
+        assertTrue(transcript.contains("Retrieved 3 column(s) of metadata for 'order_lines'."));
+        assertFalse(transcript.contains("Query returned 0 rows"),
+                "the evidence transcript the planner itself reads must not misrepresent a "
+                        + "successful metadata retrieval as an empty query");
+    }
+
+    // ── Investigation-Step Semantics: `outcome` (this step's own result) is independent of
+    //     `evaluatorDecision` (the evaluator's separate verdict on overall sufficiency) ─────────
+
+    @Test
+    void aSuccessfulQueryStepStaysSuccessfulEvenWhenTheEvaluatorAsksForMoreEvidence() {
+        EvidenceStore store = new EvidenceStore();
+        store.add(1, "Retrieve open purchase orders", "SELECT * FROM orders", "conn-1",
+                List.of(row("id", "PO-1")), "r", "NEED_MORE_DATA", "need item detail too", 5L);
+
+        EvidenceStore.StepEvidence step = store.getSteps().get(0);
+
+        assertEquals("QUERY_SUCCEEDED", step.outcome(),
+                "the query itself succeeded — Agent Brain deciding to investigate further is a "
+                        + "SEPARATE, later decision and must never retroactively mark this step failed");
+        assertEquals("NEED_MORE_DATA", step.evaluatorDecision(),
+                "the reason for the NEXT action is preserved too, just in its own field");
+    }
+
+    @Test
+    void needsMoreDataDoesNotOverwriteTheStatusOfTheSuccessfulPrecedingQuery() {
+        EvidenceStore store = new EvidenceStore();
+        store.add(1, "Step 1", "SELECT * FROM orders", "conn-1",
+                List.of(row("id", "PO-1")), "r", "NEED_MORE_DATA", "keep going", 5L);
+        store.add(2, "Step 2", "SELECT * FROM order_lines", "conn-1",
+                List.of(row("product_id", "P-1")), "r", "SUFFICIENT", "answered", 5L);
+
+        List<EvidenceStore.StepEvidence> steps = store.getSteps();
+        assertEquals("QUERY_SUCCEEDED", steps.get(0).outcome(), "step 1 succeeded on its own merits");
+        assertEquals("QUERY_SUCCEEDED", steps.get(1).outcome(), "step 2 also succeeded on its own merits");
+        assertEquals("NEED_MORE_DATA", steps.get(0).evaluatorDecision());
+        assertEquals("SUFFICIENT", steps.get(1).evaluatorDecision());
+    }
+
+    @Test
+    void metadataRetrievalIsRepresentedAsACompletedOutcomeNotAnEvaluatedQuery() {
+        EvidenceStore store = new EvidenceStore();
+        store.addMetadataStep(1, "Retrieve columns", "r", "METADATA_RETRIEVED", "Retrieved 3 column(s).");
+
+        EvidenceStore.StepEvidence step = store.getSteps().get(0);
+
+        assertEquals("METADATA_RETRIEVED", step.outcome());
+        assertNull(step.evaluatorDecision(),
+                "metadata retrieval never executes a query for the evaluator to judge — no "
+                        + "sufficiency verdict applies, and none must be fabricated");
+    }
+
+    @Test
+    void aGenuineRejectionIsRepresentedByItsOwnOutcomeNeverAsAnEvaluatorVerdict() {
+        EvidenceStore store = new EvidenceStore();
+        store.addOutcome(1, "Blocked query", "SELECT * FROM invoices", "conn-1",
+                "r", "UNAPPROVED_OBJECTS", "table not approved", 0L);
+
+        EvidenceStore.StepEvidence step = store.getSteps().get(0);
+        assertEquals("UNAPPROVED_OBJECTS", step.outcome());
+        assertNull(step.evaluatorDecision());
+        assertTrue(step.rows().isEmpty());
+    }
+
+    @Test
+    void multipleSuccessfulQueryStepsAreAllRetainedSimultaneously() {
+        EvidenceStore store = new EvidenceStore();
+        store.add(1, "POs", "SELECT * FROM orders", "conn-1", List.of(row("po", "PO-1")),
+                "r", "NEED_MORE_DATA", "need item too", 5L);
+        store.addMetadataStep(2, "Columns", "r", "METADATA_RETRIEVED", "Retrieved 15 column(s).");
+        store.add(3, "Top item", "SELECT product_id FROM order_lines", "conn-1",
+                List.of(row("product_id", "P-1", "qty", 12)), "r", "NEED_MORE_DATA", "need product details", 5L);
+        store.addMetadataStep(4, "Product columns", "r", "METADATA_RETRIEVED", "Retrieved 16 column(s).");
+        store.add(5, "Product detail", "SELECT name, sku FROM products", "conn-1",
+                List.of(row("name", "Widget", "sku", "W-1")), "r", "SUFFICIENT", "answered", 5L);
+
+        List<EvidenceStore.StepEvidence> steps = store.getSteps();
+        assertEquals(5, steps.size());
+        // Every genuinely-executed query step's rows survive, independent of the others and of
+        // the evaluator's per-step verdict.
+        assertEquals("PO-1", steps.get(0).rows().get(0).get("po"));
+        assertEquals("P-1", steps.get(2).rows().get(0).get("product_id"));
+        assertEquals("Widget", steps.get(4).rows().get(0).get("name"));
+        assertEquals("QUERY_SUCCEEDED", steps.get(0).outcome());
+        assertEquals("METADATA_RETRIEVED", steps.get(1).outcome());
+        assertEquals("QUERY_SUCCEEDED", steps.get(2).outcome());
+        assertEquals("METADATA_RETRIEVED", steps.get(3).outcome());
+        assertEquals("QUERY_SUCCEEDED", steps.get(4).outcome());
+    }
+
+    @Test
+    void genuinelyEmptyQueryResultsStillBehaveCorrectly() {
+        EvidenceStore store = new EvidenceStore();
+        store.add(1, "No matches", "SELECT * FROM orders WHERE 1=0", "conn-1", List.of(),
+                "r", "DEAD_END", "no evidence found", 5L);
+
+        EvidenceStore.StepEvidence step = store.getSteps().get(0);
+        assertEquals("QUERY_SUCCEEDED", step.outcome(),
+                "the query itself executed without error — zero rows is a valid result, not a failure");
+        assertEquals("DEAD_END", step.evaluatorDecision());
+        assertEquals("Query returned 0 rows.", step.rowSummary());
+    }
 }

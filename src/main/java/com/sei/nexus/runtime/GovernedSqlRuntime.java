@@ -13,6 +13,7 @@ import com.sei.nexus.reasoning.LiteralValidator;
 import com.sei.nexus.reasoning.ReasoningPlanner;
 import com.sei.nexus.semanticmodel.ColumnValueDomain;
 import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.sql.SqlColumnReferenceExtractor;
 import com.sei.nexus.sql.SqlTableReferenceExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,6 +67,7 @@ public class GovernedSqlRuntime {
     private final DynamicSqlService        dynamicSql;
     private final GovernanceAuditService   auditService;
     private final SqlTableReferenceExtractor tableExtractor;
+    private final SqlColumnReferenceExtractor columnExtractor;
     private final QueryExecutionRepository executionRepository;
     private final ConnectionRepository     connectionRepository;
     private final ExecutionReferenceRepository executionReferenceRepository;
@@ -75,6 +77,7 @@ public class GovernedSqlRuntime {
                               DynamicSqlService dynamicSql,
                               GovernanceAuditService auditService,
                               SqlTableReferenceExtractor tableExtractor,
+                              SqlColumnReferenceExtractor columnExtractor,
                               QueryExecutionRepository executionRepository,
                               ConnectionRepository connectionRepository,
                               ExecutionReferenceRepository executionReferenceRepository,
@@ -83,6 +86,7 @@ public class GovernedSqlRuntime {
         this.dynamicSql           = dynamicSql;
         this.auditService         = auditService;
         this.tableExtractor       = tableExtractor;
+        this.columnExtractor      = columnExtractor;
         this.executionRepository  = executionRepository;
         this.connectionRepository = connectionRepository;
         this.executionReferenceRepository = executionReferenceRepository;
@@ -99,6 +103,8 @@ public class GovernedSqlRuntime {
         CONNECTION_NOT_FOUND,
         /** A referenced table is outside the contract's approved surface. Nothing was governed. */
         UNAPPROVED_OBJECTS,
+        /** A referenced column does not exist on its (approved) table. Nothing was governed. */
+        INVALID_COLUMNS,
         /** Governance blocked at safety/allow-list level (no contract evaluation). Not audited. */
         GOVERNANCE_BLOCKED,
         /** Governance blocked at contract level. Audited with {@code blocked=true}. */
@@ -253,6 +259,25 @@ public class GovernedSqlRuntime {
                 log.warn("Contract gate (shadow) would reject step {} of run {}: table(s) {} not in "
                                 + "the approved surface for connection '{}'. Approved: [{}]",
                         r.stepNo(), r.runKey(), unapproved, r.connectionKey(), approved);
+            }
+        }
+
+        // ── 3b. Column-existence gate (defense-in-depth) — only when a contract scopes the
+        //     request, sibling to the table gate above. Deterministic identifier verification,
+        //     never semantic column selection: rejects a column that does not exist on its
+        //     table, never substitutes or guesses a replacement. Always enforced (not a shadow
+        //     mode) — an invalid column reaching the database is exactly the failure mode this
+        //     gate exists to catch before execution.
+        if (r.contract() != null) {
+            Map<String, Set<String>> knownColumnsByTable = r.contract().columnsByTable(r.connectionKey());
+            List<String> invalidColumns = columnExtractor.invalidColumnReferences(r.sql(), knownColumnsByTable);
+            if (!invalidColumns.isEmpty()) {
+                String message = "Column(s) not found on their referenced table(s) for connection '"
+                        + r.connectionKey() + "': " + invalidColumns + ". Re-check the exact column names "
+                        + "approved for that table.";
+                log.warn("Step {} of run {} rejected — invalid column reference(s): {}",
+                        r.stepNo(), r.runKey(), invalidColumns);
+                return decision(Status.INVALID_COLUMNS, message, null, invalidColumns, null);
             }
         }
 

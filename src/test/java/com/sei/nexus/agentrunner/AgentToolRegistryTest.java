@@ -104,7 +104,7 @@ class AgentToolRegistryTest {
         // connectionRepository is null: the agent policy never requests an existence check
         // (its allow-list check happens in AgentToolRegistry), so it must never be touched.
         GovernedSqlRuntime runtime = new GovernedSqlRuntime(pipeline, dynamicSql, audit,
-                EXTRACTOR, new ForbiddenExecutionRepo(),
+                EXTRACTOR, new com.sei.nexus.sql.SqlColumnReferenceExtractor(), new ForbiddenExecutionRepo(),
                 null, new com.sei.nexus.runtime.ExecutionReferenceRepository(null, new ObjectMapper()) {
                     @Override public void save(com.sei.nexus.runtime.ExecutionReference r) { /* no-op */ }
                 }, new ObjectMapper());

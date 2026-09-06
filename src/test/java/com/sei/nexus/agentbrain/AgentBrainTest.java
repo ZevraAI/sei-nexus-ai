@@ -331,7 +331,16 @@ class AgentBrainTest {
         assertEquals("Inventory", model.objects().get(0).businessName());
         assertEquals("inventory_balances", model.objectTargets().get("obj-inv").table());
         assertEquals("on_hand_qty", model.attributeTargets().get("c-inv").column());
-        assertNull(assembler.seenKeys, "the full-assembly primitive must never be called once narrowing applies");
+        // Execution-authorization scope (separate from prompt content — see
+        // ResolvedBusinessModel#executionScope): narrowing must never narrow what is
+        // executable, so the full-assembly primitive IS now also called, independently of the
+        // narrowed selection above, and its result is carried as the model's executionScope.
+        assertEquals(List.of("conn-1"), assembler.seenKeys,
+                "the full-assembly primitive is called to compute execution-authorization scope, "
+                        + "independently of narrowing — narrowing must never narrow what is executable");
+        assertTrue(model.executionScope().isPresent());
+        assertEquals(2, model.executionScope().get().objects().size(),
+                "execution authorization must reflect the full assembly, not the narrowed prompt selection");
     }
 
     @Test
@@ -359,9 +368,19 @@ class AgentBrainTest {
 
         ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "what is the weather today?");
 
-        assertTrue(model.objects().isEmpty());
-        assertNull(assembler.seenKeys, "zero relevant concepts must not trigger the full-assembly fallback");
+        assertTrue(model.objects().isEmpty(),
+                "zero relevant concepts is still an honest empty PROMPT selection — narrowing's own job");
         assertNull(assembler.seenObjectKeys, "assembleByObjectKeys need not even be called for an empty selection");
+        // Execution authorization is NOT the empty narrowed selection — the full-assembly
+        // primitive is called (this is the fix under test), so an object real, approved, and on
+        // this connection remains executable even though the LLM found no relevant concept for
+        // it in THIS question's prompt.
+        assertEquals(List.of("conn-1"), assembler.seenKeys,
+                "the full-assembly primitive IS called, to compute execution-authorization scope "
+                        + "independently of the LLM's zero-concept prompt-narrowing decision");
+        assertTrue(model.executionScope().isPresent());
+        assertEquals(2, model.executionScope().get().objects().size(),
+                "execution authorization must not be emptied merely because narrowing found nothing to render");
     }
 
     /** No active pack / no tenant concept catalog for this connection ⇒ Stage 1 does not apply ⇒
@@ -500,8 +519,15 @@ class AgentBrainTest {
 
         assertEquals(1, model.objects().size(), "must receive only the concept-selected object, not the whole domain");
         assertEquals("Inventory", model.objects().get(0).businessName());
-        assertNull(assembler.seenDomainKeys, "assembleByDomains must never be called when concept-scoping succeeds");
         assertEquals(List.of("obj-inv"), assembler.seenObjectKeys);
+        // Execution-authorization scope: assembleByDomains IS now also called, independently of
+        // concept-scoping's narrowed prompt selection above, so execution authorization reflects
+        // the full domain-bearing assembly, not the narrowed set — narrowing must never narrow
+        // what is executable.
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
+                "assembleByDomains is called to compute execution-authorization scope, independently "
+                        + "of concept-scoping's narrowed prompt selection");
+        assertTrue(model.executionScope().isPresent());
     }
 
     // Test 3 / 9 — BusinessLanguageResolver (and, by the same code path, every other independent
@@ -632,7 +658,13 @@ class AgentBrainTest {
         assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys);
         assertEquals(List.of("obj-a", "obj-b"), assembler.seenObjectKeys,
                 "when every connection qualifies, narrowing applies across all of them together");
-        assertNull(assembler.seenDomainKeys, "assembleByDomains must not be called when every connection qualified");
         assertEquals(2, model.objects().size());
+        // Execution-authorization scope: assembleByDomains IS now also called, independently of
+        // narrowing succeeding across every connection — see the two tests above for the same
+        // principle in the single-connection case.
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
+                "assembleByDomains is called to compute execution-authorization scope even when "
+                        + "every connection qualified for narrowing");
+        assertTrue(model.executionScope().isPresent());
     }
 }

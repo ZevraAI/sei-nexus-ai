@@ -5,6 +5,7 @@ import com.sei.nexus.semanticmodel.ColumnValueDomain;
 import com.sei.nexus.semanticmodel.BusinessObject;
 import com.sei.nexus.semanticmodel.PhysicalColumn;
 import com.sei.nexus.semanticmodel.PhysicalTable;
+import com.sei.nexus.semanticmodel.SemanticModel;
 
 import java.util.List;
 import java.util.Map;
@@ -51,7 +52,20 @@ public record ResolvedBusinessModel(
         // must keep calling ChatService's own getLlmDecision() exactly as before. Java never
         // constructs or infers this value itself — it is relayed verbatim from the LLM's own
         // combined response.
-        Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision
+        Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision,
+        // Execution-authorization scope, kept SEPARATE from `objects` (Concept-Scoped Metadata
+        // Narrowing's prompt-rendering selection). `objects`/`objectTargets`/`attributeTargets`
+        // above control what gets rendered in detail to the model — a token-budget/relevance
+        // concern this class's own javadoc already says must "never narrow what the caller may
+        // execute." `executionScope`, when present, is the full, deterministic, domain/connection
+        // -scoped object set — identical to what `objects` would already be had narrowing never
+        // run (see AgentBrain#resolve) — and is what ExecutionContractBuilder must compile
+        // approvedAssets from, so execution authorization never depends on which concepts an LLM
+        // call happened to select for THIS question's prompt. Optional.empty() for every caller
+        // that predates this field (every pre-existing constructor overload below), in which case
+        // ExecutionContractBuilder falls back to `objects` — byte-identical to before this field
+        // existed.
+        Optional<SemanticModel> executionScope
 ) {
     public ResolvedBusinessModel {
         connectionKeys   = List.copyOf(connectionKeys);
@@ -61,6 +75,22 @@ public record ResolvedBusinessModel(
         if (resolution == null)   resolution   = ResolvedQuestion.empty(question);
         literalScope = literalScope == null ? Map.of() : Map.copyOf(literalScope);
         routingDecision = routingDecision == null ? Optional.empty() : routingDecision;
+        executionScope  = executionScope  == null ? Optional.empty() : executionScope;
+    }
+
+    /** Pre-existing 10-arg shape (Decision Router absorption, no separate execution-authorization
+     *  scope) — {@code executionScope} defaults to empty, so {@link ExecutionContractBuilder}
+     *  falls back to {@code objects}, exactly as before this field existed. */
+    public ResolvedBusinessModel(String agentId, List<String> connectionKeys, String question,
+                                 List<BusinessObject> objects,
+                                 Map<String, PhysicalTable> objectTargets,
+                                 Map<String, PhysicalColumn> attributeTargets,
+                                 ResolvedQuestion resolution,
+                                 Map<String, ColumnValueDomain> literalScope,
+                                 boolean conceptScoped,
+                                 Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision) {
+        this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
+                resolution, literalScope, conceptScoped, routingDecision, Optional.empty());
     }
 
     /** Pre-existing 9-arg shape (Concept-Scoped Metadata Narrowing, no routing absorption) —
@@ -74,7 +104,7 @@ public record ResolvedBusinessModel(
                                  Map<String, ColumnValueDomain> literalScope,
                                  boolean conceptScoped) {
         this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
-                resolution, literalScope, conceptScoped, Optional.empty());
+                resolution, literalScope, conceptScoped, Optional.empty(), Optional.empty());
     }
 
     /** Pre-existing Semantic Foundation shape, concept-scoping unknown/inapplicable — defaults

@@ -37,11 +37,26 @@ public class ReasoningPlanner {
             SqlIdentifierGuidance.SCHEMA_AUTHORITY + "\n\n" + """
             You are a SQL investigation planner building a case step by step.
             The user's question and all evidence gathered so far are provided.
-            Your job: generate the SINGLE next SQL query that will most advance the investigation.
+            Every turn, choose exactly ONE of two equally valid actions — whichever the
+            evidence actually calls for:
+              (a) SQL — only when you already have confirmed columns, from "Approved schema"
+                  or a prior metadata response, for every table your query references.
+              (b) A metadata request — whenever any table you need is missing its column
+                  list (never shown, "(columns omitted...)", or known only via a
+                  JOIN/relationship hint).
+            (a) without confirmed columns for every referenced table is not a shortcut to
+            the SQL you were asked to produce — it is a different, disallowed action.
 
             Rules:
             - Use only the tables and columns listed under "Approved schema".
-            - Use the exact connection_key shown for each table.
+            - "connection_key" is an opaque routing token, NEVER a table or column name. Each
+              TABLE entry in "Approved schema" is annotated with its own line reading
+              "connection_key: conn-xxxxxxxx (use this exact value)" — copy that exact string
+              (it always starts with "conn-") into the "connection_key" field of your response.
+              Do not substitute the table name, a column name, or any other identifier from the
+              query you just wrote — those answer a different question (what to select) and are
+              never a valid connection_key. If the step queries more than one table, use the
+              connection_key belonging to the table your SQL actually reads from.
             - Do NOT repeat a query that has already been executed (check "Evidence so far").
             - If the evidence already answers the question, return: {"done": true}
             - Write focused SQL — a targeted SELECT, not SELECT *. Select the columns whose
@@ -59,6 +74,39 @@ public class ReasoningPlanner {
               If the user explicitly asks for all fields or the full
               record, list every approved column of the relevant table by name; never use
               SELECT *.
+            - Before generating SQL, ensure that any resolved object whose attributes are required
+              to answer the user's request has had its own metadata/column list provided to you.
+              Knowing that an object exists is NOT the same as having its metadata. An object
+              name, an identifier, relationship/JOIN guidance, or an individual column learned
+              from another context does not constitute having that object's metadata — a
+              relationship/JOIN hint may be used for relationship reasoning (which tables join to
+              which), but it must never be treated as that object's complete attribute list, and
+              must never be used as a basis to select or invent any other column on that object.
+              If the required object's metadata has not been provided — whether because its
+              column list was never shown, was shown as "(columns omitted to fit the context
+              budget)", or you only know one of its columns via a relationship/JOIN hint —
+              do not guess or infer additional columns from conventional naming. Instead of
+              "sql", respond with a metadata request for that already-resolved object:
+              {"done":false,"description":"one-line goal","requires_metadata":{"object":"<the exact table name, or business name, as shown in Approved schema>","metadataType":"columns"},"rationale":"why this object's columns are needed"}
+              You will receive that object's real column list on your next turn and can then
+              continue planning with it. Only request metadata for an object already named
+              somewhere in "Approved schema" — never for one you have no evidence exists.
+              The value you put in "object" MUST be the exact table name or exact business name
+              as shown under "Approved schema" — that is the ONLY authoritative identity source
+              for this field. A Knowledge Graph section, if present, names business entities and
+              concepts for relationship reasoning; its labels are NOT the authoritative object
+              identity and must never be substituted for the corresponding "Approved schema"
+              identity — even when the Knowledge Graph label is singular, plural, or otherwise
+              worded differently from the "Approved schema" identity. Do not expect Java to
+              match, normalize, or correct a Knowledge Graph label into the right identity for
+              you — copy the identity from "Approved schema" yourself, exactly as shown.
+            - Before finalizing an answer that identifies, names, or describes an entity, ensure
+              the evidence contains an appropriate descriptive attribute for that entity. Merely
+              knowing an entity's identifier — including one learned through JOIN/relationship
+              guidance — does not constitute having sufficient descriptive metadata for the
+              requested answer. If the required object's metadata has not been provided, use
+              "requires_metadata" for it rather than guessing a column or presenting the
+              identifier alone as the answer.
             - Joins, aggregations, GROUP BY, ORDER BY, LIMIT are all allowed.
             - Extract filter values from the attached file content when present.
             - RESOLUTIONS map the user's terms to this tenant's canonical names and values.
@@ -111,14 +159,23 @@ public class ReasoningPlanner {
               numeric values — match it exactly. Do not apply tolerant matching to numbers
               or codes.
 
-            Return JSON only (no markdown, no explanation):
-            {"done":false,"description":"one-line goal","sql":"SELECT ...","connection_key":"...","object_keys":"key1,key2","rationale":"why this step advances the investigation","literal_bindings":[{"surface":"TX","column":"stores.state_province","value":"Texas"}]}
+            Return JSON only (no markdown, no explanation) — the shape for whichever of
+            (a)/(b)/clarification/done above applies to this turn:
 
-            OR, when step 3 above applies — a term you cannot defensibly resolve against an
-            authoritative legal-values column:
+            (a) SQL:
+            {"done":false,"description":"one-line goal","sql":"SELECT ...","connection_key":"conn-xxxxxxxx","object_keys":"key1,key2","rationale":"why this step advances the investigation","literal_bindings":[{"surface":"TX","column":"stores.state_province","value":"Texas"}]}
+            ("connection_key" above is a placeholder shape only — always replace it with the
+            real "connection_key: ..." value copied from the TABLE entry you queried, never the
+            literal text "conn-xxxxxxxx".)
+
+            (b) Metadata request (see the metadata-request rule above):
+            {"done":false,"description":"one-line goal","requires_metadata":{"object":"table_name","metadataType":"columns"},"rationale":"why this table's columns are needed"}
+
+            Clarification (step 3 above applies — a term you cannot defensibly resolve
+            against an authoritative legal-values column):
             {"done":false,"clarification_question":"one clear question naming the term you could not resolve and listing the actual legal values so the user can choose","rationale":"why no legal value or business definition matched"}
 
-            OR if no further queries are needed:
+            Done (no further queries needed):
             {"done":true}
             """
             + "\n" + SqlIdentifierGuidance.IDENTIFIER_RULES;
@@ -146,6 +203,20 @@ public class ReasoningPlanner {
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 
             if (Boolean.TRUE.equals(parsed.get("done"))) return null;
+
+            // Missing-Column Metadata Request: the planner's own, explicit way to decline
+            // generating SQL when it needs a column from a table whose detail was omitted (by
+            // the presentation budget) or never shown — see the SYSTEM_PROMPT's metadata-request
+            // rule. Checked before "sql"/clarification so a response carrying more than one of
+            // these fields is still treated as a metadata request, never silently falls through
+            // to SQL built on a table it was never given columns for.
+            MetadataRequest metadataRequest = parseMetadataRequest(parsed.get("requires_metadata"));
+            if (metadataRequest != null) {
+                return StepPlan.metadataRequest(
+                        strOr(parsed, "description", "Requesting column metadata"),
+                        strOr(parsed, "rationale", ""),
+                        metadataRequest.object(), metadataRequest.metadataType());
+            }
 
             // Semantic Reasoning Over Authoritative Value Domains: the planner's own, explicit
             // way to decline generating SQL when a user's term cannot be defensibly resolved
@@ -199,6 +270,32 @@ public class ReasoningPlanner {
     }
 
     /**
+     * Parses the optional {@code requires_metadata} object from the planner's JSON — Missing-
+     * Column Metadata Request. {@code null} when absent, malformed, or missing a non-blank
+     * {@code object} — the field is a declaration hook, like {@code literal_bindings}, never a
+     * reason to fail the step. Java performs no interpretation here beyond structural parsing:
+     * whatever string the model put in {@code object} is passed through verbatim for {@link
+     * ColumnMetadataRequestHandler} to validate by exact match.
+     */
+    private MetadataRequest parseMetadataRequest(Object raw) {
+        if (!(raw instanceof Map<?, ?> m)) return null;
+        Object object = m.get("object");
+        if (!(object instanceof String s) || s.isBlank()) return null;
+        Object typeObj = m.get("metadataType");
+        String metadataType = (typeObj instanceof String t && !t.isBlank()) ? t.trim() : "columns";
+        return new MetadataRequest(s.trim(), metadataType);
+    }
+
+    /**
+     * A Missing-Column Metadata Request: the planner has already decided {@code object} (a
+     * physical table or business name copied verbatim from "Approved schema") is relevant, but
+     * has not been shown its columns, and is asking Java to retrieve them rather than guessing.
+     * Java's role is limited to validating {@code object} against the resolved/approved object
+     * set and retrieving its authoritative columns — see {@link ColumnMetadataRequestHandler}.
+     */
+    public record MetadataRequest(String object, String metadataType) {}
+
+    /**
      * Parses the optional {@code literal_bindings} array (PRO-33 / PRO-32 §0.2)
      * from the planner's JSON. Absent, malformed, or incomplete entries yield
      * an empty/partial list — the field is a declaration hook, never a reason
@@ -247,22 +344,44 @@ public class ReasoningPlanner {
             List<LiteralBinding> literalBindings,
             // Non-null/non-blank ⇒ this step is a clarification request, not a SQL step (see
             // class javadoc). Null for every pre-existing caller/constructor below.
-            String clarificationQuestion
+            String clarificationQuestion,
+            // Non-null ⇒ this step is a Missing-Column Metadata Request, not a SQL step or a
+            // clarification. Null for every pre-existing caller/constructor below.
+            MetadataRequest metadataRequest
     ) {
+        /** Pre-metadata-request shape — no metadata request. */
+        public StepPlan(String description, String sql, String connectionKey,
+                        String objectKeys, String rationale, List<LiteralBinding> literalBindings,
+                        String clarificationQuestion) {
+            this(description, sql, connectionKey, objectKeys, rationale, literalBindings,
+                    clarificationQuestion, null);
+        }
+
         /** Pre-clarification shape — no clarification (PRO-33). */
         public StepPlan(String description, String sql, String connectionKey,
                         String objectKeys, String rationale, List<LiteralBinding> literalBindings) {
-            this(description, sql, connectionKey, objectKeys, rationale, literalBindings, null);
+            this(description, sql, connectionKey, objectKeys, rationale, literalBindings, null, null);
         }
 
         /** Pre-PRO-33 shape — no declared bindings, no clarification. */
         public StepPlan(String description, String sql, String connectionKey,
                         String objectKeys, String rationale) {
-            this(description, sql, connectionKey, objectKeys, rationale, List.of(), null);
+            this(description, sql, connectionKey, objectKeys, rationale, List.of(), null, null);
         }
 
         public boolean isClarification() {
             return clarificationQuestion != null && !clarificationQuestion.isBlank();
+        }
+
+        public boolean isMetadataRequest() {
+            return metadataRequest != null;
+        }
+
+        /** Constructs a metadata-request step — the only non-SQL, non-clarification StepPlan shape. */
+        public static StepPlan metadataRequest(String description, String rationale,
+                                               String object, String metadataType) {
+            return new StepPlan(description, null, null, "", rationale, List.of(), null,
+                    new MetadataRequest(object, metadataType));
         }
     }
 }
