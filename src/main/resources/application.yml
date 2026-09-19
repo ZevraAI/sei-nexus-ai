@@ -82,6 +82,13 @@ nexus:
     correction-detector-model: ${OPENAI_CORRECTION_DETECTOR_MODEL:gpt-4o}
     onboarding-model: ${OPENAI_ONBOARDING_MODEL:gpt-4o-mini}
     memory-selection-model: ${OPENAI_MEMORY_SELECTION_MODEL:gpt-4o-mini}
+    # Phase 3 controlled core model migration: Planner/Evaluator/Composer moved to gpt-4.1 after
+    # Phase 2's live evaluation found it an acceptable candidate for these three workloads (8/8,
+    # 3/3, and 4/4 contract-correct respectively). Stage 1 deliberately stays on chat-model
+    # (gpt-4o) above — Phase 2 found gpt-4.1 unusable there (File Search never invoked, 0/3).
+    planner-model: ${OPENAI_PLANNER_MODEL:gpt-4.1}
+    evaluator-model: ${OPENAI_EVALUATOR_MODEL:gpt-4.1}
+    composer-model: ${OPENAI_COMPOSER_MODEL:gpt-4.1}
   security:
     jwt-secret: ${NEXUS_JWT_SECRET:change-me-in-production}
     session-expiry-hours: 24

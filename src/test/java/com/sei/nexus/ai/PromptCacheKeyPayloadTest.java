@@ -42,6 +42,13 @@ class PromptCacheKeyPayloadTest {
         AzureOpenAiClient client = new AzureOpenAiClient(new ObjectMapper(), null);
         setField(client, "apiKey", "unused-capture-only");
         setField(client, "chatModel", "gpt-4o");
+        // Phase 3 controlled core model migration: Planner/Evaluator/Composer now read their own
+        // dedicated model fields (not populated by @Value outside a Spring context) rather than
+        // chatModel — set explicitly here so captured requests carry the real intended model
+        // instead of null.
+        setField(client, "plannerModel", "gpt-4.1");
+        setField(client, "evaluatorModel", "gpt-4.1");
+        setField(client, "composerModel", "gpt-4.1");
         return client;
     }
 
@@ -88,7 +95,7 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() ->
                 client.respond(List.of(ChatMessage.user(question)), systemPrompt));
-        assertFieldsIdenticalExceptCacheKey(unkeyed, keyed);
+        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     // ── 2. Evaluator sends the expected cache key ───────────────────────────────────────────────
@@ -109,7 +116,7 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() ->
                 client.respond(List.of(ChatMessage.user(question)), systemPrompt));
-        assertFieldsIdenticalExceptCacheKey(unkeyed, keyed);
+        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     // ── 3. Composer sends the expected cache key (TEXT and STRICT_JSON modes) ──────────────────
@@ -130,7 +137,7 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() ->
                 client.respond(List.of(ChatMessage.user(question)), systemPrompt));
-        assertFieldsIdenticalExceptCacheKey(unkeyed, keyed);
+        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     @Test
@@ -156,7 +163,7 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() -> client.respondWithStrictJson(
                 List.of(ChatMessage.user(question)), systemPrompt, "data_answer", schema));
-        assertFieldsIdenticalExceptCacheKey(unkeyed, keyed);
+        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     // ── 4. Stage 1 combined File Search sends the expected cache key ───────────────────────────
@@ -177,6 +184,11 @@ class PromptCacheKeyPayloadTest {
                 vectorStoreId, instructions, question, null, schema));
 
         assertEquals("zevra:stage1-concept-and-routing:v1", keyed.path("prompt_cache_key").asText());
+        // Phase 3 controlled core model migration: Stage 1 is explicitly OUT of scope — Phase 2's
+        // live evaluation found gpt-4.1 unusable there (File Search never invoked, 0/3) — so this
+        // call must still use chatModel (gpt-4o), unlike Planner/Evaluator/Composer above.
+        assertEquals("gpt-4o", keyed.path("model").asText(),
+                "Stage 1 must remain on chatModel (gpt-4o) — it was explicitly excluded from the Phase 3 migration");
         assertEquals(instructions, keyed.path("instructions").asText());
         assertTrue(keyed.path("input").asText().contains(question));
         assertEquals(vectorStoreId, keyed.path("tools").get(0).path("vector_store_ids").get(0).asText(),
@@ -209,6 +221,40 @@ class PromptCacheKeyPayloadTest {
         for (String field : unkeyedFields) {
             assertEquals(unkeyed.path(field), keyed.path(field),
                     "field '" + field + "' must be byte-for-byte identical between the keyed and unkeyed calls");
+        }
+    }
+
+    /**
+     * Phase 3 controlled core model migration variant: for Planner/Evaluator/Composer, the
+     * cache-keyed call is now EXPECTED to differ from the unkeyed call in both {@code
+     * prompt_cache_key} AND {@code model} (the unkeyed method still uses {@code chatModel}; the
+     * keyed method now uses its own dedicated model field) — every OTHER field must still be
+     * byte-for-byte identical, proving the migration changed nothing about the stable prefix,
+     * dynamic content, schema, or tool configuration.
+     */
+    private static void assertFieldsIdenticalExceptCacheKeyAndModel(
+            JsonNode unkeyed, JsonNode keyed, String expectedUnkeyedModel, String expectedKeyedModel) {
+        assertEquals(expectedUnkeyedModel, unkeyed.path("model").asText(),
+                "the existing (non-migrated) method must still use the original model");
+        assertEquals(expectedKeyedModel, keyed.path("model").asText(),
+                "the migrated method must use its own dedicated model field");
+
+        var unkeyedFields = new java.util.TreeSet<String>();
+        unkeyed.fieldNames().forEachRemaining(unkeyedFields::add);
+        var keyedFields = new java.util.TreeSet<String>();
+        keyed.fieldNames().forEachRemaining(keyedFields::add);
+
+        assertFalse(unkeyedFields.contains("prompt_cache_key"),
+                "the existing (non-cache-keyed) method must never itself gain a prompt_cache_key");
+        keyedFields.remove("prompt_cache_key");
+        assertEquals(unkeyedFields, keyedFields,
+                "the migrated call must add prompt_cache_key and nothing else besides model");
+
+        for (String field : unkeyedFields) {
+            if ("model".equals(field)) continue;
+            assertEquals(unkeyed.path(field), keyed.path(field),
+                    "field '" + field + "' must be byte-for-byte identical between the keyed and unkeyed calls "
+                            + "— only model and prompt_cache_key are expected to differ post-migration");
         }
     }
 }

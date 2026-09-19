@@ -77,6 +77,22 @@ public class AzureOpenAiClient {
     @Value("${nexus.openai.memory-selection-model:gpt-4o-mini}")
     private String memorySelectionModel;
 
+    // Phase 3 controlled core model migration: Planner/Evaluator/Composer each get their own
+    // configurable model, independent of chatModel and of each other — Stage 1 (chatWithFileSearchForConceptAndRouting)
+    // deliberately keeps using chatModel (gpt-4o) unchanged, since Phase 2's live evaluation found
+    // gpt-4.1 unusable there (File Search was never invoked, 0/3). Defaults to gpt-4.1 per Phase 2's
+    // acceptable-candidate finding for these three workloads specifically; each is a plain @Value
+    // like every other tiering field above, so any one can be reverted independently without a code
+    // change if a regression is ever observed.
+    @Value("${nexus.openai.planner-model:gpt-4.1}")
+    private String plannerModel;
+
+    @Value("${nexus.openai.evaluator-model:gpt-4.1}")
+    private String evaluatorModel;
+
+    @Value("${nexus.openai.composer-model:gpt-4.1}")
+    private String composerModel;
+
     // Phase 1 explicit prompt caching: deterministic, versioned prompt_cache_key values for the
     // four calls whose telemetry (see nexus_usage_event by call_type) already showed a large,
     // byte-identical, tenant-independent static prefix — this is purely a cache-routing HINT
@@ -712,7 +728,7 @@ public class AzureOpenAiClient {
      * other existing caller.
      */
     public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_PLANNER);
+        return doRespond(messages, systemPrompt, false, plannerModel, CACHE_KEY_PLANNER);
     }
 
     /**
@@ -721,7 +737,7 @@ public class AzureOpenAiClient {
      * attaching {@code prompt_cache_key="zevra:evaluator:v1"}.
      */
     public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_EVALUATOR);
+        return doRespond(messages, systemPrompt, false, evaluatorModel, CACHE_KEY_EVALUATOR);
     }
 
     /**
@@ -730,7 +746,7 @@ public class AzureOpenAiClient {
      * additionally attaching {@code prompt_cache_key="zevra:answer-composer:v1"}.
      */
     public String respondForComposer(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_ANSWER_COMPOSER);
+        return doRespond(messages, systemPrompt, false, composerModel, CACHE_KEY_ANSWER_COMPOSER);
     }
 
     /**
@@ -768,7 +784,7 @@ public class AzureOpenAiClient {
      */
     public String respondWithStrictJson(List<ChatMessage> messages, String systemPrompt,
                                          String jsonSchemaName, Map<String, Object> jsonSchema) {
-        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, null);
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, chatModel, null);
     }
 
     /**
@@ -776,25 +792,30 @@ public class AzureOpenAiClient {
      * com.sei.nexus.response.NaturalLanguageComposer}'s STRICT_JSON mode — identical request
      * shape, additionally attaching {@code prompt_cache_key="zevra:answer-composer:v1"}.
      * Additive: the 4-arg {@link #respondWithStrictJson} (used by {@code TeachingService} and any
-     * other existing caller) is unchanged.
+     * other existing caller) is unchanged. Phase 3: uses {@link #composerModel} (gpt-4.1 by
+     * default) rather than {@link #chatModel} — the model, like the cache key, is scoped to this
+     * one caller and does not affect the 4-arg overload's callers.
      */
     public String respondWithStrictJsonForComposer(List<ChatMessage> messages, String systemPrompt,
                                                     String jsonSchemaName, Map<String, Object> jsonSchema) {
-        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, CACHE_KEY_ANSWER_COMPOSER);
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, composerModel,
+                CACHE_KEY_ANSWER_COMPOSER);
     }
 
     /**
-     * Same as the 4-arg {@link #respondWithStrictJson}, additionally attaching an explicit
-     * Responses API {@code prompt_cache_key} (Phase 1 explicit prompt caching) when {@code
-     * promptCacheKey} is non-null/non-blank — added as the LAST top-level request field, after the
-     * existing stable {@code instructions} / dynamic {@code input} / schema construction below is
-     * unchanged and complete. Purely a cache-routing hint; never part of the rendered
-     * instructions/input content, so it cannot cause one caller's dynamic content to be served to
-     * another. {@code null} reproduces the exact prior behavior.
+     * Same as the 4-arg {@link #respondWithStrictJson}, additionally taking an explicit {@code
+     * model} (Phase 3: so this one Responses-API shape can serve both {@code chatModel}-using
+     * callers and {@link #composerModel}-using callers without duplicating the request-building
+     * code) and an explicit Responses API {@code prompt_cache_key} (Phase 1 explicit prompt
+     * caching) when {@code promptCacheKey} is non-null/non-blank — added as the LAST top-level
+     * request field, after the existing stable {@code instructions} / dynamic {@code input} /
+     * schema construction below is unchanged and complete. Purely a cache-routing hint; never part
+     * of the rendered instructions/input content, so it cannot cause one caller's dynamic content
+     * to be served to another. {@code null} cache key reproduces the exact prior behavior.
      */
     private String respondWithStrictJson(List<ChatMessage> messages, String systemPrompt,
                                           String jsonSchemaName, Map<String, Object> jsonSchema,
-                                          String promptCacheKey) {
+                                          String model, String promptCacheKey) {
         String url = BASE_URL + "/responses";
 
         StringBuilder inputBuilder = new StringBuilder();
@@ -813,7 +834,7 @@ public class AzureOpenAiClient {
         text.put("format", textFormat);
 
         Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("model", chatModel);
+        requestBody.put("model", model);
         if (systemPrompt != null && !systemPrompt.isBlank()) {
             requestBody.put("instructions", systemPrompt);
         }
@@ -835,7 +856,7 @@ public class AzureOpenAiClient {
             for (ChatMessage msg : messages) {
                 requestChars += msg.content() != null ? msg.content().length() : 0;
             }
-            recordResponsesUsage(root, chatModel, latencyMs, requestChars);
+            recordResponsesUsage(root, model, latencyMs, requestChars);
             return extractResponseText(responseBody);
         } catch (NexusException e) {
             throw e;
