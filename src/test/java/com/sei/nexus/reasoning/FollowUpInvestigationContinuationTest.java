@@ -125,8 +125,15 @@ class FollowUpInvestigationContinuationTest {
                 false, null, null, false, "conv-test", "exec-q1-inventory", priorExecution, null);
 
         // ── Assert: Planner ran ───────────────────────────────────────────────────────
-        assertEquals(1, plannerCalls.get(),
-                "Planner must be invoked for a follow-up whose subject differs from seeded evidence");
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): once the evaluator
+        // marks the purchase-order step SUFFICIENT, the engine gives the Planner one bounded
+        // extra opportunity to add an optional supplementary step (see ReasoningEngine#reason's
+        // loop-control comment) — the fake planner's `evidence.stepCount() == 1` guard already
+        // returns null for this second call, so no additional step is executed; only the call
+        // count increases from 1 to 2 relative to the pre-fix behavior.
+        assertEquals(2, plannerCalls.get(),
+                "Planner must be invoked for a follow-up whose subject differs from seeded evidence, "
+                        + "plus one bounded post-sufficiency opportunity that yields no further step");
 
         // ── Assert: Governed runtime executed a purchase-order retrieval ────────────────
         assertEquals(1, executedRequests.size());

@@ -3,6 +3,7 @@ package com.sei.nexus.agentbrain;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.common.NexusException;
 import com.sei.nexus.onboarding.TenantSettingsRepository;
 import com.sei.nexus.pack.IndustryPack;
 import com.sei.nexus.pack.IndustryPackRepository;
@@ -17,7 +18,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,13 +27,15 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Persistent AI Knowledge V1, Stage 1 File Search integration — {@link
- * ConceptScopedMetadataResolver}'s new dispatch between the File Search path ({@link
- * ConceptScopedMetadataResolver#resolveStage1Selection}, new) and the legacy catalog-in-prompt
- * path (existing, deprecated but retained). Hand-rolled fakes throughout, same convention as
- * {@code ConceptScopedMetadataResolverTest} (which this file does not modify or duplicate —
- * those 16 tests already prove the legacy path's own behavior byte-for-byte unchanged via the
- * resolver's 4-arg convenience constructor).
+ * Persistent Knowledge / native OpenAI File Search Stage 1 — {@link ConceptScopedMetadataResolver}
+ * is now the SOLE production Stage 1 semantic-resolution implementation: there is no runtime
+ * choice between a legacy and a new path, no feature flag, and no fallback from Persistent
+ * Knowledge/File Search to any other concept-selection mechanism. Required-infrastructure failure
+ * (missing Vector Store, File Search/OpenAI failure) surfaces as an explicit {@link NexusException}
+ * instead.
+ *
+ * <p>Hand-rolled fakes throughout, this project's convention — no Mockito, no Spring context, no
+ * database.
  */
 class ConceptScopedMetadataResolverFileSearchTest {
 
@@ -64,32 +66,25 @@ class ConceptScopedMetadataResolverFileSearchTest {
     static class FakeSemanticService extends SemanticService {
         final Map<String, List<String>> usedConceptKeysByConnection = new LinkedHashMap<>();
         final Map<String, List<BusinessEntity>> entitiesByConnection = new LinkedHashMap<>();
+        final List<List<String>> stage2ConceptSelectionsQueried = new java.util.ArrayList<>();
         FakeSemanticService() { super(null, null, null); }
         @Override public List<String> findDistinctConceptKeysForConnection(String connectionKey) {
             return usedConceptKeysByConnection.getOrDefault(connectionKey, List.of());
         }
         @Override public List<BusinessEntity> findEntitiesByConnectionAndConcepts(String connectionKey, List<String> conceptKeys) {
+            stage2ConceptSelectionsQueried.add(conceptKeys);
             List<BusinessEntity> all = entitiesByConnection.getOrDefault(connectionKey, List.of());
             return all.stream().filter(e -> conceptKeys.contains(e.conceptKey())).toList();
         }
     }
 
-    private static final String FLAG_KEY = "persistent_knowledge_stage1_enabled";
-
+    /** Now used only for {@code previous_response_id} conversation-chaining bookkeeping — the
+     *  Stage 1 path feature flag it used to gate no longer exists. */
     static class FakeTenantSettingsRepository extends TenantSettingsRepository {
-        Boolean flagValue = false; // null simulates a read failure for the flag key specifically
         final Map<String, String> store = new LinkedHashMap<>();
         FakeTenantSettingsRepository() { super(null); }
-        @Override public Optional<String> get(String key) {
-            if (FLAG_KEY.equals(key)) {
-                if (flagValue == null) throw new RuntimeException("simulated settings read failure");
-                return Optional.of(String.valueOf(flagValue));
-            }
-            return Optional.ofNullable(store.get(key));
-        }
-        @Override public void set(String key, String value) {
-            store.put(key, value);
-        }
+        @Override public Optional<String> get(String key) { return Optional.ofNullable(store.get(key)); }
+        @Override public void set(String key, String value) { store.put(key, value); }
     }
 
     static class FakeTenantRepository extends TenantRepository {
@@ -105,7 +100,8 @@ class ConceptScopedMetadataResolverFileSearchTest {
         }
     }
 
-    /** Distinguishes which of the two AzureOpenAiClient call shapes was used. */
+    /** Scripts the File Search call; also records whether the legacy {@code chatWithJson} call
+     *  shape was ever used — asserted to NEVER happen anywhere in this file. */
     static class SpyAiClient extends AzureOpenAiClient {
         boolean chatWithJsonCalled = false;
         boolean fileSearchCalled = false;
@@ -114,7 +110,6 @@ class ConceptScopedMetadataResolverFileSearchTest {
         String lastFileSearchQuestion;
         String lastPreviousResponseId;
         String scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[]}}";
-        String scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[]}}";
         String scriptedNewResponseId = "resp_default";
         RuntimeException fileSearchFailure; // always throws, chained or not
         RuntimeException chainedOnlyFailure; // throws only when a previousResponseId is supplied
@@ -123,7 +118,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
 
         @Override public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
             chatWithJsonCalled = true;
-            return scriptedChatResponse;
+            return "{}";
         }
 
         Map<String, Object> lastJsonSchema;
@@ -145,6 +140,14 @@ class ConceptScopedMetadataResolverFileSearchTest {
             if (fileSearchFailure != null) throw fileSearchFailure;
             if (chainedOnlyFailure != null && previousResponseId != null) throw chainedOnlyFailure;
             return new FileSearchResult(scriptedFileSearchResponse, scriptedNewResponseId);
+        }
+
+        // Phase 1 explicit prompt caching: the combined concept+routing variant now calls
+        // chatWithFileSearchForConceptAndRouting (prompt_cache_key="zevra:stage1-concept-and-routing:v1")
+        // instead of the 5-arg chatWithFileSearch above — delegate to the same fake logic.
+        @Override public FileSearchResult chatWithFileSearchForConceptAndRouting(String vectorStoreId,
+                String instructions, String question, String previousResponseId, Map<String, Object> jsonSchema) {
+            return chatWithFileSearch(vectorStoreId, instructions, question, previousResponseId, jsonSchema);
         }
     }
 
@@ -188,43 +191,30 @@ class ConceptScopedMetadataResolverFileSearchTest {
                 entity("store", "obj-store", "store")));
     }
 
-    // ── 1. Flag OFF preserves current behavior ───────────────────────────────────────────────
-
-    @Test
-    void flagOffUsesLegacyCatalogPathAndNeverCallsFileSearch() {
-        setUpCommon();
-        tenantSettings.flagValue = false;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_should_never_be_used");
-
-        newResolver().resolveObjectKeys("conn-1", "any question");
-
-        assertTrue(aiClient.chatWithJsonCalled, "flag off must use the legacy catalog-in-prompt call");
-        assertFalse(aiClient.fileSearchCalled, "flag off must never invoke File Search");
-    }
-
-    // ── 2/5. Flag ON invokes File Search and skips the legacy catalog entirely ──────────────────
-
-    @Test
-    void flagOnWithVectorStoreInvokesFileSearchAndNeverSendsTheLegacyCatalog() {
-        setUpCommon();
-        tenantSettings.flagValue = true;
+    /** Standard "happy path" tenant state shared by most tests below. */
+    private void seedReadyVectorStore() {
         TenantContext.set("tenant_x");
         tenantRepository.seed("tenant_x", "vs_tenant_x");
+    }
+
+    // ── 1. Persistent Knowledge / File Search is the sole Stage 1 path ──────────────────────────
+
+    @Test
+    void resolveObjectKeysAlwaysUsesFileSearchAndNeverTheLegacyCatalogCall() {
+        setUpCommon();
+        seedReadyVectorStore();
 
         newResolver().resolveObjectKeys("conn-1", "any question");
 
-        assertTrue(aiClient.fileSearchCalled, "flag on with a vector store must use File Search");
-        assertFalse(aiClient.chatWithJsonCalled,
-                "the legacy catalog-in-prompt call must never fire when File Search Stage 1 succeeds");
+        assertTrue(aiClient.fileSearchCalled, "Stage 1 must always use File Search");
+        assertFalse(aiClient.chatWithJsonCalled, "the legacy catalog-in-prompt call must never fire");
     }
 
-    // ── 3. File Search receives the current tenant's Vector Store ID ────────────────────────────
+    // ── 2. File Search receives the current tenant's Vector Store ID ────────────────────────────
 
     @Test
     void fileSearchReceivesTheCurrentTenantsOwnVectorStoreId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         TenantContext.set("tenant_x");
         tenantRepository.seed("tenant_x", "vs_tenant_x_specific");
 
@@ -233,76 +223,92 @@ class ConceptScopedMetadataResolverFileSearchTest {
         assertEquals("vs_tenant_x_specific", aiClient.lastVectorStoreId);
     }
 
-    // ── 4. The user question reaches the File Search-enabled LLM verbatim ───────────────────────
+    // ── 3. The user question reaches the File Search-enabled LLM verbatim ───────────────────────
 
     @Test
     void theExactUserQuestionReachesTheFileSearchCall() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
 
         newResolver().resolveObjectKeys("conn-1", "Show me all open orders.");
 
         assertEquals("Show me all open orders.", aiClient.lastFileSearchQuestion);
     }
 
-    // ── 6. File Search failure falls back safely to the legacy path ─────────────────────────────
+    // ── 4-7. Explicit failure — no fallback to any other semantic mechanism ─────────────────────
 
     @Test
-    void fileSearchFailureFallsBackToTheLegacyPathForThisCall() {
+    void missingVectorStoreFailsExplicitlyWithoutAttemptingFileSearch() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
-        aiClient.fileSearchFailure = new RuntimeException("simulated OpenAI failure");
-        aiClient.scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-
-        Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q");
-
-        assertTrue(aiClient.fileSearchCalled, "File Search must still have been attempted");
-        assertTrue(aiClient.chatWithJsonCalled, "a File Search failure must fall back to the legacy call");
-        assertTrue(result.isPresent());
-        assertEquals(List.of("obj-product"), result.get(), "the legacy fallback's own result must still be returned");
-    }
-
-    // ── 7. Missing Vector Store falls back safely, without ever attempting File Search ──────────
-
-    @Test
-    void missingVectorStoreFallsBackToLegacyPathWithoutAttemptingFileSearch() {
-        setUpCommon();
-        tenantSettings.flagValue = true;
         TenantContext.set("tenant_x");
         tenantRepository.seed("tenant_x", null); // provisioned tenant row, but no vector store yet
 
-        newResolver().resolveObjectKeys("conn-1", "q");
+        NexusException ex = assertThrows(NexusException.class, () -> newResolver().resolveObjectKeys("conn-1", "q"));
 
         assertFalse(aiClient.fileSearchCalled, "no vector store ⇒ must not even attempt File Search");
-        assertTrue(aiClient.chatWithJsonCalled, "must fall back to the legacy path");
+        assertFalse(aiClient.chatWithJsonCalled, "must never fall back to the legacy catalog-in-prompt call");
+        assertEquals(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, ex.getStatus());
     }
 
     @Test
-    void unknownTenantSchemaFallsBackToLegacyPathWithoutAttemptingFileSearch() {
+    void unknownTenantSchemaFailsExplicitlyWithoutAttemptingFileSearch() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         TenantContext.set("tenant_never_seeded");
 
-        newResolver().resolveObjectKeys("conn-1", "q");
+        assertThrows(NexusException.class, () -> newResolver().resolveObjectKeys("conn-1", "q"));
 
         assertFalse(aiClient.fileSearchCalled);
-        assertTrue(aiClient.chatWithJsonCalled);
+        assertFalse(aiClient.chatWithJsonCalled);
     }
 
     @Test
-    void noTenantContextAtAllFallsBackToLegacyPathWithoutAttemptingFileSearch() {
+    void noTenantContextAtAllFailsExplicitlyWithoutAttemptingFileSearch() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         // TenantContext deliberately left unset — resolves to "public"
 
-        newResolver().resolveObjectKeys("conn-1", "q");
+        assertThrows(NexusException.class, () -> newResolver().resolveObjectKeys("conn-1", "q"));
 
         assertFalse(aiClient.fileSearchCalled, "no tenant context (public schema) must never resolve a vector store");
-        assertTrue(aiClient.chatWithJsonCalled);
+        assertFalse(aiClient.chatWithJsonCalled);
+    }
+
+    @Test
+    void fileSearchFailureOnTheFirstCallInAConversationFailsExplicitly() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.fileSearchFailure = new RuntimeException("simulated OpenAI failure");
+
+        NexusException ex = assertThrows(NexusException.class, () -> newResolver().resolveObjectKeys("conn-1", "q"));
+
+        assertTrue(aiClient.fileSearchCalled, "File Search must still have been attempted");
+        assertFalse(aiClient.chatWithJsonCalled, "a File Search failure must never fall back to the legacy call");
+        assertEquals(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, ex.getStatus());
+        assertTrue(ex.getMessage().contains("conn-1"), "the failure message should identify the affected connection");
+    }
+
+    @Test
+    void bothChainedAndFreshRetryFailingFailsExplicitlyWithoutAnyFallback() {
+        setUpCommon();
+        seedReadyVectorStore();
+        tenantSettings.store.put("stage1_response_id:conv-1", "resp_stale");
+        aiClient.fileSearchFailure = new RuntimeException("simulated: OpenAI unavailable");
+
+        assertThrows(NexusException.class, () -> newResolver().resolveObjectKeys("conn-1", "q", "conv-1"));
+
+        assertEquals(2, aiClient.fileSearchCallCount, "exactly one chained attempt, then exactly one fresh retry");
+        assertFalse(aiClient.chatWithJsonCalled, "when even the fresh retry fails, there must still be no legacy fallback");
+    }
+
+    @Test
+    void combinedCallFailureFailsExplicitlyWithoutFallback() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.fileSearchFailure = new RuntimeException("simulated OpenAI failure");
+
+        assertThrows(NexusException.class,
+                () -> newResolver().resolveObjectKeysWithRouting("conn-1", "q", "conv-1", false));
+
+        assertFalse(aiClient.chatWithJsonCalled, "a combined-call failure must never fall back to the legacy path");
     }
 
     // ── 8. No relevant knowledge preserves existing Optional.of(List.of()) semantics ────────────
@@ -310,9 +316,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void noRelevantKnowledgeReturnsOptionalOfEmptyListNotOptionalEmpty() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[]}}";
 
         Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "unrelated question");
@@ -326,9 +330,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void multipleRetrievedConceptsAreAllValidatedAndResolvedToObjectKeys() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"store\"]}}";
 
         Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q");
@@ -341,9 +343,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void invalidConceptKeyFromFileSearchIsDiscardedNeverPassedToStage2() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"made-up-concept\"]}}";
 
         Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q");
@@ -357,7 +357,6 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void tenantAOnlyEverReceivesTenantAsOwnVectorStoreId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         tenantRepository.seed("tenant_a", "vs_a");
         tenantRepository.seed("tenant_b", "vs_b");
 
@@ -372,30 +371,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
         assertEquals("vs_b", aiClient.lastVectorStoreId, "tenant B's own call must never see tenant A's vector store id");
     }
 
-    // ── 11. Downstream Stage 2 / object-key resolution is identical regardless of Stage 1 source ─
-
-    @Test
-    void stage2ResolutionIsIdenticalWhicheverStage1PathSelectedTheSameConcepts() {
-        setUpCommon();
-        // Legacy path
-        tenantSettings.flagValue = false;
-        aiClient.scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-        Optional<List<String>> legacyResult = newResolver().resolveObjectKeys("conn-1", "q");
-
-        // File Search path, same selected concept
-        aiClient = new SpyAiClient();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
-        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-        Optional<List<String>> fileSearchResult = newResolver().resolveObjectKeys("conn-1", "q");
-
-        assertEquals(legacyResult, fileSearchResult,
-                "AgentBrain's downstream consumption of the Optional<List<String>> result must be unaffected "
-                        + "by which Stage 1 implementation produced it");
-    }
-
-    // ── 13. investigation_hints is never referenced by the new prompt ──────────────────────────
+    // ── 11. investigation_hints is never referenced by the non-combined prompt ─────────────────
 
     @Test
     void fileSearchSystemPromptNeverMentionsInvestigationHints() throws Exception {
@@ -412,9 +388,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void firstCallInAConversationHasNoPreviousResponseId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
 
         newResolver().resolveObjectKeys("conn-1", "Show me all purchase orders", "conv-1");
 
@@ -424,9 +398,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void previousResponseIdIsPassedWhenAlreadyStoredForThisConversation() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         tenantSettings.store.put("stage1_response_id:conv-1", "resp_turn1");
 
         newResolver().resolveObjectKeys("conn-1", "Only the submitted ones", "conv-1");
@@ -437,9 +409,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void theLatestResponseIdIsPersistedAfterASuccessfulCall() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedNewResponseId = "resp_new_1";
 
         newResolver().resolveObjectKeys("conn-1", "Show me all purchase orders", "conv-1");
@@ -450,9 +420,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void turnTwoUsesTurnOnesStoredResponseId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         ConceptScopedMetadataResolver resolver = newResolver();
 
         aiClient.scriptedNewResponseId = "resp_turn1";
@@ -467,9 +435,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void turnThreeUsesTurnTwosStoredResponseId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         ConceptScopedMetadataResolver resolver = newResolver();
 
         aiClient.scriptedNewResponseId = "resp_turn1";
@@ -485,9 +451,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void missingStoredResponseIdStartsAFreshNonChainedCall() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         // no entry in tenantSettings.store for this conversation key
 
         Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q", "conv-never-seen");
@@ -499,9 +463,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void invalidOrExpiredPreviousResponseIdTriggersExactlyOneFreshRetry() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         tenantSettings.store.put("stage1_response_id:conv-1", "resp_stale");
         aiClient.chainedOnlyFailure = new RuntimeException("simulated: previous_response_id not found");
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
@@ -511,15 +473,13 @@ class ConceptScopedMetadataResolverFileSearchTest {
         assertEquals(2, aiClient.fileSearchCallCount, "exactly one chained attempt, then exactly one fresh retry");
         assertTrue(result.isPresent(), "the fresh retry's success must still be returned as a normal Stage 1 result");
         assertEquals(List.of("obj-product"), result.get());
-        assertFalse(aiClient.chatWithJsonCalled, "the fresh retry succeeding must never fall through to the legacy path");
+        assertFalse(aiClient.chatWithJsonCalled, "the fresh retry succeeding must never touch the legacy call shape");
     }
 
     @Test
     void freshRetryAfterAChainedFailureUpdatesTheStoredResponseId() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         tenantSettings.store.put("stage1_response_id:conv-1", "resp_stale");
         aiClient.chainedOnlyFailure = new RuntimeException("simulated: previous_response_id not found");
         aiClient.scriptedNewResponseId = "resp_fresh_retry";
@@ -531,28 +491,10 @@ class ConceptScopedMetadataResolverFileSearchTest {
     }
 
     @Test
-    void bothChainedAndFreshRetryFailingFallsBackToTheLegacyPath() {
-        setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
-        tenantSettings.store.put("stage1_response_id:conv-1", "resp_stale");
-        aiClient.fileSearchFailure = new RuntimeException("simulated: OpenAI unavailable");
-        aiClient.scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-
-        Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q", "conv-1");
-
-        assertTrue(aiClient.chatWithJsonCalled, "when even the fresh retry fails, the legacy path must still run");
-        assertEquals(List.of("obj-product"), result.orElseThrow());
-    }
-
-    @Test
     void tenantAAndTenantBNeverShareAConversationResponseId() {
         setUpCommon();
         FakeTenantSettingsRepository settingsA = new FakeTenantSettingsRepository();
-        settingsA.flagValue = true;
         FakeTenantSettingsRepository settingsB = new FakeTenantSettingsRepository();
-        settingsB.flagValue = true;
         tenantRepository.seed("tenant_a", "vs_a");
         tenantRepository.seed("tenant_b", "vs_b");
 
@@ -578,9 +520,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void conversationAAndConversationBNeverShareAResponseIdWithinTheSameTenant() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         ConceptScopedMetadataResolver resolver = newResolver();
 
         aiClient.scriptedNewResponseId = "resp_conv_a";
@@ -594,7 +534,6 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void theCorrectTenantVectorStoreIsAlwaysAttachedRegardlessOfChaining() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         TenantContext.set("tenant_x");
         tenantRepository.seed("tenant_x", "vs_tenant_x_specific");
         tenantSettings.store.put("stage1_response_id:conv-1", "resp_prior");
@@ -607,9 +546,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void theOutputContractIsUnchangedByConversationAwareness() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"store\"]}}";
 
         Optional<List<String>> result = newResolver().resolveObjectKeys("conn-1", "q", "conv-1");
@@ -620,26 +557,9 @@ class ConceptScopedMetadataResolverFileSearchTest {
     }
 
     @Test
-    void flagOffPreservesLegacyBehaviorEvenWithAConversationIdSupplied() {
-        setUpCommon();
-        tenantSettings.flagValue = false;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_should_never_be_used");
-
-        newResolver().resolveObjectKeys("conn-1", "any question", "conv-1");
-
-        assertTrue(aiClient.chatWithJsonCalled, "flag off must still use the legacy path even with a conversationId");
-        assertFalse(aiClient.fileSearchCalled, "flag off must never invoke File Search, conversationId or not");
-        assertNull(tenantSettings.store.get("stage1_response_id:conv-1"),
-                "the legacy path must never write a Stage 1 response id");
-    }
-
-    @Test
     void existingNonConversationCallersRemainFullyFunctional() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
 
         // The pre-existing 2-arg overload (no conversationId at all) must still work exactly as before.
@@ -654,9 +574,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void combinedCallResolvesConceptsAndRoutingInOneCall() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]},"
                 + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
 
@@ -673,9 +591,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void runtimeFactIsPassedAsPlainInputTextNeverAsRetrieval() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[]},"
                 + "\"routing\":{\"type\":\"ANSWER_FROM_MEMORY\",\"clarificationQuestion\":\"\"}}";
 
@@ -688,9 +604,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void hybridRoutingIsParsedCorrectly() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]},"
                 + "\"routing\":{\"type\":\"HYBRID_DOC_AND_DATA\",\"clarificationQuestion\":\"\"}}";
 
@@ -703,9 +617,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void clarificationRoutingCarriesTheQuestionText() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[]},"
                 + "\"routing\":{\"type\":\"ASK_CLARIFICATION\",\"clarificationQuestion\":\"Which product line do you mean?\"}}";
 
@@ -719,9 +631,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void knowledgeGapRoutingIsParsedCorrectly() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[]},"
                 + "\"routing\":{\"type\":\"KNOWLEDGE_GAP\",\"clarificationQuestion\":\"\"}}";
 
@@ -735,9 +645,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void invalidRoutingTypeIsDiscardedNotGuessedAt() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         // A value outside the five-value contract — must never be invented/coerced into a guess.
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]},"
                 + "\"routing\":{\"type\":\"MADE_UP_TYPE\",\"clarificationQuestion\":\"\"}}";
@@ -751,44 +659,8 @@ class ConceptScopedMetadataResolverFileSearchTest {
     }
 
     @Test
-    void flagOffProducesConceptsWithoutRoutingLegacyFallbackRequired() {
-        setUpCommon();
-        tenantSettings.flagValue = false;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_should_never_be_used");
-        aiClient.scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-
-        ConceptScopedMetadataResolver.CombinedResolution result =
-                newResolver().resolveObjectKeysWithRouting("conn-1", "q", "conv-1", false);
-
-        assertFalse(aiClient.fileSearchCalled, "flag off must never invoke File Search");
-        assertTrue(result.routing().isEmpty(),
-                "the legacy catalog-in-prompt path has no routing capability — caller must fall back to Decision Router");
-        assertEquals(List.of("obj-product"), result.objectKeys().orElseThrow(),
-                "concept resolution itself must still work via the legacy path");
-    }
-
-    @Test
-    void combinedCallFailureFallsBackToLegacyPathWithNoRouting() {
-        setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
-        aiClient.fileSearchFailure = new RuntimeException("simulated OpenAI failure");
-        aiClient.scriptedChatResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]}}";
-
-        ConceptScopedMetadataResolver.CombinedResolution result =
-                newResolver().resolveObjectKeysWithRouting("conn-1", "q", "conv-1", false);
-
-        assertTrue(aiClient.chatWithJsonCalled, "a combined-call failure must fall back to the legacy path");
-        assertTrue(result.routing().isEmpty(), "the legacy fallback never carries a routing decision");
-        assertEquals(List.of("obj-product"), result.objectKeys().orElseThrow());
-    }
-
-    @Test
     void tenantAAndTenantBNeverShareARoutingCall() {
         setUpCommon();
-        tenantSettings.flagValue = true;
         tenantRepository.seed("tenant_a", "vs_a");
         tenantRepository.seed("tenant_b", "vs_b");
 
@@ -806,9 +678,7 @@ class ConceptScopedMetadataResolverFileSearchTest {
     @Test
     void combinedCallChainsViaPreviousResponseIdAcrossTurnsJustLikeTheConceptOnlyPath() {
         setUpCommon();
-        tenantSettings.flagValue = true;
-        TenantContext.set("tenant_x");
-        tenantRepository.seed("tenant_x", "vs_tenant_x");
+        seedReadyVectorStore();
         aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]},"
                 + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
         ConceptScopedMetadataResolver resolver = newResolver();
@@ -820,5 +690,94 @@ class ConceptScopedMetadataResolverFileSearchTest {
         aiClient.scriptedNewResponseId = "resp_turn2";
         resolver.resolveObjectKeysWithRouting("conn-1", "Only the active ones", "conv-1", false);
         assertEquals("resp_turn1", aiClient.lastPreviousResponseId, "turn 2 must chain to turn 1's response id");
+    }
+
+    // ── Concept-Level Disjunctive Ambiguity design — SINGLE / MULTI_SPAN / AMBIGUOUS ────────────
+    // (ported from the now-deleted legacy-only ConceptScopedMetadataResolverTest, adapted to the
+    // combined Persistent Knowledge + routing call, the canonical production Stage 1 path)
+
+    @Test
+    void resolutionTypeSingleProceedsToStage2Normally() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"],"
+                + "\"resolutionType\":\"SINGLE\",\"conceptClarificationQuestion\":\"\"},"
+                + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
+
+        ConceptScopedMetadataResolver.CombinedResolution result =
+                newResolver().resolveObjectKeysWithRouting("conn-1", "show me the product catalog", "conv-1", false);
+
+        assertTrue(result.conceptAmbiguityClarification().isEmpty());
+        assertEquals(List.of("product"), result.conceptKeys().get());
+        assertEquals(List.of("obj-product"), result.objectKeys().get());
+        assertEquals(List.of(List.of("product")), semanticService.stage2ConceptSelectionsQueried,
+                "Stage 2 must run normally for a single, unambiguous concept");
+    }
+
+    @Test
+    void resolutionTypeMultiSpanProceedsWithBothConcepts() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"store\"],"
+                + "\"resolutionType\":\"MULTI_SPAN\",\"conceptClarificationQuestion\":\"\"},"
+                + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
+
+        ConceptScopedMetadataResolver.CombinedResolution result =
+                newResolver().resolveObjectKeysWithRouting("conn-1", "compare products across stores", "conv-1", false);
+
+        assertTrue(result.conceptAmbiguityClarification().isEmpty());
+        assertEquals(List.of("product", "store"), result.conceptKeys().get());
+        assertTrue(result.objectKeys().get().containsAll(List.of("obj-product", "obj-store")));
+    }
+
+    @Test
+    void resolutionTypeAmbiguousNeverCallsStage2() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"store\"],"
+                + "\"resolutionType\":\"AMBIGUOUS\","
+                + "\"conceptClarificationQuestion\":\"Do you mean the product catalog or store locations?\"},"
+                + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
+
+        ConceptScopedMetadataResolver.CombinedResolution result =
+                newResolver().resolveObjectKeysWithRouting("conn-1", "ambiguous question", "conv-1", false);
+
+        assertTrue(result.conceptAmbiguityClarification().isPresent());
+        assertEquals("Do you mean the product catalog or store locations?", result.conceptAmbiguityClarification().get());
+        assertTrue(result.objectKeys().isPresent(), "present-but-empty, never Optional.empty()");
+        assertTrue(result.objectKeys().get().isEmpty(), "no physical object may be resolved for an ambiguous question");
+        assertTrue(semanticService.stage2ConceptSelectionsQueried.isEmpty(),
+                "Stage 2 must NEVER be invoked when Stage 1 signals ambiguity");
+        assertEquals(List.of("product", "store"), result.conceptKeys().get());
+    }
+
+    @Test
+    void malformedAmbiguousSignalWithNoQuestionIsDiscarded() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\",\"store\"],"
+                + "\"resolutionType\":\"AMBIGUOUS\",\"conceptClarificationQuestion\":\"\"},"
+                + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
+
+        ConceptScopedMetadataResolver.CombinedResolution result =
+                newResolver().resolveObjectKeysWithRouting("conn-1", "q", "conv-1", false);
+
+        assertTrue(result.conceptAmbiguityClarification().isEmpty());
+        assertFalse(semanticService.stage2ConceptSelectionsQueried.isEmpty(),
+                "a discarded/malformed ambiguity signal falls through to normal Stage 2 resolution");
+    }
+
+    @Test
+    void resolutionTypeFieldIsBackwardCompatibleWithResponsesLackingIt() {
+        setUpCommon();
+        seedReadyVectorStore();
+        aiClient.scriptedFileSearchResponse = "{\"metadataRequest\":{\"conceptKeys\":[\"product\"]},"
+                + "\"routing\":{\"type\":\"QUERY_LIVE_DATA\",\"clarificationQuestion\":\"\"}}";
+
+        ConceptScopedMetadataResolver.CombinedResolution result =
+                newResolver().resolveObjectKeysWithRouting("conn-1", "q", "conv-1", false);
+
+        assertTrue(result.conceptAmbiguityClarification().isEmpty());
+        assertEquals(List.of("product"), result.conceptKeys().get());
     }
 }

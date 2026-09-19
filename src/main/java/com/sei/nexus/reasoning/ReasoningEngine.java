@@ -137,6 +137,11 @@ public class ReasoningEngine {
         EvidenceStore evidence      = new EvidenceStore();
         String        resultSnapshot = null;
         int           stepNo         = 1;
+        // Root-cause fix (chart-hint architecture investigation, 2026-09): bounds how many
+        // additional Planner round-trips are allowed AFTER the evaluator first judges the
+        // accumulated evidence sufficient — see the loop-control comment below for why this
+        // exists and what it replaces.
+        int           postSufficiencyPlannerCalls = 0;
         // PRO-33 retry memory: (column, literal) pairs already rejected once —
         // the "re-prompted once" bound of PRO-32 §5.
         Set<String>            literalRejections = new HashSet<>();
@@ -322,6 +327,7 @@ public class ReasoningEngine {
 
             // Literal hard block — a repeat violation on an authoritative domain.
             if (ro.status() == GovernedSqlRuntime.Status.LITERAL_BLOCKED) {
+                log.info("Step {} literal-blocked for run '{}': {}", stepNo, runKey, ro.message());
                 evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
                         plan.rationale(), "LITERAL_BLOCKED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "LITERAL_BLOCKED", ro.message(),
@@ -370,11 +376,16 @@ public class ReasoningEngine {
                 break;
             }
 
-            // Execution failed — already audited by the runtime.
+            // Execution failed — already audited by the runtime. Every other terminal branch in
+            // this loop pairs its evidence.addOutcome() with a saveStep() so the step (including
+            // the attempted plan.sql()) is persisted to nexus_reasoning_step for later diagnosis;
+            // this branch was missing that call, which meant a driver-level failure (e.g. a SQL
+            // syntax error) left no persisted trace of what was actually sent to the database.
             if (ro.status() == GovernedSqlRuntime.Status.FAILED) {
                 log.error("Step {} execution failed: {}", stepNo, ro.message(), ro.failure());
                 evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
                         plan.rationale(), "ERROR", ro.message(), 0L);
+                saveStep(sessionKey, stepNo, plan, "ERROR", ro.message(), evidence, List.of(), null);
                 break;
             }
 
@@ -401,7 +412,9 @@ public class ReasoningEngine {
             // ── 6. Evaluate ───────────────────────────────────────────────
             ReasoningEvaluator.EvaluationResult eval = evaluator.evaluate(question, buildTempEvidence(evidence, stepNo, plan, rows, elapsed));
             evidence.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                    rows, plan.rationale(), eval.decision(), eval.rationale(), elapsed);
+                    rows, plan.rationale(), eval.decision(), eval.rationale(), elapsed,
+                    plan.chartType(), plan.categoryKey(), plan.valueKeys(),
+                    plan.categoryLabel(), plan.valueLabels(), plan.metricLabel());
             saveStep(sessionKey, stepNo, plan, eval.decision(), eval.rationale(), evidence, rows, rJson);
 
             eventBus.publish(runKey, "step_completed", Map.of(
@@ -413,7 +426,27 @@ public class ReasoningEngine {
                     "decision", eval.decision(),
                     "rationale",eval.rationale()));
 
-            if (eval.isSufficient() || "DEAD_END".equals(eval.decision())) break;
+            if ("DEAD_END".equals(eval.decision())) break;
+
+            // Root-cause fix (chart-hint architecture investigation): this used to be
+            // `if (eval.isSufficient() || "DEAD_END".equals(eval.decision())) break;` — breaking
+            // the loop unconditionally the instant the evaluator judged the accumulated evidence
+            // sufficient. That meant the Planner was NEVER re-consulted after answering the
+            // primary question, so its own SUPPLEMENTARY BREAKDOWN STEPS judgment call (see
+            // ReasoningPlanner.SYSTEM_PROMPT) had no real opportunity to fire — this is exactly
+            // why zero supplementary steps were observed live for "show me all open purchase
+            // orders". Now: once sufficiency is first reached, the Planner still gets asked
+            // again on the next iteration — remaining entirely free to return {"done": true}
+            // immediately, as it will for the ordinary case — but bounded to at most 2 further
+            // round-trips (matching the prompt's own "one or two additional steps, never more"
+            // guidance) so cost/latency stays controlled even if the model keeps proposing
+            // steps. MAX_STEPS remains the hard ceiling regardless. This never forces a
+            // supplementary step to be planned — it only removes the short-circuit that
+            // previously prevented the Planner from ever being asked.
+            if (eval.isSufficient()) {
+                if (postSufficiencyPlannerCalls >= 2) break;
+                postSufficiencyPlannerCalls++;
+            }
 
             stepNo++;
         }
@@ -450,7 +483,9 @@ public class ReasoningEngine {
         List<InvestigationDataset> investigationDatasets = evidence.getSteps().stream()
                 .filter(s -> !s.rows().isEmpty())
                 .map(s -> new InvestigationDataset(s.stepNo(), s.description(),
-                        s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows()))
+                        s.rows().size() > 100 ? s.rows().subList(0, 100) : s.rows(),
+                        s.chartType(), s.categoryKey(), s.valueKeys(),
+                        s.categoryLabel(), s.valueLabels(), s.metricLabel()))
                 .toList();
 
         // Update session with final stats
@@ -493,10 +528,12 @@ public class ReasoningEngine {
         EvidenceStore temp = new EvidenceStore();
         for (EvidenceStore.StepEvidence s : existing.getSteps()) {
             temp.add(s.stepNo(), s.description(), s.sql(), s.connectionKey(),
-                    s.rows(), s.plannerRationale(), s.evaluatorDecision(), s.evaluatorRationale(), s.executionMs());
+                    s.rows(), s.plannerRationale(), s.evaluatorDecision(), s.evaluatorRationale(), s.executionMs(),
+                    s.chartType(), s.categoryKey(), s.valueKeys());
         }
         temp.add(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
-                rows, plan.rationale(), null, null, ms);
+                rows, plan.rationale(), null, null, ms,
+                plan.chartType(), plan.categoryKey(), plan.valueKeys());
         return temp;
     }
 

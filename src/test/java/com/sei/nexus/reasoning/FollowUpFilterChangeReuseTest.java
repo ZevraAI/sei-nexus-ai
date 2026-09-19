@@ -122,7 +122,14 @@ class FollowUpFilterChangeReuseTest {
                 false, null, null, false, "conv-test", "exec-q1-pos", priorExecution, null);
 
         // ── 3. Planner invoked for the filtered follow-up ────────────────────────────────
-        assertEquals(1, plannerCalls.get(), "Planner must be invoked when the follow-up requires a different result set");
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): once the evaluator
+        // marks the filtered step SUFFICIENT, the engine gives the Planner one bounded extra
+        // opportunity to add an optional supplementary step — the fake planner's
+        // `evidence.stepCount() == 1` guard already returns null for this second call, so no
+        // additional step/execution/evaluation results (see the unchanged evaluatorCalls
+        // assertion below).
+        assertEquals(2, plannerCalls.get(), "Planner must be invoked when the follow-up requires a "
+                + "different result set, plus one bounded post-sufficiency opportunity");
 
         // ── 4. Generated/executed query contains the appropriate filter ─────────────────
         assertEquals(1, executedRequests.size());
@@ -259,7 +266,10 @@ class FollowUpFilterChangeReuseTest {
                 question, question, "rsession-test", "schema context", "run-q2", "user@test.com",
                 false, null, null, false, "conv-test", "exec-q1-pos", priorExecution, null);
 
-        assertEquals(1, plannerCalls.get());
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): see the analogous
+        // comment in filteredFollowUpInvokesPlannerAndReturnsOnlyMatchingRows above — one bounded
+        // extra post-sufficiency Planner call, yielding no further step.
+        assertEquals(2, plannerCalls.get());
         assertEquals(1, result.queryData().size(),
                 "the displayed result set must actually be the closed subset, not the full 12-row carryover");
         assertEquals("closed", result.queryData().get(0).get("status"));

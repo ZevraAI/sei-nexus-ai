@@ -37,15 +37,16 @@ class AzureOpenAiClientMetricsTest {
 
     /** Records every {@link UsageService#record} invocation without touching a real repository. */
     static class RecordingUsageService extends UsageService {
-        record Call(String model, int promptTokens, int completionTokens, int cachedTokens) {}
+        record Call(String model, int promptTokens, int completionTokens, int cachedTokens, String callType) {}
         final List<Call> calls = new java.util.ArrayList<>();
         RecordingUsageService() { super(null); }
-        // Cost baseline instrumentation: AzureOpenAiClient.recordUsage() now calls the 4-arg
-        // overload (added so cached tokens can be priced at the discounted rate) instead of the
-        // 3-arg one — override that actual seam, not the one it delegates from, or these calls
+        // Cost/call-type observability: AzureOpenAiClient.recordUsage() now calls the 5-arg
+        // overload (added so call_type can be persisted alongside cached_tokens) instead of the
+        // 4-arg one — override that actual seam, not the one it delegates from, or these calls
         // fall through to the real (un-fakeable, DB-backed) implementation and go unrecorded here.
-        @Override public void record(String model, int promptTokens, int completionTokens, int cachedTokens) {
-            calls.add(new Call(model, promptTokens, completionTokens, cachedTokens));
+        @Override
+        public void record(String model, int promptTokens, int completionTokens, int cachedTokens, String callType) {
+            calls.add(new Call(model, promptTokens, completionTokens, cachedTokens, callType));
         }
     }
 
@@ -111,6 +112,39 @@ class AzureOpenAiClientMetricsTest {
     }
 
     @Test
+    void callTypeReachesUsageServiceFromTheExistingLlmCallTag() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient("""
+                {"choices":[{"message":{"content":"ok"}}],
+                 "usage":{"prompt_tokens":10,"completion_tokens":2,
+                           "prompt_tokens_details":{"cached_tokens":0}}}
+                """, usage);
+
+        LlmCallTag.set("PLANNER");
+        client.chat(List.of(ChatMessage.user("hi")), "system prompt");
+
+        assertEquals(1, usage.calls.size());
+        assertEquals("PLANNER", usage.calls.get(0).callType(),
+                "the call site's existing LlmCallTag must reach UsageService.record as call_type");
+    }
+
+    @Test
+    void noLlmCallTagSetYieldsTheUntaggedSafeRepresentationNotAGuess() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient("""
+                {"choices":[{"message":{"content":"ok"}}],
+                 "usage":{"prompt_tokens":10,"completion_tokens":2}}
+                """, usage);
+
+        // No LlmCallTag.set(...) call before this — deliberately simulating a caller that never tagged.
+        client.chat(List.of(ChatMessage.user("hi")), "system prompt");
+
+        assertEquals("UNTAGGED", usage.calls.get(0).callType(),
+                "an untagged call must report the existing safe 'UNTAGGED' representation, "
+                        + "never an inferred/guessed call type");
+    }
+
+    @Test
     void absentUsageNodeIsStillACompleteNoOpExactlyAsBeforeThisInstrumentation() {
         RecordingUsageService usage = new RecordingUsageService();
         ScriptedClient client = new ScriptedClient(
@@ -165,5 +199,109 @@ class AzureOpenAiClientMetricsTest {
         client.chat(List.of(ChatMessage.user("hi")), "system");
 
         assertEquals("UNTAGGED", LlmCallTag.get());
+    }
+
+    // ── Phase 0 telemetry hardening: Responses API path (recordResponsesUsage) ─────────────────
+    // Chat Completions (doChat/recordUsage) is covered above; the Responses API path
+    // (doRespond/recordResponsesUsage) reads different field names (input_tokens/output_tokens/
+    // input_tokens_details.cached_tokens vs prompt_tokens/completion_tokens/
+    // prompt_tokens_details.cached_tokens) and is exercised by a different set of core calls
+    // (Stage 1, Memory Selection, Planner, Evaluator, Composer, Teaching) — verified separately
+    // so a regression in one shape can never hide behind the other's passing tests.
+
+    @Test
+    void responsesApiUsageWithCachedTokensIsPersistedCorrectly() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient("""
+                {"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                 "usage":{"input_tokens":2000,"output_tokens":80,
+                           "input_tokens_details":{"cached_tokens":1500}}}
+                """, usage);
+
+        LlmCallTag.set("PLANNER");
+        String answer = client.respond(List.of(ChatMessage.user("hi")), "system prompt");
+
+        assertEquals("ok", answer);
+        assertEquals(1, usage.calls.size());
+        assertEquals(2000, usage.calls.get(0).promptTokens());
+        assertEquals(80, usage.calls.get(0).completionTokens());
+        assertEquals(1500, usage.calls.get(0).cachedTokens());
+        assertEquals("PLANNER", usage.calls.get(0).callType());
+    }
+
+    @Test
+    void responsesApiUsageWithoutCachedTokensDefaultsToZeroRatherThanThrowing() {
+        RecordingUsageService usage = new RecordingUsageService();
+        // A Responses payload with usage but no input_tokens_details at all — must not throw,
+        // and must not be confused with "cache hit of 0" being anything other than "unknown/none".
+        ScriptedClient client = new ScriptedClient("""
+                {"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                 "usage":{"input_tokens":500,"output_tokens":40}}
+                """, usage);
+
+        assertDoesNotThrow(() -> client.respond(List.of(ChatMessage.user("hi")), "system prompt"));
+        assertEquals(1, usage.calls.size());
+        assertEquals(500, usage.calls.get(0).promptTokens());
+        assertEquals(40, usage.calls.get(0).completionTokens());
+        assertEquals(0, usage.calls.get(0).cachedTokens());
+    }
+
+    @Test
+    void responsesApiWithAbsentUsageNodeNeverRecordsAPhantomRow() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient(
+                "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}",
+                usage);
+
+        client.respond(List.of(ChatMessage.user("hi")), "system prompt");
+
+        assertTrue(usage.calls.isEmpty(), "no usage node in a Responses payload ⇒ record() must never be called");
+    }
+
+    // ── Phase 0 telemetry hardening: embeddings are not misclassified as chat usage ─────────────
+    // embed() reuses the same recordUsage() seam Chat Completions calls do (embeddings responses
+    // shape their usage object the same way: prompt_tokens/completion_tokens, no
+    // prompt_tokens_details at all since OpenAI does not cache embedding inputs). This proves (a)
+    // an embedding response's absent prompt_tokens_details still defaults cached_tokens to 0
+    // without throwing, and (b) when the call site tags itself (as DocumentMemoryService now does
+    // at both its ingest and query-time embed() call sites), that tag reaches call_type exactly
+    // like every other call — an embedding call is therefore identifiable by call_type even though
+    // it shares the default feature="chat" bucket (a separate, pre-existing, out-of-scope-for-this-
+    // phase column not touched here).
+
+    @Test
+    void embeddingUsageIsTaggedAndCachedTokensDefaultToZero() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient("""
+                {"data":[{"embedding":[0.1,0.2,0.3]}],
+                 "usage":{"prompt_tokens":42,"total_tokens":42}}
+                """, usage);
+
+        LlmCallTag.set("MEMORY_EMBEDDING");
+        EmbeddingResult result = client.embed("some chunk of document text");
+
+        assertEquals(3, result.embedding().length);
+        assertEquals(1, usage.calls.size());
+        assertEquals(42, usage.calls.get(0).promptTokens());
+        assertEquals(0, usage.calls.get(0).completionTokens(),
+                "embeddings responses have no completion_tokens field — must default to 0, not throw");
+        assertEquals(0, usage.calls.get(0).cachedTokens(),
+                "OpenAI does not report prompt_tokens_details for embeddings — must default to 0");
+        assertEquals("MEMORY_EMBEDDING", usage.calls.get(0).callType(),
+                "an embedding call must be identifiable by call_type, distinct from chat/reasoning calls");
+    }
+
+    @Test
+    void untaggedEmbeddingCallStillYieldsTheSafeUntaggedRepresentation() {
+        RecordingUsageService usage = new RecordingUsageService();
+        ScriptedClient client = new ScriptedClient("""
+                {"data":[{"embedding":[0.1]}],
+                 "usage":{"prompt_tokens":10,"total_tokens":10}}
+                """, usage);
+
+        // No LlmCallTag.set(...) — proves the plumbing itself never invents a classification.
+        client.embed("text");
+
+        assertEquals("UNTAGGED", usage.calls.get(0).callType());
     }
 }

@@ -26,11 +26,16 @@ class AlertComposerServiceTest {
         String seenUser;
         boolean fail = false;
         FakeAi() { super(new ObjectMapper(), null); }
-        @Override public String chat(List<ChatMessage> messages, String systemPrompt) {
+        @Override public String respond(List<ChatMessage> messages, String systemPrompt) {
             this.seenSystem = systemPrompt;
             this.seenUser = messages.get(0).content();
             if (fail) throw new RuntimeException("model down");
             return "Inventory turnover dropped 32% below its 90-day baseline; review procurement.";
+        }
+        // Phase 1 explicit prompt caching: NaturalLanguageComposer's TEXT mode now calls
+        // respondForComposer (prompt_cache_key="zevra:answer-composer:v1") instead of respond.
+        @Override public String respondForComposer(List<ChatMessage> messages, String systemPrompt) {
+            return respond(messages, systemPrompt);
         }
     }
 

@@ -290,7 +290,12 @@ public class EnterpriseMapService {
         // feature bucket. No effect on the call itself.
         com.sei.nexus.ai.LlmCallTag.set("ENTERPRISE_MAP_SIMULATE");
         com.sei.nexus.usage.UsageContext.set("enterprise_map", null);
-        String responseJson = aiClient.chatWithJson(List.of(ChatMessage.user(userMessage)), systemPrompt);
+        // Model tiering (pre-production cost optimization): reuses nexus.openai.onboarding-model
+        // (defaults to gpt-4o-mini) rather than introducing a dedicated property — this is the
+        // same admin/onboarding-tooling family as BusinessObjectBatchAnalyzer/OnboardingService,
+        // and the task explicitly asked not to invent unnecessary config properties. Prompt/
+        // parsing/error handling below are unchanged.
+        String responseJson = aiClient.chatWithJsonForOnboarding(List.of(ChatMessage.user(userMessage)), systemPrompt);
         Map<String, Object> parsed = parseJson(responseJson);
 
         String sql = (String) parsed.get("sql");

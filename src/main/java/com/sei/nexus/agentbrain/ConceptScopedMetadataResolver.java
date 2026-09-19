@@ -3,11 +3,10 @@ package com.sei.nexus.agentbrain;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.ai.ChatMessage;
+import com.sei.nexus.common.NexusException;
 import com.sei.nexus.onboarding.TenantSettingsRepository;
 import com.sei.nexus.pack.IndustryPack;
 import com.sei.nexus.pack.IndustryPackRepository;
-import com.sei.nexus.pack.PackEntity;
 import com.sei.nexus.pack.TenantPack;
 import com.sei.nexus.semantic.BusinessEntity;
 import com.sei.nexus.semantic.SemanticService;
@@ -17,6 +16,7 @@ import com.sei.nexus.tenant.TenantRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Concept-Scoped Metadata Narrowing (upstream Agent Brain context reduction).
@@ -34,28 +33,41 @@ import java.util.stream.Collectors;
  * services/repositories — no new persistence, no new AI mechanism:
  *
  * <ul>
- *   <li><b>Stage 1</b> — {@link #resolveObjectKeys}: builds the tenant's compact concept
- *       catalog (the connection's active {@link IndustryPack}'s concepts, intersected with the
- *       {@code concept_key}s actually assigned to this connection's Business Entities — see
- *       {@link SemanticService#findDistinctConceptKeysForConnection}), then makes ONE LLM call
- *       asking which of those concepts (zero, one, or several) are relevant to the question.
- *       Physical table/column names are never part of this stage's context.</li>
+ *   <li><b>Stage 1</b> — Persistent Knowledge / native OpenAI File Search (see {@link
+ *       #selectConceptsViaPersistentKnowledge}/{@link
+ *       #selectConceptsAndRoutingViaPersistentKnowledge}) is the ONE production Stage 1
+ *       semantic-resolution implementation: the model retrieves and reasons over the tenant's
+ *       own persistent business knowledge via {@code file_search} against its provisioned
+ *       Vector Store, and returns which concept(s) — zero, one, or several — are relevant, plus
+ *       (per {@link #CONCEPT_RESOLUTION_TYPE_RULES}) whether the resolution is a single clear
+ *       concept, a genuine multi-concept span, or a disjunctive ambiguity between mutually
+ *       exclusive concepts. Java never builds or sends a constructed catalog, and never chooses
+ *       among concepts — it only validates the model's returned {@code concept_key}(s) against
+ *       {@code usedConceptKeys} (this connection's actual, current concept usage in Postgres —
+ *       see {@link SemanticService#findDistinctConceptKeysForConnection}) and discards anything
+ *       not in that set. Physical table/column names are never part of this stage's context.
+ *       There is no runtime choice between multiple Stage 1 implementations and no fallback to
+ *       any other semantic mechanism — see {@link #resolveStage1SelectionInternal}.</li>
  *   <li><b>Stage 2</b> — resolves the LLM's validated concept_key selection to the physical
  *       object keys bound to them (via {@link
  *       SemanticService#findEntitiesByConnectionAndConcepts}), returning ALL matching objects —
  *       never one arbitrarily chosen when a concept binds to more than one physical object.</li>
  * </ul>
  *
- * <p>Mirrors {@code BusinessObjectBatchAnalyzer}'s exact concept-catalog rendering shape and
- * acceptance-boundary discipline (never invent a key; validate, don't decide) — reused, not
- * duplicated as a second resolver mechanism. This class makes no semantic decision itself: the
- * LLM decides which concepts are relevant; this class only retrieves the catalog, sends it,
- * validates the response against the exact list offered, and retrieves the resulting metadata.
+ * <p>This class makes no semantic decision itself: the LLM decides which concepts are relevant
+ * and whether the question is ambiguous between them; this class only sends the question,
+ * validates the response against the tenant's actual concept usage, and retrieves the resulting
+ * metadata.
  *
- * <p>Every public method degrades to {@link Optional#empty()} on anything that isn't a clean,
- * confident Stage-1 result — no active pack, no tenant concept catalog yet (no Business Entity
- * on this connection has ever been LLM-classified), or any failure — so {@link AgentBrain} can
- * fall back to its existing, unnarrowed assembly exactly as it did before this feature existed.
+ * <p><b>Two distinct degradation modes, never conflated:</b> a public method returns {@link
+ * Optional#empty()} (equivalently, {@link CombinedResolution#EMPTY}) only when concept-scoped
+ * narrowing does not apply to this connection AT ALL — no active pack, or no tenant concept
+ * catalog yet (no Business Entity on this connection has ever been LLM-classified) — so {@link
+ * AgentBrain} falls back to its existing, unnarrowed assembly exactly as before this feature
+ * existed. This is NOT the same as required Persistent Knowledge infrastructure (Vector Store /
+ * File Search) being missing or failing when narrowing DOES apply — that condition throws a
+ * {@link com.sei.nexus.common.NexusException} instead, making the failure visible rather than
+ * silently degrading to an unnarrowed result.
  */
 @Component
 public class ConceptScopedMetadataResolver {
@@ -66,9 +78,12 @@ public class ConceptScopedMetadataResolver {
     private final SemanticService semanticService;
     private final AzureOpenAiClient aiClient;
     private final ObjectMapper objectMapper;
-    // Persistent AI Knowledge V1, Stage 1 File Search integration — both nullable (see the
-    // 4-arg convenience constructor below): when null, the File Search path is unconditionally
-    // disabled and behavior is byte-identical to before this integration existed.
+    // Persistent AI Knowledge V1, Stage 1 File Search infrastructure — both nullable (see the
+    // 4-arg convenience constructor below): when null, Stage 1 cannot resolve a Vector Store id
+    // for any connection, so any call that reaches Stage 1 (an active pack + tenant concept
+    // catalog apply) throws NexusException — File Search is the sole Stage 1 implementation, so
+    // there is no other mechanism left to "fall back" to. tenantSettingsRepository is also used,
+    // independently, for previous_response_id conversation-chaining bookkeeping.
     private final TenantSettingsRepository tenantSettingsRepository;
     private final TenantRepository tenantRepository;
 
@@ -88,10 +103,13 @@ public class ConceptScopedMetadataResolver {
     }
 
     /**
-     * Backward-compatible convenience constructor (existing tests and any caller predating the
-     * File Search Stage 1 integration). The File Search path is unconditionally disabled when
-     * constructed this way — there is no {@link TenantSettingsRepository} to read the flag from
-     * — so behavior is byte-identical to before this integration existed.
+     * Convenience constructor (existing tests, and any caller not wiring the Persistent Knowledge
+     * infrastructure). Since Persistent Knowledge / File Search is the sole Stage 1
+     * implementation, a resolver built this way has no {@link TenantRepository} to resolve a
+     * Vector Store id from — any call that reaches Stage 1 (an active pack + tenant concept
+     * catalog apply for the connection) throws {@link com.sei.nexus.common.NexusException}.
+     * Concept-scoped narrowing's own "does not apply at all" degradation (no active pack, no
+     * tenant concept catalog) is unaffected and still returns {@link Optional#empty()}.
      */
     public ConceptScopedMetadataResolver(IndustryPackRepository packRepository,
                                          SemanticService semanticService,
@@ -100,23 +118,17 @@ public class ConceptScopedMetadataResolver {
         this(packRepository, semanticService, aiClient, objectMapper, null, null);
     }
 
-    /** One canonical concept offered to the LLM for SELECTION — the same shape {@code
-     *  BusinessObjectBatchAnalyzer.ConceptInfo} offers for concept CLASSIFICATION; kept as a
-     *  separate, private record here rather than a shared/exported type, since the two remain
-     *  independent call sites with no coupling need (see that class's own javadoc on why its
-     *  record is private too). */
-    private record ConceptCatalogEntry(String conceptKey, String name, List<String> aliases,
-                                       String description, String operationalMeaning) {}
-
     /**
      * Stage 1 + Stage 2 for ONE connection.
      *
      * @return {@link Optional#empty()} when concept-scoped narrowing does not apply to this
-     *         connection (no active pack, no tenant concept catalog, or any failure) — the
-     *         caller MUST fall back to its existing full assembly for this connection. When
-     *         present, the list is the exact, already-selected-and-resolved set of physical
-     *         object keys to assemble — possibly empty, when the LLM legitimately found no
-     *         available tenant concept relevant to the question.
+     *         connection AT ALL (no active pack, no tenant concept catalog yet) — the caller MUST
+     *         fall back to its existing full assembly for this connection. When present, the list
+     *         is the exact, already-selected-and-resolved set of physical object keys to
+     *         assemble — possibly empty, when the LLM legitimately found no available tenant
+     *         concept relevant to the question. Required-infrastructure failure (missing Vector
+     *         Store, File Search/OpenAI failure) is a distinct condition and is never absorbed
+     *         into this return value — it propagates as a {@link com.sei.nexus.common.NexusException}.
      */
     public Optional<List<String>> resolveObjectKeys(String connectionKey, String question) {
         return resolveObjectKeys(connectionKey, question, null);
@@ -136,6 +148,18 @@ public class ConceptScopedMetadataResolver {
     }
 
     /**
+     * Concept-Key Semantic Anchor design: the exact concept_key(s) Stage 1 selected for this
+     * connection/question — the same Stage 1 run {@link #resolveObjectKeys} already performs,
+     * exposing its concept identity instead of discarding it after Stage 2 resolves it to
+     * physical object keys. {@link Optional#empty()} under every condition {@link
+     * #resolveObjectKeys} already falls back on; otherwise the validated list Stage 1 returned,
+     * unmodified — Java neither rederives nor filters it semantically here.
+     */
+    public Optional<List<String>> resolveConceptKeys(String connectionKey, String question, String conversationId) {
+        return resolveObjectKeysInternal(connectionKey, question, conversationId, false, false).conceptKeys();
+    }
+
+    /**
      * One semantic value the combined Persistent Knowledge response can carry as its routing
      * decision — the exact same five-value contract the (now bypassable) Decision Router
      * produced, relayed verbatim from the LLM's own combined response. Java never constructs,
@@ -145,9 +169,17 @@ public class ConceptScopedMetadataResolver {
     public record RoutingDecision(String type, String clarificationQuestion) {}
 
     /** Stage 1 + Stage 2 combined result, additionally carrying a request-level routing decision
-     *  — see {@link #resolveObjectKeysWithRouting}. */
-    public record CombinedResolution(Optional<List<String>> objectKeys, Optional<RoutingDecision> routing) {
-        static final CombinedResolution EMPTY = new CombinedResolution(Optional.empty(), Optional.empty());
+     *  — see {@link #resolveObjectKeysWithRouting} — and the exact concept_key(s) Stage 1
+     *  selected before Stage 2 resolved them to physical object keys (Concept-Key Semantic
+     *  Anchor design — see {@link #resolveConceptKeys}). {@code conceptKeys} is {@link
+     *  Optional#empty()} whenever {@code objectKeys} is (every fallback condition already
+     *  documented on {@link #resolveObjectKeys}); otherwise it is the validated, unmodified list
+     *  Stage 1 returned — Java never rederives, normalizes, or filters it semantically. */
+    public record CombinedResolution(Optional<List<String>> objectKeys, Optional<RoutingDecision> routing,
+                                     Optional<List<String>> conceptKeys,
+                                     Optional<String> conceptAmbiguityClarification) {
+        static final CombinedResolution EMPTY = new CombinedResolution(
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     /**
@@ -165,14 +197,17 @@ public class ConceptScopedMetadataResolver {
      *                        this question. This is a plain fact handed to the LLM as input text,
      *                        exactly as the legacy Decision Router's context did; Java never
      *                        decides routing from it itself.
-     * @return {@link CombinedResolution#EMPTY} under every condition {@link #resolveObjectKeys}
-     *         already falls back on (no active pack, no tenant concept catalog, resolver
-     *         failure). {@code routing()} is additionally {@link Optional#empty()} whenever the
-     *         File Search Stage 1 path does not apply (flag off, no Vector Store, or the
-     *         combined call fails and the legacy catalog-in-prompt fallback runs) — the legacy
-     *         prompt has no routing capability, so the caller (ChatService) MUST fall back to
-     *         its own existing Decision Router call whenever routing is absent, exactly as
-     *         before this method existed.
+     * @return {@link CombinedResolution#EMPTY} only when concept-scoped narrowing does not apply
+     *         to this connection AT ALL (no active pack, no tenant concept catalog yet) — a
+     *         condition distinct from, and never conflated with, required-infrastructure failure
+     *         (missing Vector Store, File Search/OpenAI failure), which instead propagates as a
+     *         {@link NexusException} (see {@link #resolveStage1SelectionInternal}). {@code
+     *         routing()} is {@link Optional#empty()} whenever the model's own combined response
+     *         did not include a valid routing decision, in which case the caller (ChatService)
+     *         MUST fall back to its own existing Decision Router call — exactly as before this
+     *         method existed. This is the pre-existing Decision Router absorption fallback (a
+     *         separate, unrelated concern this task does not change), never a Stage 1
+     *         concept-selection fallback.
      */
     public CombinedResolution resolveObjectKeysWithRouting(String connectionKey, String question,
                                                             String conversationId, boolean memoryAvailable) {
@@ -194,103 +229,104 @@ public class ConceptScopedMetadataResolver {
 
             Stage1Selection sel = resolveStage1SelectionInternal(connectionKey, pack, usedConceptKeys, question,
                     conversationId, includeRouting, memoryAvailable);
-            if (sel.selected() == null) return CombinedResolution.EMPTY; // legacy "no catalog to offer" case, preserved verbatim
 
-            List<String> objectKeys = sel.selected().isEmpty()
+            boolean ambiguous = sel.ambiguityClarification() != null && !sel.ambiguityClarification().isBlank();
+            // Concept-Level Disjunctive Ambiguity design — CRITICAL DOWNSTREAM BOUNDARY: when
+            // Stage 1 explicitly marked its own selection ambiguous, Stage 2 (resolving concept
+            // keys to physical object keys) is never invoked at all — no object becomes approved
+            // for an unresolved ambiguity. objectKeys is Optional.of(List.of()) (present, but
+            // empty) rather than Optional.empty(), so the caller takes the SAME "legitimately no
+            // relevant objects" branch it already has for the zero-concepts-selected case (never
+            // falls back to a broader, unnarrowed assembly) — see AgentBrain#conceptScopedModel*.
+            List<String> objectKeys = (ambiguous || sel.selected().isEmpty())
                     ? List.of()
                     : semanticService.findEntitiesByConnectionAndConcepts(connectionKey, sel.selected()).stream()
                             .map(BusinessEntity::primaryObjectKey)
                             .filter(k -> k != null && !k.isBlank())
                             .distinct()
                             .toList();
-            return new CombinedResolution(Optional.of(objectKeys), Optional.ofNullable(sel.routing()));
+            return new CombinedResolution(Optional.of(objectKeys), Optional.ofNullable(sel.routing()),
+                    Optional.of(sel.selected()),
+                    ambiguous ? Optional.of(sel.ambiguityClarification()) : Optional.empty());
+        } catch (NexusException e) {
+            // Required Persistent Knowledge infrastructure (Vector Store / File Search) is
+            // missing or failed — this is NOT the same condition as "concept-scoped narrowing
+            // doesn't apply to this connection" (the generic catch below) and must never be
+            // silently absorbed into it. The absence/failure of required semantic infrastructure
+            // must be visible to the caller, never masked as an ordinary unnarrowed fallback.
+            throw e;
         } catch (Exception e) {
-            log.warn("Concept-scoped metadata resolution unavailable for connection '{}', "
-                    + "falling back to full assembly: {}", connectionKey, e.getMessage());
+            log.warn("Concept-scoped metadata resolution unavailable for connection '{}' "
+                    + "(no active pack or no tenant concept catalog yet), falling back to full assembly: {}",
+                    connectionKey, e.getMessage());
             return CombinedResolution.EMPTY;
         }
     }
 
-    // ── Stage 1 dispatch — File Search (new) vs. catalog-in-prompt (legacy, deprecated below) ──
-
-    private static final String FILE_SEARCH_STAGE1_SETTING_KEY = "persistent_knowledge_stage1_enabled";
-
-    /**
-     * Chooses and runs Stage 1, returning the validated selected concept_keys.
-     *
-     * @return the validated selection (possibly empty — "found nothing relevant" is a valid
-     *         result), or {@code null} when the legacy path determined narrowing does not apply
-     *         at all (no catalog could be built) — the caller maps {@code null} to {@code
-     *         Optional.empty()}, preserving the exact pre-existing semantics.
-     */
-    @SuppressWarnings("deprecation") // the legacy path is the intended fallback — see class javadoc on each deprecated method
-    private List<String> resolveStage1Selection(String connectionKey, IndustryPack pack,
-                                                 List<String> usedConceptKeys, String question, String conversationId) {
-        return resolveStage1SelectionInternal(connectionKey, pack, usedConceptKeys, question, conversationId,
-                false, false).selected();
-    }
+    // ── Stage 1 dispatch — Persistent Knowledge / native OpenAI File Search (the sole Stage 1) ──
 
     /** A Stage 1 selection, optionally carrying a routing decision — see {@link
-     *  #resolveStage1SelectionInternal}. {@code selected() == null} is the legacy "no catalog to
-     *  offer" sentinel, preserved verbatim from {@link #resolveStage1Selection}'s original
-     *  contract. {@code routing()} is always {@code null} for the legacy catalog-in-prompt path
-     *  (it has no routing capability) and for a caller that did not request routing. */
-    private record Stage1Selection(List<String> selected, RoutingDecision routing) {}
+     *  #resolveStage1SelectionInternal}. {@code selected()} is never {@code null} — Persistent
+     *  Knowledge / File Search is the sole Stage 1 implementation, so the legacy "no catalog to
+     *  offer" sentinel no longer applies; a genuinely empty tenant concept catalog is instead
+     *  filtered out earlier, in {@link #resolveObjectKeysInternal} (see {@code usedConceptKeys}).
+     *  {@code routing()} is {@code null} for a caller that did not request routing. {@code
+     *  ambiguityClarification()} (Concept-Level Disjunctive Ambiguity design) is non-null/non-blank
+     *  only when the LLM explicitly marked its selection {@code resolutionType: "AMBIGUOUS"} — see
+     *  {@link #CONCEPT_RESOLUTION_TYPE_RULES} — and is {@code null} for the non-combined,
+     *  non-routing File Search path (see {@link #selectConceptsViaPersistentKnowledge}'s own
+     *  javadoc for why that prompt does not carry this field). */
+    private record Stage1Selection(List<String> selected, RoutingDecision routing, String ambiguityClarification) {}
 
     /**
-     * Chooses and runs Stage 1, returning the validated selected concept_keys and, when {@code
-     * includeRouting} is true, the combined call's routing decision.
+     * Chooses and runs Stage 1 — Persistent Knowledge / native OpenAI File Search is the ONLY
+     * production Stage 1 semantic-resolution implementation; there is no runtime choice and no
+     * fallback to any other semantic mechanism. When {@code includeRouting} is true, also returns
+     * the combined call's routing decision (see {@link
+     * #selectConceptsAndRoutingViaPersistentKnowledge}).
      *
-     * @param includeRouting when true and the File Search path applies, calls {@link
-     *                       #selectConceptsAndRoutingViaPersistentKnowledge} (the combined
-     *                       concept+routing contract) instead of {@link
+     * <p><b>Explicit failure, never silent degradation:</b> if this connection's tenant has no
+     * provisioned Vector Store, or the File Search/OpenAI call itself fails, this method throws
+     * {@link NexusException} ({@code 503 SERVICE_UNAVAILABLE}) rather than falling back to any
+     * other concept-selection mechanism — the absence/failure of required Persistent Knowledge
+     * infrastructure must be visible, never silently masked. The caller ({@link
+     * #resolveObjectKeysInternal}) lets this propagate; it is caught only by the OUTER "does
+     * concept-scoped narrowing apply to this connection at all" try/catch there, which explicitly
+     * re-throws it rather than swallowing it into the unrelated, pre-existing "narrowing doesn't
+     * apply" degradation (no active pack, no tenant concept catalog) — those remain two distinct
+     * conditions, never conflated.
+     *
+     * @param includeRouting when true, calls {@link #selectConceptsAndRoutingViaPersistentKnowledge}
+     *                       (the combined concept+routing contract) instead of {@link
      *                       #selectConceptsViaPersistentKnowledge} (concept-keys only) — the two
      *                       call different system prompts/schemas, never both, so a caller that
-     *                       does not need routing never pays for or receives it. Ignored for the
-     *                       legacy catalog-in-prompt fallback, which has no routing capability
-     *                       regardless of this flag — {@code routing()} is {@code null} whenever
-     *                       that path runs.
+     *                       does not need routing never pays for or receives it.
      */
     private Stage1Selection resolveStage1SelectionInternal(String connectionKey, IndustryPack pack,
                                                             List<String> usedConceptKeys, String question,
                                                             String conversationId, boolean includeRouting,
                                                             boolean memoryAvailable) {
-        if (fileSearchStage1Enabled()) {
-            String vectorStoreId = currentTenantVectorStoreId();
-            if (vectorStoreId != null && !vectorStoreId.isBlank()) {
-                try {
-                    if (includeRouting) {
-                        Stage1CombinedResult r = selectConceptsAndRoutingViaPersistentKnowledge(
-                                vectorStoreId, usedConceptKeys, question, conversationId, memoryAvailable);
-                        return new Stage1Selection(r.conceptKeys(), r.routing());
-                    }
-                    return new Stage1Selection(
-                            selectConceptsViaPersistentKnowledge(vectorStoreId, usedConceptKeys, question, conversationId),
-                            null);
-                } catch (Exception e) {
-                    log.warn("File Search Stage 1 failed for connection '{}', falling back to the legacy "
-                            + "catalog-in-prompt path for this call: {}", connectionKey, e.getMessage());
-                    // fall through to the legacy path below — this call must still succeed
-                }
-            } else {
-                log.debug("File Search Stage 1 is enabled but the tenant has no persistent knowledge "
-                        + "Vector Store yet ({}); using the legacy catalog path", connectionKey);
-            }
+        String vectorStoreId = currentTenantVectorStoreId();
+        if (vectorStoreId == null || vectorStoreId.isBlank()) {
+            throw new NexusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Persistent Knowledge Stage 1 requires a provisioned Vector Store for this tenant, "
+                            + "but none is available for connection '" + connectionKey + "'.");
         }
-        List<ConceptCatalogEntry> catalog = tenantConceptCatalog(pack, usedConceptKeys);
-        if (catalog.isEmpty()) return new Stage1Selection(null, null);
-        return new Stage1Selection(selectConceptsViaLlm(pack.packId(), catalog, question), null);
-    }
-
-    /** Reads the per-tenant feature flag. Defaults to {@code false} (legacy path) on any failure
-     *  to read it, and when this resolver was built via the 4-arg convenience constructor. */
-    private boolean fileSearchStage1Enabled() {
-        if (tenantSettingsRepository == null) return false;
         try {
-            return tenantSettingsRepository.isTrue(FILE_SEARCH_STAGE1_SETTING_KEY);
+            if (includeRouting) {
+                Stage1CombinedResult r = selectConceptsAndRoutingViaPersistentKnowledge(
+                        vectorStoreId, usedConceptKeys, question, conversationId, memoryAvailable);
+                return new Stage1Selection(r.conceptKeys(), r.routing(), r.ambiguityClarification());
+            }
+            return new Stage1Selection(
+                    selectConceptsViaPersistentKnowledge(vectorStoreId, usedConceptKeys, question, conversationId),
+                    null, null);
+        } catch (NexusException e) {
+            throw e;
         } catch (Exception e) {
-            log.warn("Could not read the File Search Stage 1 flag, defaulting to the legacy path: {}", e.getMessage());
-            return false;
+            throw new NexusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Persistent Knowledge Stage 1 (File Search) failed for connection '" + connectionKey
+                            + "': " + e.getMessage());
         }
     }
 
@@ -300,8 +336,8 @@ public class ConceptScopedMetadataResolver {
      * never reach another tenant's Vector Store through this path. {@code null} when the current
      * schema is the shared {@code public} schema (no tenant context), when the resolver was
      * built via the 4-arg convenience constructor, or when the tenant has not yet been
-     * provisioned with a Vector Store (Phase 1) — all three cases correctly fall back to the
-     * legacy path above.
+     * provisioned with a Vector Store — {@link #resolveStage1SelectionInternal} turns a {@code
+     * null} here into an explicit failure; it is never treated as "narrowing doesn't apply."
      */
     private String currentTenantVectorStoreId() {
         if (tenantRepository == null) return null;
@@ -310,94 +346,49 @@ public class ConceptScopedMetadataResolver {
             if (TenantContext.PUBLIC_SCHEMA.equals(schema)) return null;
             return tenantRepository.findBySchemaName(schema).map(Tenant::aiKnowledgeVectorStoreId).orElse(null);
         } catch (Exception e) {
-            log.warn("Could not resolve the tenant's Vector Store id, defaulting to the legacy path: {}", e.getMessage());
+            log.warn("Could not resolve the tenant's Vector Store id for connection resolution: {}", e.getMessage());
             return null;
         }
     }
 
-    /**
-     * @deprecated Retained only as the fallback source for {@link #resolveStage1Selection} when
-     * the Persistent AI Knowledge V1 File Search Stage 1 path ({@code
-     * persistent_knowledge_stage1_enabled}) is disabled, unavailable for the current tenant, or
-     * fails at runtime — see {@link #selectConceptsViaPersistentKnowledge} for the replacement. Not
-     * removed and not to be extended with new functionality; it must remain exactly as-is for
-     * safe rollback throughout the migration window. Candidate for retirement only after the
-     * File Search path is validated in production for a meaningful tenant cohort (see
-     * {@code docs/designs/ZEVRA_PERSISTENT_AI_KNOWLEDGE_V1_DESIGN.md} §19).
-     *
-     * <p>Stage 1 content: the active Pack's concepts, INTERSECTED with the concept_keys actually
-     * present on this connection (never the Pack's full catalogue, and never a Business Entity
-     * whose concept_key is still NULL — an unclassified object is simply not part of any tenant
-     * concept catalog yet, never guessed at here).
-     */
-    @Deprecated
-    private List<ConceptCatalogEntry> tenantConceptCatalog(IndustryPack pack, List<String> usedConceptKeys) {
-        if (pack.entities() == null) return List.of();
-        Set<String> used = new HashSet<>(usedConceptKeys);
-        List<ConceptCatalogEntry> catalog = new ArrayList<>();
-        for (PackEntity e : pack.entities()) {
-            if (e.conceptKey() == null || e.conceptKey().isBlank()) continue;
-            if (!used.contains(e.conceptKey())) continue;
-            catalog.add(new ConceptCatalogEntry(e.conceptKey(), e.name(),
-                    e.aliases() != null ? e.aliases() : List.of(), e.description(), e.operationalMeaning()));
-        }
-        return catalog;
-    }
-
-    // ── Stage 1 — LLM concept selection ─────────────────────────────────────────
+    // ── Stage 1 — File Search concept selection field shape ────────────────────
 
     private static final String METADATA_REQUEST_FIELD_SCHEMA = """
             {"metadataRequest": {"conceptKeys": ["<concept_key>", "..."]}}""";
 
-    private static final String METADATA_REQUEST_SYSTEM_PROMPT = """
-            You are the semantic reasoning layer of an enterprise data platform. You are given a
-            user's business question and a catalog of canonical business concepts actually
-            available for this tenant's connection. Decide which of the listed concepts — zero,
-            one, or several — are relevant to answering the question, using each concept's
-            name/aliases/description/operational meaning. You have NOT been shown any physical
-            table or column names at this stage — do not guess at or assume any.
-
-            Respond with valid JSON only — no prose, no markdown fences — in exactly this shape:
-            """ + METADATA_REQUEST_FIELD_SCHEMA + """
-
-
-            Rules:
-            - Every value in conceptKeys MUST be copied exactly from the concept_key values
-              listed below — never invent one.
-            - Returning an empty conceptKeys array is correct and expected when none of the
-              listed concepts is actually relevant to the question — never include a concept
-              just to produce a non-empty answer.
-            - Select every concept genuinely relevant to the question, not only the single best
-              match — a question may span more than one business concept.
+    /** Shared rules text for the {@code resolutionType}/{@code conceptClarificationQuestion}
+     *  fields — appended verbatim to the combined Persistent Knowledge + routing prompt ({@link
+     *  #PERSISTENT_KNOWLEDGE_WITH_ROUTING_SYSTEM_PROMPT}), the canonical production Stage 1
+     *  contract. Deliberately NOT added to the non-combined, non-routing File Search prompt
+     *  ({@link #PERSISTENT_KNOWLEDGE_SYSTEM_PROMPT}) or its parser — see that prompt's own javadoc
+     *  for why. This is the sole mechanism by which Agent Brain — never Java — decides whether a
+     *  question is a single clear concept, a genuine multi-concept span, or a disjunctive
+     *  ambiguity between mutually exclusive concepts. */
+    private static final String CONCEPT_RESOLUTION_TYPE_RULES = """
+            - Additionally decide how the selected concepts relate to the question, using
+              "resolutionType":
+                - "SINGLE": exactly one concept is clearly established as what the question means.
+                - "MULTI_SPAN": the question genuinely requires more than one concept TOGETHER
+                  (e.g. a comparison or a combined metric spanning concepts) — conceptKeys lists
+                  every concept required.
+                - "AMBIGUOUS": the wording could plausibly mean any ONE of two or more DIFFERENT,
+                  mutually-exclusive concepts, and nothing in the question or prior conversation
+                  establishes which one the user means. List every plausible candidate in
+                  conceptKeys and set "conceptClarificationQuestion" to a specific, concept-level
+                  question asking the user to choose between them (e.g. "Do you mean purchase
+                  orders or sales orders?") — never guess which one is meant.
+            - "conceptClarificationQuestion" MUST be a non-empty, specific question when
+              resolutionType is "AMBIGUOUS", and an empty string for every other resolutionType.
+            - Only use "AMBIGUOUS" when the candidates are genuinely DIFFERENT, non-overlapping
+              business concepts the question could equally mean — never for a question that
+              merely spans multiple concepts together (that is "MULTI_SPAN"), and never merely
+              because a term could be interpreted several ways WITHIN one already-clear concept
+              (that is a value-level ambiguity, handled separately, later, and not your concern
+              here).
+            - When conceptKeys is empty (no listed concept is relevant at all), resolutionType
+              MUST be "SINGLE" and conceptClarificationQuestion MUST be empty — "AMBIGUOUS" means
+              genuinely plausible candidates exist, never "nothing matched."
             """;
-
-    /**
-     * @deprecated Replaced, when {@code persistent_knowledge_stage1_enabled} is on and the
-     * tenant has a Vector Store, by {@link #selectConceptsViaPersistentKnowledge} — the Persistent AI
-     * Knowledge V1 Stage 1 integration. Retained temporarily for production fallback/rollback
-     * (called from {@link #resolveStage1Selection} whenever the new path is disabled,
-     * unavailable, or fails). Do not add new functionality here; not removed in this change. See
-     * {@code docs/designs/ZEVRA_PERSISTENT_AI_KNOWLEDGE_V1_DESIGN.md} §19 for the retirement
-     * condition.
-     *
-     * <p>Governance only, never semantic decision-making: makes the LLM call, then discards any
-     * concept_key it returns that was not actually offered — this method decides nothing about
-     * relevance itself, it only accepts or rejects the model's own answer, exactly like {@code
-     * BusinessObjectBatchAnalyzer#applyConceptResolution}'s identical discipline.
-     */
-    @Deprecated
-    private List<String> selectConceptsViaLlm(String packKey, List<ConceptCatalogEntry> catalog, String question) {
-        String userMessage = renderCatalog(packKey, catalog, question);
-        String response;
-        try {
-            com.sei.nexus.ai.LlmCallTag.set("STAGE1_CONCEPT_SELECTION");
-            response = aiClient.chatWithJson(List.of(ChatMessage.user(userMessage)), METADATA_REQUEST_SYSTEM_PROMPT);
-        } catch (Exception e) {
-            log.warn("Concept-selection LLM call failed for pack '{}': {}", packKey, e.getMessage());
-            return List.of();
-        }
-        return validateSelection(parseSelection(response), catalog);
-    }
 
     // ── Stage 1 — File Search concept selection (Persistent AI Knowledge V1) ───────────────────
 
@@ -428,17 +419,29 @@ public class ConceptScopedMetadataResolver {
     private static final String RESPONSE_ID_SETTING_KEY_PREFIX = "stage1_response_id:";
 
     /**
-     * Persistent AI Knowledge V1 Stage 1: the model retrieves and reasons over the tenant's
-     * persistent knowledge itself via {@code file_search} — Java sends only the question, never
-     * a constructed catalog. This is the entire point of this method; see {@link
+     * Persistent AI Knowledge V1 Stage 1, non-routing variant: the model retrieves and reasons
+     * over the tenant's persistent knowledge itself via {@code file_search} — Java sends only the
+     * question, never a constructed catalog. This is the entire point of this method; see {@link
      * com.sei.nexus.ai.AzureOpenAiClient#chatWithFileSearch}.
      *
-     * <p>Java's role is unchanged in kind from the legacy path: it never decides which concept is
-     * relevant — it only validates whatever concept_key(s) the model returns against {@code
-     * usedConceptKeys} (the tenant's actual, current concept usage for this connection, from
-     * Postgres) and discards anything not in that set. This is enforcement, not semantic
-     * resolution — Java does not parse the retrieved filename to determine the concept; the
-     * model's own returned {@code conceptKeys} field is the only signal consulted.
+     * <p><b>Why this remains a distinct method/prompt rather than being merged into {@link
+     * #selectConceptsAndRoutingViaPersistentKnowledge}:</b> this is the Stage 1 call reached by
+     * {@link #resolveObjectKeys}/{@link #resolveConceptKeys}, which {@code AgentBrain}'s
+     * autonomous-agent call graph uses (the {@code memoryAvailable == null} overload — see {@code
+     * AgentRunner}). Autonomous agents have no Decision Router / routing concept at all — there is
+     * no {@code memoryAvailable} runtime fact and no routing decision to request — so forcing that
+     * caller through the combined concept+routing contract would mean sending a meaningless
+     * runtime fact and silently discarding an unused routing field on every call. Both this method
+     * and the combined one are equally "the" Persistent Knowledge / File Search Stage 1
+     * implementation for their respective callers — this is a distinct public contract (concept
+     * resolution only), not a second, competing semantic-resolution mechanism, and not legacy.
+     *
+     * <p>Java's role here is deterministic only: it never decides which concept is relevant — it
+     * only validates whatever concept_key(s) the model returns against {@code usedConceptKeys}
+     * (the tenant's actual, current concept usage for this connection, from Postgres) and discards
+     * anything not in that set. This is enforcement, not semantic resolution — Java does not parse
+     * the retrieved filename to determine the concept; the model's own returned {@code
+     * conceptKeys} field is the only signal consulted.
      *
      * <p>Conversation-aware chaining: when {@code conversationId} is non-blank and this resolver
      * has a {@link TenantSettingsRepository}, Zevra looks up the current tenant's own previously
@@ -463,7 +466,7 @@ public class ConceptScopedMetadataResolver {
         } catch (Exception e) {
             if (!chained) {
                 log.warn("File Search concept-selection call failed for vector store '{}': {}", vectorStoreId, e.getMessage());
-                throw e; // let the caller (resolveStage1Selection) fall back to the legacy path for this call
+                throw e; // propagates to the caller, which surfaces an explicit failure — no fallback
             }
             log.warn("Chained File Search concept-selection call failed for vector store '{}' "
                     + "(previous response id may be stale/expired); retrying once, fresh: {}",
@@ -475,7 +478,7 @@ public class ConceptScopedMetadataResolver {
             } catch (Exception retryEx) {
                 log.warn("Fresh (non-chained) File Search concept-selection retry also failed for vector store '{}': {}",
                         vectorStoreId, retryEx.getMessage());
-                throw retryEx; // let the caller fall back to the legacy path for this call
+                throw retryEx; // propagates to the caller, which surfaces an explicit failure — no fallback
             }
         }
         storePreviousResponseId(conversationId, result.responseId());
@@ -494,7 +497,9 @@ public class ConceptScopedMetadataResolver {
             "ANSWER_FROM_MEMORY", "QUERY_LIVE_DATA", "HYBRID_DOC_AND_DATA", "ASK_CLARIFICATION", "KNOWLEDGE_GAP");
 
     private static final String COMBINED_FIELD_SCHEMA = """
-            {"metadataRequest": {"conceptKeys": ["<concept_key>", "..."]},
+            {"metadataRequest": {"conceptKeys": ["<concept_key>", "..."],
+                                  "resolutionType": "SINGLE|MULTI_SPAN|AMBIGUOUS",
+                                  "conceptClarificationQuestion": ""},
              "routing": {"type": "ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP",
                          "clarificationQuestion": ""}}""";
 
@@ -561,7 +566,7 @@ public class ConceptScopedMetadataResolver {
               match — a question may span more than one business concept.
             - clarificationQuestion must be a specific, non-empty question when routing.type is
               ASK_CLARIFICATION, and an empty string for every other routing.type.
-            """;
+            """ + CONCEPT_RESOLUTION_TYPE_RULES;
 
     private static final Map<String, Object> COMBINED_STAGE1_JSON_SCHEMA = buildCombinedJsonSchema();
 
@@ -572,10 +577,15 @@ public class ConceptScopedMetadataResolver {
      *  {@code enum}, something the legacy Decision Router's plain {@code chat()} call never had. */
     private static Map<String, Object> buildCombinedJsonSchema() {
         Map<String, Object> conceptKeysArray = Map.of("type", "array", "items", Map.of("type", "string"));
+        Map<String, Object> resolutionType = Map.of(
+                "type", "string", "enum", List.of("SINGLE", "MULTI_SPAN", "AMBIGUOUS"));
         Map<String, Object> metadataRequest = Map.of(
                 "type", "object",
-                "properties", Map.of("conceptKeys", conceptKeysArray),
-                "required", List.of("conceptKeys"),
+                "properties", Map.of(
+                        "conceptKeys", conceptKeysArray,
+                        "resolutionType", resolutionType,
+                        "conceptClarificationQuestion", Map.of("type", "string")),
+                "required", List.of("conceptKeys", "resolutionType", "conceptClarificationQuestion"),
                 "additionalProperties", false);
         Map<String, Object> routingType = Map.of("type", "string", "enum", ROUTING_TYPES);
         Map<String, Object> routing = Map.of(
@@ -592,8 +602,11 @@ public class ConceptScopedMetadataResolver {
 
     /** The raw Stage 1 output before Stage 2 resolves {@code conceptKeys} to physical object
      *  keys — {@link #resolveObjectKeysInternal} performs that resolution afterward, identically
-     *  to the non-combined path. */
-    private record Stage1CombinedResult(List<String> conceptKeys, RoutingDecision routing) {}
+     *  to the non-combined path. {@code ambiguityClarification} (Concept-Level Disjunctive
+     *  Ambiguity design) is non-null/non-blank only when the LLM explicitly marked its selection
+     *  {@code resolutionType: "AMBIGUOUS"} — see {@link #CONCEPT_RESOLUTION_TYPE_RULES}. */
+    private record Stage1CombinedResult(List<String> conceptKeys, RoutingDecision routing,
+                                        String ambiguityClarification) {}
 
     /**
      * Same request/response chaining discipline as {@link #selectConceptsViaPersistentKnowledge}
@@ -615,26 +628,30 @@ public class ConceptScopedMetadataResolver {
         com.sei.nexus.ai.AzureOpenAiClient.FileSearchResult result;
         try {
             com.sei.nexus.ai.LlmCallTag.set("STAGE1_FILE_SEARCH_CONCEPT_AND_ROUTING");
-            result = aiClient.chatWithFileSearch(vectorStoreId, PERSISTENT_KNOWLEDGE_WITH_ROUTING_SYSTEM_PROMPT,
+            // Phase 1 explicit prompt caching: identical request shape, additionally attaching
+            // prompt_cache_key="zevra:stage1-concept-and-routing:v1" (a pure cache-routing hint).
+            result = aiClient.chatWithFileSearchForConceptAndRouting(vectorStoreId,
+                    PERSISTENT_KNOWLEDGE_WITH_ROUTING_SYSTEM_PROMPT,
                     questionWithRuntimeFacts, previousResponseId, COMBINED_STAGE1_JSON_SCHEMA);
         } catch (Exception e) {
             if (!chained) {
                 log.warn("Combined File Search concept+routing call failed for vector store '{}': {}",
                         vectorStoreId, e.getMessage());
-                throw e; // let the caller fall back to the legacy path for this call
+                throw e; // propagates to the caller, which surfaces an explicit failure — no fallback
             }
             log.warn("Chained combined File Search call failed for vector store '{}' (previous "
                     + "response id may be stale/expired); retrying once, fresh: {}",
                     vectorStoreId, e.getMessage());
             try {
                 com.sei.nexus.ai.LlmCallTag.set("STAGE1_FILE_SEARCH_CONCEPT_AND_ROUTING");
-                result = aiClient.chatWithFileSearch(vectorStoreId, PERSISTENT_KNOWLEDGE_WITH_ROUTING_SYSTEM_PROMPT,
+                result = aiClient.chatWithFileSearchForConceptAndRouting(vectorStoreId,
+                        PERSISTENT_KNOWLEDGE_WITH_ROUTING_SYSTEM_PROMPT,
                         questionWithRuntimeFacts, null, COMBINED_STAGE1_JSON_SCHEMA);
                 chained = false;
             } catch (Exception retryEx) {
                 log.warn("Fresh (non-chained) combined File Search retry also failed for vector store '{}': {}",
                         vectorStoreId, retryEx.getMessage());
-                throw retryEx; // let the caller fall back to the legacy path for this call
+                throw retryEx; // propagates to the caller, which surfaces an explicit failure — no fallback
             }
         }
         storePreviousResponseId(conversationId, result.responseId());
@@ -644,7 +661,8 @@ public class ConceptScopedMetadataResolver {
 
         List<String> conceptKeys = validateAgainstUsedConceptKeys(parseSelection(result.text()), usedConceptKeys);
         RoutingDecision routing = parseRouting(result.text());
-        return new Stage1CombinedResult(conceptKeys, routing);
+        String ambiguity = parseConceptClarification(result.text());
+        return new Stage1CombinedResult(conceptKeys, routing, ambiguity);
     }
 
     /** Java validates the model's own {@code routing.type} against the exact five-value contract
@@ -667,6 +685,43 @@ public class ConceptScopedMetadataResolver {
             return new RoutingDecision(type, clarificationQuestion);
         } catch (Exception e) {
             log.warn("Failed to parse routing decision from combined Stage 1 response: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Concept-Level Disjunctive Ambiguity design: reads {@code metadataRequest.resolutionType}/
+     * {@code metadataRequest.conceptClarificationQuestion} from the combined Persistent Knowledge
+     * + routing Stage 1 response (see {@link #CONCEPT_RESOLUTION_TYPE_RULES}).
+     *
+     * <p>Deterministic validation only, exactly like {@link #parseRouting}: the LLM's own
+     * {@code resolutionType} value is the only signal consulted. A response is treated as
+     * non-ambiguous (returns {@code null}) whenever {@code resolutionType} is missing or not
+     * exactly {@code "AMBIGUOUS"} (byte-identical to a Stage 1 response predating this field —
+     * the zero-cost backward-compatibility guarantee), or when it claims {@code "AMBIGUOUS"} but
+     * supplies no actual clarification question — a malformed/degenerate signal is discarded
+     * rather than guessed at, never surfaced as a fabricated clarification. Java never invents,
+     * upgrades, or downgrades this value; it only accepts or discards the model's own answer.
+     */
+    private String parseConceptClarification(String json) {
+        try {
+            Map<String, Object> parsed = objectMapper.readValue(extractJson(json), new TypeReference<>() {});
+            Object metadataRequestObj = parsed.get("metadataRequest");
+            if (!(metadataRequestObj instanceof Map<?, ?> mr)) return null;
+            Object typeObj = mr.get("resolutionType");
+            if (!(typeObj instanceof String resolutionType) || !"AMBIGUOUS".equals(resolutionType)) {
+                return null;
+            }
+            Object cq = mr.get("conceptClarificationQuestion");
+            String clarificationQuestion = cq != null ? String.valueOf(cq).trim() : "";
+            if (clarificationQuestion.isEmpty()) {
+                log.warn("Discarding AMBIGUOUS resolutionType with no conceptClarificationQuestion "
+                        + "from Stage 1 response — malformed signal, never fabricated by Java");
+                return null;
+            }
+            return clarificationQuestion;
+        } catch (Exception e) {
+            log.warn("Failed to parse concept resolution type from Stage 1 response: {}", e.getMessage());
             return null;
         }
     }
@@ -697,9 +752,11 @@ public class ConceptScopedMetadataResolver {
         }
     }
 
-    /** Same discipline as {@link #validateSelection}, adapted to a plain set of authoritative
-     *  keys rather than a rendered catalog — there is no catalog in this path to validate against,
-     *  only the tenant's actual Postgres-recorded concept usage. */
+    /** Java validates the LLM's own answer against the tenant's actual, current concept usage for
+     *  this connection (from Postgres) — it never chooses, scores, ranks, or infers a concept
+     *  itself. A concept_key the model invented (not in that set) is dropped, never persisted or
+     *  acted on. There is no Java-rendered catalog to validate against in the File Search path —
+     *  the model retrieves its own context via {@code file_search}. */
     private List<String> validateAgainstUsedConceptKeys(List<String> candidateKeys, List<String> usedConceptKeys) {
         Set<String> valid = new HashSet<>(usedConceptKeys);
         List<String> result = new ArrayList<>();
@@ -712,37 +769,6 @@ public class ConceptScopedMetadataResolver {
             }
         }
         return result;
-    }
-
-    /**
-     * @deprecated Retained only as part of the legacy fallback path (see {@link
-     * #tenantConceptCatalog}). Not removed, not extended.
-     *
-     * <p>Renders the Stage 1 context — question + compact concept catalog ONLY. Deliberately
-     * never includes physical table names, column names, or full Business Entity/Data Object
-     * metadata — that is exactly the context-explosion this feature exists to prevent.
-     */
-    @Deprecated
-    private String renderCatalog(String packKey, List<ConceptCatalogEntry> catalog, String question) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("User question: ").append(question == null ? "" : question).append("\n\n");
-        sb.append("Industry Pack: ").append(packKey).append("\n");
-        sb.append("Business concepts available for this tenant connection (physical table/column ")
-          .append("names are intentionally not shown at this stage):\n");
-        for (ConceptCatalogEntry c : catalog) {
-            sb.append("  - concept_key: ").append(c.conceptKey()).append(" | name: ").append(c.name());
-            if (!c.aliases().isEmpty()) {
-                sb.append(" | aliases: ").append(String.join(", ", c.aliases()));
-            }
-            if (c.description() != null && !c.description().isBlank()) {
-                sb.append(" | ").append(c.description());
-            }
-            if (c.operationalMeaning() != null && !c.operationalMeaning().isBlank()) {
-                sb.append(" | operational meaning: ").append(c.operationalMeaning());
-            }
-            sb.append("\n");
-        }
-        return sb.toString();
     }
 
     @SuppressWarnings("unchecked")
@@ -771,19 +797,4 @@ public class ConceptScopedMetadataResolver {
         return (start >= 0 && end > start) ? text.substring(start, end + 1) : text;
     }
 
-    /** Java validates the LLM's own answer against the exact catalog it was offered — it never
-     *  chooses, scores, ranks, or infers a concept itself. A concept_key the model invented (not
-     *  in the offered list) is dropped, never persisted or acted on. */
-    private List<String> validateSelection(List<String> candidateKeys, List<ConceptCatalogEntry> catalog) {
-        Set<String> offered = catalog.stream().map(ConceptCatalogEntry::conceptKey).collect(Collectors.toSet());
-        List<String> valid = new ArrayList<>();
-        for (String key : candidateKeys) {
-            if (offered.contains(key)) {
-                valid.add(key);
-            } else {
-                log.warn("Discarding invalid/invented conceptKey '{}' — not offered in the tenant concept catalog", key);
-            }
-        }
-        return valid;
-    }
 }

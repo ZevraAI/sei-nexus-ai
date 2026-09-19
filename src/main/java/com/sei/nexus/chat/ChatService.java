@@ -73,6 +73,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -462,6 +463,25 @@ public class ChatService {
             log.info("RETRIEVAL_TIMING stage=agentBrainResolve wallClockMs={} "
                             + "note=includesStage1LlmCallLatencyWhenConceptScoped",
                     agentBrainResolveMs);
+
+            // Concept-Level Disjunctive Ambiguity design — CRITICAL DOWNSTREAM BOUNDARY: when
+            // Agent Brain's own Stage 1 call explicitly marked this question ambiguous between
+            // mutually exclusive business concepts (see ResolvedBusinessModel
+            // #conceptAmbiguityClarification()), the request terminates here, into a concept-level
+            // clarification answer — BEFORE any ExecutionContract is compiled, any physical
+            // metadata is retrieved, or the reasoning/decision-routing machinery runs. The
+            // clarification question itself is relayed verbatim from Agent Brain's own response;
+            // Java neither constructs nor chooses it.
+            if (businessModel.conceptAmbiguityClarification().isPresent()) {
+                String clarification = businessModel.conceptAmbiguityClarification().get();
+                reasoningEventBus.phaseCompleted(runKey, ProgressPhase.METADATA);
+                runRepository.update(runKey, clarification, "ASK_CLARIFICATION", "COMPLETE", null);
+                reasoningEventBus.publish(runKey, "answer_ready", Map.of("answer", clarification));
+                reasoningEventBus.complete(runKey);
+                return buildResponse(conversationId, runKey, clarification, "ASK_CLARIFICATION",
+                        agent, routingConfidence, false, List.of(), List.of(), List.of(), List.of(), List.of());
+            }
+
             ResolvedQuestion resolved = businessModel.resolution();
             ExecutionContract executionContract = executionContractBuilder.compile(businessModel);
 
@@ -659,7 +679,8 @@ public class ChatService {
                     long buildContextStartNanos = System.nanoTime();
                     String schemaCtx = buildContextSummary(raw, memChunks, promptContext, semantic, findings,
                             anomalyCtx, false, history, agent, resolved, conversationContext,
-                            businessModel.conceptScoped(), businessModel.objectTargets().keySet());
+                            businessModel.conceptScoped(), businessModel.objectTargets().keySet(),
+                            businessModel.resolvedConceptKeys());
                     long buildContextMs = (System.nanoTime() - buildContextStartNanos) / 1_000_000;
                     log.info("RETRIEVAL_TIMING stage=buildContextSummary wallClockMs={} note=noLlmCallInsideThisMethod",
                             buildContextMs);
@@ -759,16 +780,34 @@ public class ChatService {
                     reasoningEventBus.publish(runKey, "answer_ready", Map.of("answer", answer));
                     reasoningEventBus.complete(runKey);
 
-                    // ── Phase 3: fire-and-forget learning from this successful run ──
-                    // Pick the SQL from the most data-rich step for term extraction.
+                    // ── Unified Learning Event pipeline: exactly two implicit triggers ──
+                    // Normal successful queries, follow-ups, browsing, filters, etc. perform NO
+                    // learning call at all — not even a no-op TermExtractor invocation. Pick the
+                    // SQL from the most data-rich step (unchanged precondition: a successful query
+                    // is a prerequisite for either trigger, never sufficient on its own).
                     String bestSql = reasonResult.evidence().getSteps().stream()
                             .filter(s -> !s.rows().isEmpty() && s.sql() != null)
                             .max(java.util.Comparator.comparingInt(s -> s.rows().size()))
                             .map(s -> s.sql())
                             .orElse(null);
                     if (bestSql != null) {
-                        semanticLearningService.learnFromRun(
-                                runKey, raw, bestSql, agentDomainKey, conversationId);
+                        // Trigger 1 — CLARIFICATION_RESOLUTION: this run succeeded immediately
+                        // after the prior run in this conversation ended in a clarification
+                        // request (deterministic, persisted signal — see
+                        // SemanticLearningService#isImmediatelyPriorRunAClarification).
+                        if (semanticLearningService.isImmediatelyPriorRunAClarification(conversationId, runKey)) {
+                            semanticLearningService.dispatch(new com.sei.nexus.semantic.LearningEvent(
+                                    com.sei.nexus.semantic.LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                                    raw, bestSql, agentDomainKey,
+                                    businessModel.resolvedConceptKeys(), runKey, conversationId));
+                        }
+                        // Trigger 2 — SEMANTIC_CORRECTION: existing CorrectionDetector mechanism,
+                        // unchanged, now funneled into the same Learning Event pipeline.
+                        if (conversationId != null && !conversationId.isBlank()) {
+                            semanticLearningService.detectAndSaveCorrectionForRun(
+                                    runKey, raw, conversationId, agentDomainKey,
+                                    businessModel.resolvedConceptKeys());
+                        }
                     }
 
                     // ── PRO-33: successful validated literal bindings enter the
@@ -989,15 +1028,15 @@ public class ChatService {
      * produces is now produced, when possible, by the combined Persistent Knowledge / File
      * Search Stage 1 call itself — see {@link
      * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveObjectKeysWithRouting} and
-     * {@code docs/ai/decision-router-absorption.md}. Retained for legacy Stage-1 fallback while
-     * {@code persistent_knowledge_stage1_enabled} is not universally migrated, and for any
-     * request where Stage 1 does not apply at all (no active pack, no tenant concept catalog) or
-     * the combined call's routing field is invalid/unparseable — {@link #getLlmDecision} is only
-     * ever called from {@link #ask} when {@code businessModel.routingDecision()} is empty. Not
-     * removed and not to be extended with new functionality. Candidate for retirement only after
-     * every tenant is migrated to the Persistent Knowledge Stage 1 path (mirrors the retirement
-     * condition already documented for {@code ConceptScopedMetadataResolver}'s own deprecated
-     * legacy methods).
+     * {@code docs/ai/decision-router-absorption.md}. Persistent Knowledge / File Search is now
+     * the sole Stage 1 semantic-resolution implementation (no feature flag, no legacy Stage 1
+     * fallback) — but the combined call's own {@code routing} field can still be absent
+     * (invalid/unparseable, or Stage 1 does not apply at all for this connection: no active pack,
+     * no tenant concept catalog), and in that case {@link #getLlmDecision} is still the routing
+     * fallback — only ever called from {@link #ask} when {@code businessModel.routingDecision()}
+     * is empty. Not removed and not to be extended with new functionality. This is a Decision
+     * Router / routing concern, distinct from and unaffected by Stage 1 concept-selection's own
+     * legacy-path removal.
      */
     @Deprecated
     static final String DECISION_SYSTEM_PROMPT = """
@@ -1088,7 +1127,12 @@ public class ChatService {
                     .reduce((a, b) -> a + "\n" + b).orElse("");
             String prompt = "Question: " + question + "\n\nAlready known in this conversation:\n" + index;
             com.sei.nexus.ai.LlmCallTag.set("MEMORY_SELECTION");
-            String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), MEMORY_SELECTION_SYSTEM_PROMPT);
+            // Phase 1 Responses API migration: transport-only — same prompt/roster context, same
+            // free-form-text (non-schema) output contract, same exact-roster-membership validation below.
+            // Model tiering (pre-production cost optimization): selecting entity_keys by exact
+            // match from a short roster is low-complexity — nexus.openai.memory-selection-model
+            // (defaults to gpt-4o-mini) instead of the core chat model.
+            String resp = aiClient.respondForMemorySelection(List.of(ChatMessage.user(prompt)), MEMORY_SELECTION_SYSTEM_PROMPT);
 
             Map<String, Object> parsed = objectMapper.readValue(extractJson(resp),
                     new TypeReference<Map<String, Object>>() {});
@@ -1257,10 +1301,11 @@ public class ChatService {
             String anomalyCtx, NexusAgent agent, boolean includeMemory) {
             StringBuilder ctx = new StringBuilder();
 
-            boolean anyRows          = investigationDatasets != null && !investigationDatasets.isEmpty();
-            boolean anyError         = false;
-            boolean anyBlocked       = false;
-            boolean anyClarification = false;
+            boolean anyRows             = investigationDatasets != null && !investigationDatasets.isEmpty();
+            boolean anyError            = false;
+            boolean anyBlocked          = false;
+            boolean anyClarification    = false;
+            boolean anyValidationFailed = false;
 
             if (anyRows) {
                 ctx.append(buildInvestigationDatasetsBlock(investigationDatasets, outcomeInterpreter));
@@ -1277,6 +1322,9 @@ public class ChatService {
                 } else if (r.containsKey("clarification")) {
                     ctx.append("Clarification needed: ").append(r.get("question")).append("\n");
                     anyClarification = true;
+                } else if (r.containsKey("validationFailed")) {
+                    ctx.append("Query validation failed: ").append(r.get("reason")).append("\n");
+                    anyValidationFailed = true;
                 } else if (r.containsKey("blocked")) {
                     ctx.append("Query blocked: ").append(r.get("reason")).append("\n");
                     anyBlocked = true;
@@ -1303,11 +1351,12 @@ public class ChatService {
             String prompt = "Question: " + question + attachmentNote + "\n\nQuery results:\n" + ctx;
 
             String systemPrompt = resultSystemPrompt(anyRows, anyError, anyBlocked, anyClarification,
-                    attachmentSummary != null && !attachmentSummary.isBlank());
+                    anyValidationFailed, attachmentSummary != null && !attachmentSummary.isBlank());
 
             // Presentation policy (system prompt) and evidence context are chat's; only the
             // model call + failure handling are delegated to the shared composer.
-            String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification);
+            String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification,
+                    anyValidationFailed);
 
             if (!anyRows) {
                 // No evidence to decompose — TEXT mode, exactly as before this change.
@@ -1316,11 +1365,105 @@ public class ChatService {
             }
 
             // Real evidence exists — ask the SAME call for the model's own semantic decomposition
-            // instead of a second call. On any parse failure, degrade to plain text (never throw,
-            // never block the answer on the JSON shape being perfect).
+            // instead of a second call. Strict-schema enforced: the API guarantees every field
+            // below is present in the returned JSON — the model's CONTENT judgment for every field
+            // remains completely unconstrained, only the FIELD'S PRESENCE is now enforced.
+            // FOLLOW_UP_QUESTIONS reasoning lives on that same section (see #dataAnswerJsonSchema's
+            // javadoc) — there is no independent top-level reasoning field to enforce here anymore.
+            // On any parse failure (or a genuine API-level failure), degrade to plain text via
+            // `fallback` — never throw, never block the answer on the JSON shape being perfect.
             String json = nlComposer.compose(
-                    NaturalLanguageComposer.CompositionRequest.json(prompt, DATA_ANSWER_JSON_SYSTEM_PROMPT, fallback));
+                    NaturalLanguageComposer.CompositionRequest.strictJson(prompt, DATA_ANSWER_JSON_SYSTEM_PROMPT,
+                            "data_answer", dataAnswerJsonSchema(), fallback));
             return parseStructuredAnswer(json, objectMapper, fallback);
+    }
+
+    /**
+     * The strict JSON Schema for the {@code DATA_ANSWER_JSON_SYSTEM_PROMPT} contract — every
+     * field that prompt already asks for, formalized into an OpenAI Structured-Outputs strict
+     * schema (see {@link AzureOpenAiClient#respondWithStrictJson}). This is STRUCTURE enforcement
+     * only: which keys must be present, and their shape. It decides nothing about content — every
+     * field's actual value remains entirely the model's judgment, including the legitimate choice
+     * of an empty array/null string for a field that has nothing to say this turn.
+     *
+     * <p>Strict mode requires every property to be listed in "required" at every object level, so
+     * genuine optionality is expressed with nullable types ({@code ["string","null"]}) rather than
+     * omitting a key — never a Java-side default filling in the "real" value; a null here is
+     * relayed to {@link #parseStructuredAnswer} exactly like the previous loose-JSON contract's
+     * absent key already was.
+     *
+     * <p>Package-private static seam — a pure function of no inputs, so a unit test can validate
+     * its shape directly (mirrors {@code TeachingService#teachingProposalJsonSchema}'s pattern).
+     *
+     * <p><b>FOLLOW_UP_QUESTIONS structural fix:</b> {@code reasoning} is a property of the shared
+     * {@code Section} object schema (nullable, like {@code title}/{@code purpose}/{@code content}
+     * already are for section types that don't use them) — never a separate top-level field. This
+     * is deliberate: it eliminates the prior structural flaw where {@code
+     * follow_up_questions_reasoning} was an independent, always-required top-level string totally
+     * decoupled from whether a {@code FOLLOW_UP_QUESTIONS} section/items existed at all, which let
+     * the model satisfy the schema by writing a plausible-sounding reasoning sentence while never
+     * emitting the corresponding section. Now {@code reasoning} and {@code items} are properties of
+     * the exact same object — a {@code FOLLOW_UP_QUESTIONS} section cannot exist without a {@code
+     * reasoning} slot directly beside its {@code items}. <b>Known limitation, by design:</b> OpenAI
+     * strict mode requires every property of an object schema to be listed in "required" at that
+     * object level (nullable types express optionality, not omission), and all section types share
+     * ONE flat object schema — so strict JSON Schema alone cannot express "reasoning is required
+     * ONLY when type=FOLLOW_UP_QUESTIONS and items is non-empty," nor can it forbid reasoning
+     * describing items that were never actually emitted. That cross-field, per-type conditional is
+     * enforced by explicit prompt instruction (see DATA_ANSWER_JSON_SYSTEM_PROMPT's FOLLOW_UP_QUESTIONS
+     * rules), not by the schema — the schema's job here is only to remove the structural possibility
+     * of reasoning existing in total isolation from items, which it previously did.
+     */
+    static Map<String, Object> dataAnswerJsonSchema() {
+        Map<String, Object> sectionProps = new LinkedHashMap<>();
+        sectionProps.put("type", Map.of("type", "string",
+                "enum", List.of("DATASET", "HIGHLIGHT", "FINDINGS", "RELATED_FACTS",
+                        "RECOMMENDATION", "FOLLOW_UP_QUESTIONS", "TEXT")));
+        sectionProps.put("title", Map.of("type", List.of("string", "null")));
+        sectionProps.put("purpose", Map.of("type", List.of("string", "null")));
+        sectionProps.put("dataset_refs", Map.of(
+                "type", List.of("array", "null"),
+                "items", Map.of("type", "string")));
+        sectionProps.put("display", Map.of("type", List.of("boolean", "null")));
+        sectionProps.put("items", Map.of(
+                "type", List.of("array", "null"),
+                "items", Map.of("type", "string")));
+        sectionProps.put("content", Map.of("type", List.of("string", "null")));
+        // "reasoning" — meaningful only for type="FOLLOW_UP_QUESTIONS" (the reasoning for the
+        // questions in this same section's "items"), null on every other section type. This is
+        // the structural fix: reasoning and items are now properties of the SAME object, so a
+        // FOLLOW_UP_QUESTIONS section cannot exist with its reasoning living anywhere else. See
+        // dataAnswerJsonSchema's class-level javadoc for why strict mode cannot make this
+        // property conditionally required only for FOLLOW_UP_QUESTIONS.
+        sectionProps.put("reasoning", Map.of("type", List.of("string", "null")));
+
+        Map<String, Object> sectionSchema = new LinkedHashMap<>();
+        sectionSchema.put("type", "object");
+        sectionSchema.put("properties", sectionProps);
+        sectionSchema.put("required", List.of("type", "title", "purpose", "dataset_refs",
+                "display", "items", "content", "reasoning"));
+        sectionSchema.put("additionalProperties", false);
+
+        Map<String, Object> metricProps = new LinkedHashMap<>();
+        metricProps.put("label", Map.of("type", "string"));
+        metricProps.put("value", Map.of("type", "string"));
+        Map<String, Object> metricSchema = new LinkedHashMap<>();
+        metricSchema.put("type", "object");
+        metricSchema.put("properties", metricProps);
+        metricSchema.put("required", List.of("label", "value"));
+        metricSchema.put("additionalProperties", false);
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("answer", Map.of("type", "string"));
+        properties.put("sections", Map.of("type", "array", "items", sectionSchema));
+        properties.put("metrics", Map.of("type", "array", "items", metricSchema));
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("answer", "sections", "metrics"));
+        schema.put("additionalProperties", false);
+        return schema;
     }
 
     /**
@@ -1337,6 +1480,24 @@ public class ChatService {
             String answerText = node.path("answer").asText("");
             String answer = answerText.isBlank() ? fallbackAnswer : answerText;
 
+            // "metrics" is a top-level field parallel to "sections" — the model's optional,
+            // whole-answer headline figures (see DATA_ANSWER_JSON_SYSTEM_PROMPT's METRICS rules).
+            // Parsed identically regardless of which contract shape (sections vs. legacy flat)
+            // the rest of the response uses. Each entry parses straight into
+            // StructuredAnswer.Metric — a mechanical shape read, never an interpretation of what
+            // a metric means.
+            List<StructuredAnswer.Metric> metrics = new java.util.ArrayList<>();
+            JsonNode metricsNode = node.get("metrics");
+            if (metricsNode != null && metricsNode.isArray()) {
+                for (JsonNode metricNode : metricsNode) {
+                    StructuredAnswer.Metric m = mapper.treeToValue(metricNode, StructuredAnswer.Metric.class);
+                    if (m != null && m.label() != null && !m.label().isBlank()
+                            && m.value() != null && !m.value().isBlank()) {
+                        metrics.add(m);
+                    }
+                }
+            }
+
             JsonNode sectionsNode = node.get("sections");
             if (sectionsNode != null && sectionsNode.isArray() && !sectionsNode.isEmpty()) {
                 // The sections-based contract — the model's UI-content plan. Each entry parses
@@ -1348,15 +1509,15 @@ public class ChatService {
                 for (JsonNode sectionNode : sectionsNode) {
                     sections.add(mapper.treeToValue(sectionNode, StructuredAnswer.Section.class));
                 }
-                return StructuredAnswer.fromSections(answer, sections);
+                return StructuredAnswer.fromSections(answer, sections, metrics);
             }
 
             // Legacy shape — no `sections` in the response (an older/degraded model turn).
             // Lenient JSON-shape handling, exactly as this parser has always tolerated a
             // response missing optional fields; not a semantic fallback.
             StructuredAnswer parsed = mapper.treeToValue(node, StructuredAnswer.class);
-            return new StructuredAnswer(answer, parsed.understanding(), parsed.keyFindings(),
-                    parsed.relatedFacts(), parsed.recommendation(), parsed.nextSteps());
+            return new StructuredAnswer(answer, List.of(), parsed.understanding(), parsed.keyFindings(),
+                    parsed.relatedFacts(), parsed.recommendation(), parsed.followUpQuestions(), metrics);
         } catch (Exception e) {
             log.warn("Failed to parse structured answer; falling back to plain text: {}", e.getMessage());
             return StructuredAnswer.plain(fallbackAnswer);
@@ -1408,7 +1569,7 @@ public class ChatService {
             if (refs == null || refs.isEmpty()) {
                 // No dataset(s) to ground — passes through unchanged, no resolution attempted.
                 out.add(new ResponseArtifacts.Section(s.type(), s.title(), s.purpose(), s.display(),
-                        s.items(), s.content(), List.of()));
+                        s.items(), s.content(), s.reasoning(), List.of()));
                 continue;
             }
 
@@ -1430,12 +1591,17 @@ public class ChatService {
                     allValid = false;
                     break;
                 }
-                resolved.add(new ResponseArtifacts.Section.ResolvedDataset(ds.stepNo(), ds.rows()));
+                // Full rows are only ever rendered for a type=DATASET section — any other type
+                // (HIGHLIGHT/TEXT) cites a dataset purely for traceability (a "step-N · N rows"
+                // trace tag), never to display its table, so carrying the full row payload there
+                // is pure unused bloat (see ResponseArtifacts.Section.ResolvedDataset javadoc).
+                List<Map<String, Object>> rows = "DATASET".equals(s.type()) ? ds.rows() : List.of();
+                resolved.add(new ResponseArtifacts.Section.ResolvedDataset(ds.stepNo(), rows, ds.rows().size()));
             }
             if (!allValid) continue;
 
             out.add(new ResponseArtifacts.Section(s.type(), s.title(), s.purpose(), s.display(),
-                    s.items(), s.content(), resolved));
+                    s.items(), s.content(), s.reasoning(), resolved));
         }
         return out;
     }
@@ -1552,6 +1718,29 @@ public class ChatService {
                 """;
     }
 
+    /**
+     * The system prompt when a step's own filter value failed deterministic literal validation
+     * (PRO-33) — a technical data-quality/format check on the SQL Zevra itself generated, never a
+     * governance or access-control decision. Must never be confused with {@link
+     * #blockedQuerySystemPrompt} — telling the user their request is "not permitted under data
+     * access policy" when the real cause is an internal validation limitation misattributes an
+     * internal issue as a deliberate access restriction.
+     */
+    static String validationFailedSystemPrompt() {
+        return """
+                You are Zevra, an enterprise operational intelligence AI.
+                The investigation could not complete because a filter value it generated failed an
+                internal data-validation check — this is a technical limitation, NOT an access or
+                permissions restriction, and NOT a data-access policy decision.
+                State plainly and concisely that the investigation could not be completed due to an
+                internal technical limitation, and suggest the user try rephrasing the request.
+                Do NOT say the request is not permitted, not allowed, or restricted by policy. Do NOT
+                say no records were found. Do NOT say the query executed successfully.
+                Do not expose raw error text, SQL, or internal implementation details.
+                Keep the response to 1-2 sentences.
+                """;
+    }
+
     private static final String DATA_ANSWER_SYSTEM_PROMPT = """
             You are Zevra, an enterprise operational intelligence AI briefing a busy executive.
             Answer like a chief of staff, not a database.
@@ -1574,21 +1763,26 @@ public class ChatService {
      * rows exist to reason about. Asks the SAME model call that used to return prose-only to also
      * plan the complete UI content: which investigation dataset(s) answer which part of the
      * question, which should be displayed, and what belongs in findings / related facts /
-     * recommendation / next steps. This is the ownership boundary: the model decides all of this
+     * recommendation / follow-up questions. This is the ownership boundary: the model decides all of this
      * — Java never selects, ranks, or infers any of it (see ChatService#resolveSections, which
      * only resolves an exact {@code step-N} reference the model already chose).
      */
     private static final String DATA_ANSWER_JSON_SYSTEM_PROMPT = """
-            You are Zevra, an enterprise operational intelligence AI briefing a busy executive.
-            Answer like a chief of staff, not a database. Respond with a single JSON object —
-            no markdown fences, no prose outside the JSON — with exactly these fields:
+            You are Zevra, an enterprise operational intelligence AI briefing a busy executive on
+            an Investigation Console. The frontend owns PRESENTATION — layout, cards vs. inline
+            content, spacing, typography, colors, chart/table rendering, placement. You own
+            CONTENT — deciding what the answer is, which evidence is worth showing, which
+            additional findings/facts are genuinely useful, whether a recommendation is warranted,
+            which follow-up investigations are genuinely useful, and which headline figures deserve
+            visual emphasis. Respond with a single JSON object — no markdown fences, no prose
+            outside the JSON — with exactly these fields:
 
             {
-              "answer": string,        // the full prose answer (see rules below)
-              "sections": [             // your complete UI-content plan — see rules below
+              "answer": string,        // the primary executive conclusion (see rules below)
+              "sections": [             // OPTIONAL content beyond "answer" — see rules below
                 {
                   "type": string,        // "DATASET" | "HIGHLIGHT" | "FINDINGS" | "RELATED_FACTS" |
-                                          // "RECOMMENDATION" | "NEXT_STEPS" | "TEXT"
+                                          // "RECOMMENDATION" | "FOLLOW_UP_QUESTIONS" | "TEXT"
                   "title": string|null,
                   "purpose": string|null,
                   "dataset_refs": string[]|null,  // REQUIRED (at least one) for type="DATASET";
@@ -1597,86 +1791,247 @@ public class ChatService {
                                                    // this section's content genuinely depends on
                                                    // more than one dataset.
                   "display": boolean|null,     // type="DATASET" only
-                  "items": string[]|null,      // type="FINDINGS" | "RELATED_FACTS" | "NEXT_STEPS"
-                  "content": string|null       // type="HIGHLIGHT" | "RECOMMENDATION" | "TEXT"
+                  "items": string[]|null,      // type="FINDINGS" | "RELATED_FACTS" | "FOLLOW_UP_QUESTIONS"
+                  "content": string|null,      // type="HIGHLIGHT" | "RECOMMENDATION" | "TEXT"
+                  "reasoning": string|null     // type="FOLLOW_UP_QUESTIONS" only — see rules below
                 }
+              ],
+              "metrics": [               // OPTIONAL — see METRICS rules below; omit or [] when
+                {                          // nothing beyond the obvious row count is noteworthy
+                  "label": string,        // e.g. "Top Buyer", "Total Value", "Earliest Delivery"
+                  "value": string         // pre-formatted for display, e.g. "Marcus Webb",
+                }                          // "$373,750", "Oct 3, 2025" — your own formatting
               ]
             }
 
-            RULES FOR "answer":
-            - LEAD with a single-sentence VERDICT: the conclusion itself, as one plain declarative
-              sentence that ends with a period and can stand alone
-              (e.g. "Margins are healthy overall, but two beauty products are priced below cost.").
-            - Then give 1-2 short sentences on WHY it matters — the driver or the exception.
+            ══════════════════════════════ CORE PRINCIPLE ══════════════════════════════
+            The schema below lists AVAILABLE content types, not REQUIRED content. Never create a
+            section merely because its type exists in the schema, and never populate "metrics" or
+            "sections" just to avoid an empty array. If "answer" already communicates everything
+            important, the correct response may legitimately be just "answer" plus the necessary
+            DATASET section(s) — or even an empty "sections" array when no dataset needs to be
+            shown. Every piece of content — every section, every metric, every follow-up question —
+            must earn its place by adding something the reader does not already have. When it
+            doesn't, omit it. A shorter, sparser response is not an incomplete one.
+
+            RULES FOR "answer" — the primary executive conclusion. Everything else in the response
+            (sections, metrics) exists only to add what "answer" itself does not already say.
+            - Start with the most important conclusion — the verdict itself — as the opening
+              statement.
+            - Keep it concise: normally 1-3 sentences. Add a short sentence on WHY it matters — the
+              driver, the exception, a comparison — ONLY when that explanation is tied to a
+              concrete figure or comparison actually present in the evidence (a proportion, a
+              count, a rate — e.g. "3 of 5 (60%)"). Never append generic risk/urgency language
+              ("this could indicate a problem," "this needs monitoring") that isn't backed by an
+              actual number or comparison in the data.
             - If the question has more than one substantive part (e.g. "show me all open orders
-              AND which item I ordered the most"), the answer must address every part — do not
-              silently drop one of them.
+              AND which item I ordered the most"), address every part — do not silently drop one.
+            - Use only evidence supplied in the investigation datasets shown to you below — never
+              outside knowledge, never an invented figure or relationship.
             - Do NOT reproduce row-level values here — that is what a DATASET section is for.
               Summarise; do not transcribe.
-            - Bold the key figures. Plain prose only. Be brief: 2 to 5 sentences total.
+            - Do not add generic risk language, and do not invent implications the evidence does
+              not support.
+            - Do not mention UI sections, datasets, steps, SQL, metadata, or your own internal
+              reasoning — "answer" is a business conclusion, not a description of how you produced
+              it.
+            - Include a concrete figure, comparison, or relationship when it materially explains
+              the conclusion; bold important figures when useful. Plain prose otherwise.
 
-            RULES FOR "sections" — YOU decide the complete UI-content plan. Below you will be
-            shown one or more INVESTIGATION DATASETS, each with an explicit "Dataset: step-N"
-            identifier, its description, row count, columns, and actual values. You decide:
-            - Which dataset(s) directly answer a part of the question the user asked to SEE
-              (e.g. "show me...", "list...", "which orders...") — for each, emit a section with
-              "type": "DATASET", "dataset_refs" set to that dataset's EXACT "step-N" identifier as
-              shown (character-for-character — never invent, abbreviate, or guess one), "display":
-              true, and a "title"/"purpose" you write describing what it shows.
-            - A dataset that exists but is not directly responsive to the question may be omitted
-              from "sections" entirely, or included with "display": false — your judgment.
-            - "HIGHLIGHT": a specific, dataset-grounded observation worth calling out on its own —
-              e.g. "Widget A (SKU ABC-123) is the most ordered item with 1,500 units ordered."
-              Put the narrative in "content" AND set "dataset_refs" to EVERY dataset that
-              narrative's facts actually come from. This is frequently more than one dataset — for
-              example, a name/SKU may come from one dataset and a quantity from another; if so,
-              list BOTH ("dataset_refs": ["step-3", "step-5"]). Never omit a dataset merely
-              because another dataset in the list contains the more descriptive portion of the
-              statement. One dataset is equally valid ("dataset_refs": ["step-1"]) when that's
-              genuinely all the claim depends on — you decide the count, based only on what the
-              claim actually draws from. Every factual value in "content" (a name, a number, an
-              id) MUST come from a dataset listed in "dataset_refs" (or from "answer") — never
-              state a value that isn't actually present in a dataset shown to you, and never claim
-              a relationship between values (e.g. "this id belongs to this quantity") unless the
-              supplied evidence itself supports it.
-            - "FINDINGS": genuine, materially significant discoveries from the evidence that are
-              NOT already fully stated in "answer" — put them in "items". Omit this section type
-              if nothing meets that bar.
-            - "RELATED_FACTS": additional context that helps explain a finding but isn't itself a
-              finding or recommendation. Omit if there is none.
-            - "RECOMMENDATION": a SINGLE sentence in "content" stating what the business should
-              consider doing, grounded in evidence you actually have. Omit if unwarranted — do not
-              invent one merely because the type exists.
-            - "NEXT_STEPS": concrete follow-up investigations specific to THIS question and
-              evidence, as "items" — not generic filler. Omit if none apply.
-            - "TEXT": free-form narrative content that doesn't fit any type above — use sparingly.
+            RULES FOR "sections" — each one is OPTIONAL, and exists only when it adds something
+            "answer" doesn't already say. Below you will be shown one or more INVESTIGATION
+            DATASETS, each with an explicit "Dataset: step-N" identifier, its description, row
+            count, columns, and actual values.
+            - "DATASET": appropriate when the question asks to show/list/retrieve/display/compare/
+              inspect records, or when a dataset is important supporting evidence. "dataset_refs"
+              MUST be that dataset's EXACT "step-N" identifier as shown (character-for-character —
+              never invent, abbreviate, or guess one); "display" MUST be true for a dataset meant
+              for the user. "title" should be concise and business-friendly. "purpose" is OPTIONAL
+              — write it only when it adds real context beyond the title (what makes this result
+              notable, or what the user will do with it); if the title already explains the
+              dataset and nothing further is genuinely useful, set "purpose" to null. Never write a
+              boilerplate purpose such as "This dataset lists all X with details." Never invent
+              rows, values, columns, or entities. A dataset that exists but is not directly
+              responsive to the question may be omitted entirely, or included with "display": false.
+            - "HIGHLIGHT": use ONLY when there is a specific, important observation that deserves
+              separate visual emphasis AND that observation is NOT already contained in "answer".
+              For example, if "answer" already says "Open purchase orders total 5, with Marcus
+              Webb accounting for 3," do not create a HIGHLIGHT restating that Marcus Webb has 3
+              open orders — that is duplication. A genuinely additional HIGHLIGHT would be a
+              different fact "answer" never mentioned, e.g. "Three of the five orders are
+              partially received." Put the narrative in "content" and set "dataset_refs" to EVERY
+              dataset that narrative's facts actually come from (this may be more than one — e.g. a
+              name/SKU from one dataset and a quantity from another: "dataset_refs": ["step-3",
+              "step-5"]). Every factual value in "content" MUST come from a dataset listed in
+              "dataset_refs" (or from "answer") — never state a value not actually present in a
+              dataset shown to you. If there is no genuinely additional highlight, do not emit one.
+            - "FINDINGS": use ONLY for additional evidence-backed discoveries that materially add
+              to "answer", as "items". The test for each item: "does this tell the reader something
+              they did not already learn from 'answer' or another section?" If no, drop it — do not
+              restate "answer" in different wording, do not split one answer into multiple
+              artificial findings, and do not create this section simply because the schema offers
+              it. For categorical or aggregate evidence (rows grouped by some dimension, each with
+              a count/sum/other aggregate), a finding may identify a meaningful quantified
+              relationship — one category dominates, one entity accounts for most records, a
+              category is unusually high/low, two groups differ materially — but only when the
+              supplied evidence actually supports it. State the quantified fact and stop; do not
+              append interpretive commentary ("this indicates...", "this could signal...") unless
+              that interpretation is itself tied to a specific figure already in the same item. If
+              nothing genuinely qualifies, omit FINDINGS.
+            - "RELATED_FACTS": use ONLY when additional context helps the user understand the
+              investigation but is not itself the primary finding — e.g. a related date pattern, a
+              supporting category, a secondary attribute. Do not use it to repeat "answer". If
+              nothing useful exists, omit it.
+            - "RECOMMENDATION": use ONLY when the evidence supports an actionable business
+              consideration — one concise sentence in "content". Do not manufacture one, and do not
+              write generic language such as "This should be monitored," "Further investigation may
+              be needed," or "Management should review this," unless the evidence itself provides a
+              concrete basis for that specific recommendation. If no recommendation is warranted,
+              omit RECOMMENDATION.
+            - "FOLLOW_UP_QUESTIONS": ONE cohesive, OPTIONAL section holding BOTH the actual
+              possible questions the USER may naturally ask NEXT ("items") AND the reasoning for
+              why those specific questions are plausible/useful ("reasoning") — the two always
+              travel together, in the same section object. Evaluate this explicitly on EVERY
+              response, before you decide to omit it: CURRENT QUESTION + AVAILABLE EVIDENCE →
+              "Are there useful, concrete questions this user might naturally ask next, beyond
+              what 'answer' already covers?" → YES: emit FOLLOW_UP_QUESTIONS with both "items" and
+              "reasoning" populated; NO: omit it entirely. That is a different question from "is
+              the current investigation/answer incomplete?" — do not silently default to omission
+              just because this section is marked optional, and do not skip evaluating it merely
+              because "answer" already feels complete. For list, status-breakdown, and
+              aggregate-style results especially — the exact shape where a curious user most often
+              has a natural next question — actively check whether the visible fields (status,
+              dates, owners/buyers, amounts, categories) support a concrete next question before
+              concluding there is nothing useful to add; treat silently skipping this check, not
+              emitting a well-grounded section, as the failure mode to avoid. NOT a generic
+              chatbot suggestion list,
+              and NOT investigation steps, reasoning steps, tasks, actions, recommendations,
+              required next actions, or workflow instructions for Zevra. Think: CURRENT USER
+              QUESTION → CURRENT ANSWER/EVIDENCE → "what questions might this user naturally ask
+              next?" → FOLLOW-UP QUESTIONS. Do NOT think: CURRENT USER QUESTION → CURRENT ANSWER →
+              "what should Zevra/the investigation do next?" → actions/investigation steps — that
+              is a different, disallowed framing. These are optional and speculative BY DESIGN:
+              they do not represent required actions, and proposing them is NOT a determination
+              that the current result is incomplete. You do NOT need to establish that the dataset
+              is incomplete, insufficient, or missing something before proposing a follow-up
+              question — a follow-up is a plausible NEXT QUESTION a curious user might ask, not
+              evidence of a gap in the current answer, and it can be useful even when the current
+              answer is already complete. For "show me open purchase orders", the current dataset
+              already containing every open purchase order does NOT prevent follow-up questions
+              like "How many are partially received?", "Which open purchase orders are due for
+              delivery soon?", "Who has the most open purchase orders?", or "What is the total
+              value of the open purchase orders?" — these are useful precisely because they explore
+              a different dimension, comparison, or detail than the current answer, not because the
+              current answer is somehow lacking. Follow-up questions must still be grounded in the
+              available investigation evidence/datasets — explore a dimension, comparison, or
+              detail that dataset actually supports; do not invent an unavailable dataset, fact,
+              metric, or capability. Do NOT generate follow-up questions merely to fill a quota, do
+              NOT suggest questions unrelated to the current investigation, do NOT ask the user to
+              retrieve information Zevra already has (check every INVESTIGATION DATASET shown to
+              you first — if the value you'd otherwise ask for already appears there, use it
+              directly instead), and do NOT turn FOLLOW_UP_QUESTIONS into generic advice such as
+              "review the data," "take action," "would you like more information?", or "should I
+              analyze this further?" — every item must be a genuine, concrete, answerable question.
+              A simple lookup can legitimately have no useful follow-up questions — but do not omit
+              a genuinely useful FOLLOW_UP_QUESTIONS section merely because the current dataset is
+              complete; completeness of the current answer and usefulness of a follow-up question
+              are unrelated. IMPORTANT: a FOLLOW_UP_QUESTIONS item is NOT disqualified as
+              duplication merely because it concerns the same dataset or topic as "answer" — it is
+              a proposed question the user might ask, not a repeated fact, so the AVOID DUPLICATION
+              rule below does not apply to it.
+              "reasoning" (this section's other field) is your own one-line record of WHY the
+              questions actually present in THIS section's "items" are plausible/useful — e.g.
+              "these explore order status, delivery timing, and buyer distribution, each a
+              dimension the current dataset doesn't already break out." It must describe the
+              ACTUAL items emitted in this same section, never a different or hypothetical set of
+              questions, and never questions you considered but chose not to include. Do NOT write
+              "reasoning" describing candidate follow-up questions without also emitting those same
+              questions in "items" — a narrative about follow-up questions that never actually
+              appear in "items" is a contract violation, not a valid response.
+              If you identify useful follow-up questions, emit the FOLLOW_UP_QUESTIONS section with
+              both "items" (the actual questions) and "reasoning" (why they're useful) populated.
+              If no useful follow-up questions exist, OMIT the FOLLOW_UP_QUESTIONS section entirely
+              — never include one with an empty "items" array, and never include one whose
+              "reasoning" describes questions that aren't present in "items".
+            - "TEXT": free-form narrative that doesn't fit any type above — use sparingly, and only
+              when it states something genuinely not already said elsewhere. If you have nothing
+              further to add, omit it.
 
-            CRITICAL — NEVER ask the user to retrieve information you already have. Before writing
-            "next_steps" or a caveat like "identify the item by name/SKU", check every INVESTIGATION
-            DATASET shown to you — if the descriptive value you need (a name, a SKU, an id) already
-            appears there, use it directly in "answer" or a DATASET/HIGHLIGHT section instead of
-            asking the user to go find it.
+            RULES FOR "metrics" — a separate visual-emphasis layer, distinct from any per-dataset
+            chart hint you may have declared earlier when building a step's query (those are about
+            how ONE dataset charts; "metrics" is about what's worth headlining across the entire
+            evidence set for this answer). A metric is NOT required to be different from every
+            number in "answer" — it is valid when it gives the reader a useful at-a-glance
+            representation of an important figure, even one "answer" also states (e.g. answer:
+            "There are 5 open purchase orders, with Marcus Webb accounting for 3" → valid metrics:
+            {"label": "Open Orders", "value": "5"}, {"label": "Top Buyer", "value": "Marcus Webb"}
+            — this is visual repetition for at-a-glance emphasis, not semantic duplication, and is
+            allowed). Each entry is {"label": string, "value": string} — "value" is the exact
+            display string, already formatted the way you'd want it shown (currency symbols, date
+            formatting, a percentage — your own judgment; Java will not reformat it). Only include
+            metrics genuinely useful for this investigation and grounded in the supplied evidence —
+            do not create metrics merely to fill space, and do not calculate an unsupported metric.
+            Zero metrics is valid.
 
-            CRITICAL — every entry in "dataset_refs" MUST exactly match one of the "Dataset:
-            step-N" identifiers you were actually shown. Never invent a step number, never
-            reference a dataset that wasn't shown to you, never invent rows, columns, or values
-            that aren't in it. Narrative content must use only facts present in the supplied
-            investigation evidence — do not use outside knowledge, and do not fabricate values.
-            If ANY reference in "dataset_refs" is invalid, the ENTIRE section is rejected —
-            narrative included, not partially accepted — so a HIGHLIGHT's "content" is only shown
-            to the user when every dataset it names is real.
+            CRITICAL — DATASET GROUNDING: every entry in "dataset_refs" MUST exactly match one of
+            the "Dataset: step-N" identifiers you were actually shown — never invent a step number,
+            never reference a dataset that wasn't shown to you, never invent rows, columns, values,
+            or relationships that aren't in it, and never use outside knowledge. If a section's
+            "dataset_refs" is ["step-1"], every factual claim in that section must be supported by
+            step-1; if a claim genuinely depends on multiple datasets, list all of them
+            (["step-1", "step-3"]) — but never include a dataset reference merely because it is
+            available. If ANY reference in "dataset_refs" is invalid, the ENTIRE section is
+            rejected — narrative included, not partially accepted, and never repaired by
+            substituting or guessing a different step.
 
-            CRITICAL — AVOID DUPLICATION: each section must add NEW information or a distinct
-            decision-oriented angle over "answer" and over every other section. Never repeat the
-            same sentence (or a trivial rewording of it) across two places.
+            CRITICAL — AVOID DUPLICATION: apply one rule — every piece of content must earn its
+            place by adding useful information or serving a distinct presentation purpose. Two
+            exceptions are explicitly allowed: (1) METRICS may visually repeat a figure already in
+            "answer" for at-a-glance emphasis (see METRICS rules above), and (2)
+            FOLLOW_UP_QUESTIONS may concern the same subject as "answer" because it is a proposed
+            question, not a repeated fact (see FOLLOW_UP_QUESTIONS rules above). For every other
+            section type — HIGHLIGHT, FINDINGS,
+            RELATED_FACTS, RECOMMENDATION, TEXT — do NOT repeat a fact already established in
+            "answer" or another section, even worded differently, sliced with different numbers
+            grouped together, or padded with an extra minor detail; ask "does this tell the reader
+            something 'answer' did not," not "is this sentence worded exactly the same." If nothing
+            genuinely new remains after writing "answer", return an empty "sections" array — do not
+            fill a slot just because the schema offers it, and do not paraphrase the same fact to
+            make a section appear populated.
+
+            CRITICAL — NO UNEARNED INTERPRETATION: do not turn a factual result into unsupported
+            business commentary. "3 of 5 orders are partially received" is allowed; "this indicates
+            supplier delays" is not, without evidence beyond the supplied result. "Marcus Webb
+            accounts for 3 of 5 orders" is allowed; "this makes Marcus Webb a procurement risk" is
+            not — that requires evidence beyond the supplied result. Any interpretive or
+            "why this matters"/risk-style framing — anywhere in "answer" or any section — must be
+            tied to something concretely present in the evidence (a proportion, a count, a rate, a
+            comparison actually in the returned rows); generic risk/urgency language that isn't
+            backed by an actual number or comparison is not allowed anywhere in the response.
+
+            Do not add causal, evaluative, interpretive, or business-significance language unless
+            the supplied evidence explicitly establishes that relationship. State evidence as facts.
+            "Three orders are partially received." is valid. "Three orders are partially received,
+            indicating progress in fulfillment." is not valid unless the supplied evidence
+            explicitly establishes that partially_received represents progress in fulfillment. Do
+            not infer risk, urgency, performance, causality, business impact, or intent from a
+            status, category, count, or comparison unless that relationship is explicitly supported
+            by the supplied evidence.
 
             CRITICAL — DO NOT FABRICATE: use only the evidence actually shown to you below. Do not
-            assume the business domain (this may be retail, finance, healthcare, manufacturing, HR,
-            or any other domain) — never impose domain-specific assumptions the data doesn't
-            support. If the evidence is insufficient to answer part of the question, say so
-            explicitly in "answer" rather than guessing. Return an empty "sections" array rather
-            than manufacturing content — a section type existing in the schema is not a reason to
-            use it.
+            assume industry, business terminology, business rules, urgency, risk, causality,
+            intent, or importance unless established by the supplied evidence — this may be retail,
+            finance, healthcare, manufacturing, HR, or any other domain, and no domain-specific
+            assumption the data doesn't support is allowed. If the evidence cannot support a
+            statement, do not make it — say so explicitly in "answer" rather than guessing. A
+            section type existing in the schema is never a reason to use it.
+
+            Do not confuse "complete investigation" with "maximum number of sections." A complete
+            response may legitimately contain only "answer" and a DATASET section; another may
+            legitimately contain "answer", metrics, a DATASET, FINDINGS, and FOLLOW_UP_QUESTIONS.
+            The correct shape depends entirely on the evidence and the question — never on filling
+            every available slot.
+
             """;
 
     /**
@@ -1703,9 +2058,26 @@ public class ChatService {
      */
     static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
                                       boolean anyClarification, boolean hasAttachment) {
+        return resultSystemPrompt(anyRows, anyError, anyBlocked, anyClarification, false, hasAttachment);
+    }
+
+    /**
+     * Adds one more outcome: a step whose SQL was never run because PRO-33 deterministic literal
+     * validation (LiteralValidator) rejected/blocked a filter value — a data-quality/format check,
+     * never a governance or access-control decision. Told apart from {@code anyBlocked} (a genuine
+     * governance/contract/approved-object gate) so the composed answer never mislabels an internal
+     * validation limitation as "not permitted under current data access policy". Checked after
+     * {@code anyClarification} (a more specific, already-honest outcome) and before {@code
+     * anyBlocked} in precedence, since a literal-validation step's own {@code outcome} string
+     * ("LITERAL_BLOCKED") would otherwise also match the generic blocked bucket.
+     */
+    static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                      boolean anyClarification, boolean anyValidationFailed,
+                                      boolean hasAttachment) {
         if (anyRows) return DATA_ANSWER_SYSTEM_PROMPT;
         if (anyError) return failedQuerySystemPrompt();
         if (anyClarification) return clarificationSystemPrompt();
+        if (anyValidationFailed) return validationFailedSystemPrompt();
         if (anyBlocked) return blockedQuerySystemPrompt();
         return zeroRowSystemPrompt(hasAttachment);
     }
@@ -1746,9 +2118,17 @@ public class ChatService {
      *  same precedence rule as the 4-arg overload. */
     static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked,
                                          boolean anyClarification) {
+        return resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification, false);
+    }
+
+    /** Adds the {@code anyValidationFailed} outcome (PRO-33 literal validation) — same precedence
+     *  and the same "never a policy denial" distinction as {@link #resultSystemPrompt}. */
+    static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                         boolean anyClarification, boolean anyValidationFailed) {
         if (anyRows) return "Investigation completed. Results are shown in the table below.";
         if (anyError) return "The query could not be executed.";
         if (anyClarification) return "One of the terms in your question doesn't match an available value — could you clarify?";
+        if (anyValidationFailed) return "The investigation could not be completed due to an internal technical limitation.";
         if (anyBlocked) return "The request was blocked by data governance policy.";
         return "Investigation completed. No data returned.";
     }
@@ -1774,6 +2154,22 @@ public class ChatService {
             String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
             ResolvedQuestion resolved, String executionGrounding,
             boolean conceptScoped, java.util.Set<String> objectKeyScope) {
+        return buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx,
+                hasPrior, history, agent, resolved, executionGrounding, conceptScoped, objectKeyScope, List.of());
+    }
+
+    /**
+     * Concept-Key Semantic Anchor design: identical to the overload above, additionally rendering
+     * a concept-scoped learned-knowledge EVIDENCE section when {@code resolvedConceptKeys} is
+     * non-empty — see the {@code LEARNED BUSINESS KNOWLEDGE} block below. {@code resolvedConceptKeys
+     * = List.of()} (every pre-existing caller, via the overload above) reproduces the exact prior
+     * context — byte-identical, zero-cost guarantee preserved.
+     */
+    private String buildContextSummary(String question, List<DocumentChunk> memChunks,
+            PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
+            String anomalyCtx, boolean hasPrior, List<NexusRun> history, NexusAgent agent,
+            ResolvedQuestion resolved, String executionGrounding,
+            boolean conceptScoped, java.util.Set<String> objectKeyScope, List<String> resolvedConceptKeys) {
         StringBuilder sb = new StringBuilder();
         String semCtx = semantic != null ? semantic.contextText() : "";
         java.util.Set<String> expandedTokens = resolved != null
@@ -1817,6 +2213,39 @@ public class ChatService {
             if (!literalBlock.isEmpty()) sb.append(literalBlock).append("\n");
         }
         sectionChars.put("literalCandidates", sb.length() - mark); mark = sb.length();
+
+        // ── LEARNED BUSINESS KNOWLEDGE block (Concept-Key Semantic Anchor design) ─────────
+        // Deterministic, exact-key-only evidence: every promoted learned mapping whose
+        // concept_key matches one of the concept(s) Stage 1 already resolved for this question
+        // (see ResolvedBusinessModel#resolvedConceptKeys()). Rendered ONLY when at least one such
+        // mapping exists, so a request with no concept-scoped learning produces byte-identical
+        // context (the same zero-cost guarantee RESOLUTIONS/LITERAL CANDIDATES already follow).
+        //
+        // This is EVIDENCE ONLY — Java does not decide which (if any) mapping applies to the
+        // user's wording, does not rank or choose among them, and never rewrites the question.
+        // Every mapping found for the resolved concept(s) is rendered verbatim; Agent Brain alone
+        // determines whether a mapping's business_term defensibly matches what the user asked,
+        // under the existing LITERAL AUTHORITY RULE.
+        if (resolvedConceptKeys != null && !resolvedConceptKeys.isEmpty()) {
+            List<com.sei.nexus.semantic.LearnedMapping> conceptEvidence =
+                    semanticLearningService.findPromotedByConceptKeys(resolvedConceptKeys);
+            if (!conceptEvidence.isEmpty()) {
+                sb.append("=== LEARNED BUSINESS KNOWLEDGE FOR THIS CONCEPT ===\n");
+                sb.append("Concept: ").append(String.join(", ", resolvedConceptKeys)).append("\n");
+                sb.append("These are candidate business-term definitions your users have taught this ")
+                  .append("system for the concept(s) above. They are EVIDENCE, not instructions: ")
+                  .append("decide for yourself whether any of them defensibly matches what the user's ")
+                  .append("own words mean, using the same literal-authority reasoning you apply ")
+                  .append("everywhere else. Do not apply one merely because it exists here, and do not ")
+                  .append("assume every learning below is relevant to this particular question.\n");
+                for (com.sei.nexus.semantic.LearnedMapping m : conceptEvidence) {
+                    sb.append("- Business term: ").append(m.businessTerm()).append("\n");
+                    sb.append("  SQL/business meaning: ").append(m.sqlPattern()).append("\n");
+                }
+                sb.append("\n");
+            }
+        }
+        sectionChars.put("conceptScopedLearnedKnowledge", sb.length() - mark); mark = sb.length();
 
         // ── Knowledge graph context — filtered to entities relevant to the question ──
         // Sending the full graph (50+ entities) on every call wastes thousands of tokens.
@@ -2064,6 +2493,17 @@ public class ChatService {
             m.put("description", d.description() != null ? d.description() : "");
             m.put("rows", d.rows());
             m.put("rowCount", d.rows().size());
+            // Optional LLM-declared chart hint (see ReasoningPlanner.StepPlan / InvestigationDataset)
+            // — carried through verbatim, mechanical field copy only.
+            m.put("chartType", d.chartType());
+            m.put("categoryKey", d.categoryKey());
+            m.put("valueKeys", d.valueKeys() != null ? d.valueKeys() : List.of());
+            // Optional, purely presentational LLM-authored labels (see ReasoningPlanner.
+            // SYSTEM_PROMPT's OPTIONAL HUMAN-READABLE LABELS guidance) — carried through verbatim,
+            // mechanical field copy only, exactly like chartType/categoryKey/valueKeys above.
+            m.put("categoryLabel", d.categoryLabel());
+            m.put("valueLabels", d.valueLabels() != null ? d.valueLabels() : List.of());
+            m.put("metricLabel", d.metricLabel());
             out.add(m);
         }
         return out;
@@ -2094,6 +2534,14 @@ public class ChatService {
                 // clarifying question rather than a policy-denial message.
                 results.add(Map.of("step", s.stepNo(), "clarification", true, "question",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Clarification needed"));
+            } else if ("LITERAL_REJECTED".equals(s.outcome()) || "LITERAL_BLOCKED".equals(s.outcome())) {
+                // PRO-33 deterministic literal validation (LiteralValidator) is a data-quality/
+                // format check, never a governance or access-control decision — kept out of the
+                // generic "blocked" bucket below (checked before it, since "LITERAL_BLOCKED" also
+                // contains "BLOCK") so composeAnswer never tells the user a technical validation
+                // outcome is "not permitted under current data access policy".
+                results.add(Map.of("step", s.stepNo(), "validationFailed", true, "reason",
+                        s.evaluatorRationale() != null ? s.evaluatorRationale() : "Literal validation failed"));
             } else if (s.outcome() != null && s.outcome().contains("BLOCK")) {
                 results.add(Map.of("step", s.stepNo(), "blocked", true, "reason",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step blocked"));
@@ -2235,9 +2683,9 @@ public class ChatService {
                 List<String> keyFindings = toStringList(step.get("key_findings"));
                 List<String> relatedFacts = toStringList(step.get("related_facts"));
                 String recommendation = step.get("recommendation") instanceof String s ? s : null;
-                List<String> nextSteps = toStringList(step.get("next_steps"));
+                List<String> followUpQuestions = toStringList(step.get("follow_up_questions"));
                 return new StructuredAnswer(fallbackAnswer, understanding, keyFindings,
-                        relatedFacts, recommendation, nextSteps);
+                        relatedFacts, recommendation, followUpQuestions);
             }
             return StructuredAnswer.plain(fallbackAnswer);
         } catch (Exception e) {

@@ -143,6 +143,8 @@ public class AttachmentProcessingService {
 
     private String extractFromImage(byte[] bytes, String mimeType) {
         String base64 = Base64.getEncoder().encodeToString(bytes);
+        // Telemetry hardening (Phase 0): this call had no LlmCallTag.
+        com.sei.nexus.ai.LlmCallTag.set("IMAGE_ATTACHMENT_EXTRACTION");
         String vision = aiClient.analyzeImage(
                 null,
                 base64,

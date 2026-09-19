@@ -162,6 +162,13 @@ public class DocumentMemoryService {
             // --- Embed and save each chunk ---
             int chunkNo = 0;
             for (String chunkText : chunks) {
+                // Telemetry hardening (Phase 0): this ingest-time embed() call had no LlmCallTag at
+                // all — it would persist as UNTAGGED/NULL call_type and, combined with the existing
+                // default feature="chat" (UsageContext is never set on this path), be indistinguishable
+                // from a real chat call in nexus_usage_event. Reuses the exact same tag the sibling
+                // query-time embed() call below already sets for the identical operation (embedding
+                // text) — not a new classification.
+                com.sei.nexus.ai.LlmCallTag.set("MEMORY_EMBEDDING");
                 float[] embedding = azureOpenAiClient.embed(chunkText).embedding();
                 int tokens = estimateTokenCount(chunkText);
                 String chunkKey = Keys.uniqueKey("chunk");

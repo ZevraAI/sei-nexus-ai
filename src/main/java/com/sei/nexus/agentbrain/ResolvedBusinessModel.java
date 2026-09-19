@@ -65,7 +65,32 @@ public record ResolvedBusinessModel(
         // that predates this field (every pre-existing constructor overload below), in which case
         // ExecutionContractBuilder falls back to `objects` — byte-identical to before this field
         // existed.
-        Optional<SemanticModel> executionScope
+        Optional<SemanticModel> executionScope,
+        // Concept-Key Semantic Anchor design: the exact concept_key(s) Stage 1 selected for this
+        // request (see ConceptScopedMetadataResolver#resolveConceptKeys / AgentBrain's
+        // conceptScopedModel*), carried through verbatim — never rederived, normalized, or
+        // filtered semantically here. This is DETERMINISTIC SCOPING IDENTITY ONLY: it exists so a
+        // downstream, exact-key lookup (LearnedMappingRepository#findPromotedByConceptKeys) can
+        // retrieve concept-scoped learned-knowledge evidence; it is never itself a semantic
+        // decision, and nothing in this class or its callers may use it to choose or apply a
+        // learning. Empty for every pre-existing constructor overload below (no concept-scoped
+        // narrowing occurred, or narrowing ran through a path that predates this field) —
+        // reproducing prior behavior byte for byte.
+        List<String> resolvedConceptKeys,
+        // Concept-Level Disjunctive Ambiguity design: present, carrying a concept-level
+        // clarification question authored verbatim by Agent Brain (Stage 1), only when Stage 1
+        // explicitly marked its own concept selection "AMBIGUOUS" — the question could plausibly
+        // mean any ONE of two or more DIFFERENT, mutually-exclusive business concepts, and nothing
+        // resolves which one (see AgentBrain#conceptScopedModelWithRouting and
+        // ConceptScopedMetadataResolver's CONCEPT_RESOLUTION_TYPE_RULES). Java never constructs or
+        // infers this text — it is relayed verbatim from the LLM's own response, exactly like
+        // {@link #routingDecision}. When present, {@code objects}/{@code objectTargets}/{@code
+        // attributeTargets}/{@code executionScope} are ALL empty — no physical object is ever
+        // approved for an unresolved ambiguity — and the caller (ChatService) MUST terminate the
+        // request into a clarification response without compiling an ExecutionContract or
+        // retrieving physical metadata. Empty for every pre-existing constructor overload below
+        // (no ambiguity signal existed before this field), reproducing prior behavior byte for byte.
+        Optional<String> conceptAmbiguityClarification
 ) {
     public ResolvedBusinessModel {
         connectionKeys   = List.copyOf(connectionKeys);
@@ -76,6 +101,43 @@ public record ResolvedBusinessModel(
         literalScope = literalScope == null ? Map.of() : Map.copyOf(literalScope);
         routingDecision = routingDecision == null ? Optional.empty() : routingDecision;
         executionScope  = executionScope  == null ? Optional.empty() : executionScope;
+        resolvedConceptKeys = resolvedConceptKeys == null ? List.of() : List.copyOf(resolvedConceptKeys);
+        conceptAmbiguityClarification = conceptAmbiguityClarification == null
+                ? Optional.empty() : conceptAmbiguityClarification;
+    }
+
+    /** Pre-existing 12-arg shape (Concept-Key Semantic Anchor design, no ambiguity signal) —
+     *  {@code conceptAmbiguityClarification} defaults to empty, exactly the fallback behavior
+     *  every caller of this overload has always exhibited. */
+    public ResolvedBusinessModel(String agentId, List<String> connectionKeys, String question,
+                                 List<BusinessObject> objects,
+                                 Map<String, PhysicalTable> objectTargets,
+                                 Map<String, PhysicalColumn> attributeTargets,
+                                 ResolvedQuestion resolution,
+                                 Map<String, ColumnValueDomain> literalScope,
+                                 boolean conceptScoped,
+                                 Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision,
+                                 Optional<SemanticModel> executionScope,
+                                 List<String> resolvedConceptKeys) {
+        this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
+                resolution, literalScope, conceptScoped, routingDecision, executionScope,
+                resolvedConceptKeys, Optional.empty());
+    }
+
+    /** Pre-existing 11-arg shape (Decision Router absorption + separate execution-authorization
+     *  scope, no concept-key carry-through) — {@code resolvedConceptKeys} defaults to empty,
+     *  exactly the fallback behavior every caller of this overload has always exhibited. */
+    public ResolvedBusinessModel(String agentId, List<String> connectionKeys, String question,
+                                 List<BusinessObject> objects,
+                                 Map<String, PhysicalTable> objectTargets,
+                                 Map<String, PhysicalColumn> attributeTargets,
+                                 ResolvedQuestion resolution,
+                                 Map<String, ColumnValueDomain> literalScope,
+                                 boolean conceptScoped,
+                                 Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision,
+                                 Optional<SemanticModel> executionScope) {
+        this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
+                resolution, literalScope, conceptScoped, routingDecision, executionScope, List.of());
     }
 
     /** Pre-existing 10-arg shape (Decision Router absorption, no separate execution-authorization
@@ -90,7 +152,7 @@ public record ResolvedBusinessModel(
                                  boolean conceptScoped,
                                  Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision) {
         this(agentId, connectionKeys, question, objects, objectTargets, attributeTargets,
-                resolution, literalScope, conceptScoped, routingDecision, Optional.empty());
+                resolution, literalScope, conceptScoped, routingDecision, Optional.empty(), List.of());
     }
 
     /** Pre-existing 9-arg shape (Concept-Scoped Metadata Narrowing, no routing absorption) —

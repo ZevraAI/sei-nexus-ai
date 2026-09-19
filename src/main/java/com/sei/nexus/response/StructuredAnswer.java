@@ -22,12 +22,20 @@ import java.util.List;
  * {@code answer} plus {@code sections} — a UI-content plan the model itself authors, deciding
  * which investigation dataset (by its Java-assigned {@code step-N} identifier) answers which
  * part of the question, which dataset(s) should be displayed, and what belongs in findings /
- * related facts / recommendation / next steps. The five legacy flat fields below are never
- * independently populated by the model once {@code sections} is used — see {@link
+ * related facts / recommendation / follow-up questions. The five legacy flat fields below are
+ * never independently populated by the model once {@code sections} is used — see {@link
  * #fromSections} — they exist only so existing consumers that read them directly keep working
  * unchanged, via a mechanical, type-tag-driven projection Java performs from {@code sections}.
  * Java never re-derives these from prose, never selects a dataset, and never decides placement —
  * it only copies fields the model already tagged by {@code type}.
+ *
+ * <p><b>FOLLOW_UP_QUESTIONS is a single section, not two decoupled fields:</b> a {@code
+ * FOLLOW_UP_QUESTIONS} {@link Section} carries both its questions ({@code items}) and the
+ * reasoning for them ({@code reasoning}) directly on the same object — there is no independent
+ * top-level reasoning field (there used to be one, {@code follow_up_questions_reasoning}; it has
+ * been removed entirely, not kept as a compatibility field, because it was structurally decoupled
+ * from whether a FOLLOW_UP_QUESTIONS section/items existed at all — see {@code
+ * ChatService#dataAnswerJsonSchema}'s javadoc for the full history).
  *
  * @param answer         the primary answer, in prose — always present.
  * @param sections       the model's own UI-content plan — see class javadoc. Empty for a
@@ -46,8 +54,25 @@ import java.util.List;
  *                        {@code understanding} and {@code keyFindings}; empty when there is none.
  * @param recommendation what the business should consider doing, grounded in the evidence; null
  *                        when no recommendation is warranted.
- * @param nextSteps      concrete follow-up investigations the user could ask next, specific to
- *                        this question/evidence — not generic filler; empty when none apply.
+ * @param followUpQuestions possible questions the user may naturally ask next based on the
+ *                        current investigation, specific to this question/evidence — not generic
+ *                        filler; empty when none apply. Not investigation steps, actions, or
+ *                        recommendations — see {@code ChatService.DATA_ANSWER_JSON_SYSTEM_PROMPT}'s
+ *                        FOLLOW_UP_QUESTIONS rules. Mechanically derived from the FOLLOW_UP_QUESTIONS
+ *                        section's own {@code items} (see {@link #fromSections}) — the reasoning
+ *                        for these lives on that same {@link Section}'s {@code reasoning}, not here.
+ * @param metrics        OPTIONAL whole-answer headline figures the model itself judged genuinely
+ *                        worth surfacing (a standout entity, a total, an earliest/latest value,
+ *                        etc.) — see {@code ChatService.DATA_ANSWER_JSON_SYSTEM_PROMPT}'s METRICS
+ *                        rules. A distinct concept from any per-step chart hint (those describe
+ *                        how ONE dataset charts; this is a holistic, across-the-whole-answer set
+ *                        of figures). Empty when the model found nothing beyond the obvious row
+ *                        count worth headlining — never padded to fill a slot. Java relays each
+ *                        {@code label}/{@code value} verbatim, performing zero interpretation of
+ *                        what a metric means or how its value should be formatted — see {@code
+ *                        ResponseArtifactsBuilder#metrics}, where a non-empty list here is
+ *                        preferred outright over the mechanical row-count/distinct-count
+ *                        computation, which remains the fallback tier for when this is empty.
  */
 public record StructuredAnswer(
         String answer,
@@ -56,22 +81,28 @@ public record StructuredAnswer(
         List<String> keyFindings,
         List<String> relatedFacts,
         String recommendation,
-        List<String> nextSteps
+        List<String> followUpQuestions,
+        List<Metric> metrics
 ) {
     /** Pre-{@code sections} shape — every pre-existing caller/constructor. {@code sections}
      *  defaults to empty; behavior is otherwise byte-identical to before this field existed. */
     public StructuredAnswer(String answer, String understanding, List<String> keyFindings,
-                            List<String> relatedFacts, String recommendation, List<String> nextSteps) {
-        this(answer, List.of(), understanding, keyFindings, relatedFacts, recommendation, nextSteps);
+                            List<String> relatedFacts, String recommendation, List<String> followUpQuestions) {
+        this(answer, List.of(), understanding, keyFindings, relatedFacts, recommendation, followUpQuestions, List.of());
     }
 
     /** A structured answer carrying no semantic decomposition — the legacy-compatible shape.
      *  Byte-identical to before {@code sections} existed (every field null) except {@code
-     *  sections} itself, which is empty (never null) — a new field, nothing to be compatible
-     *  with. */
+     *  sections}/{@code metrics}, which are empty (never null) — new fields, nothing to be
+     *  compatible with. */
     public static StructuredAnswer plain(String answer) {
-        return new StructuredAnswer(answer, List.of(), null, null, null, null, null);
+        return new StructuredAnswer(answer, List.of(), null, null, null, null, null, List.of());
     }
+
+    /** One whole-answer headline figure the model itself proposed — see the class javadoc's
+     *  {@code metrics} parameter. {@code value} is pre-formatted for display exactly as the model
+     *  wants it shown; Java never reformats it. */
+    public record Metric(String label, String value) {}
 
     /**
      * Builds a {@link StructuredAnswer} from the model's UI-content plan — the sections-based
@@ -85,6 +116,16 @@ public record StructuredAnswer(
      * type in this contract; {@code answer} is the narrative.
      */
     public static StructuredAnswer fromSections(String answer, List<Section> sections) {
+        return fromSections(answer, sections, List.of());
+    }
+
+    /**
+     * As {@link #fromSections(String, List)}, with one additive parameter: {@code metrics} — the
+     * model's own top-level {@code "metrics"} array (see the class javadoc), a sibling of
+     * {@code "sections"} in the JSON contract, never derived from section content itself. Relayed
+     * verbatim; empty when the model supplied none.
+     */
+    public static StructuredAnswer fromSections(String answer, List<Section> sections, List<Metric> metrics) {
         List<Section> s = sections == null ? List.of() : sections;
         // A HIGHLIGHT's content is a distinguished, dataset-grounded observation — mechanically
         // the same kind of content as a FINDINGS item, just additionally traceable to a dataset.
@@ -93,7 +134,8 @@ public record StructuredAnswer(
         keyFindings.addAll(contentsOfType(s, "HIGHLIGHT"));
         return new StructuredAnswer(answer, s, null,
                 keyFindings, itemsOfType(s, "RELATED_FACTS"),
-                firstContentOfType(s, "RECOMMENDATION"), itemsOfType(s, "NEXT_STEPS"));
+                firstContentOfType(s, "RECOMMENDATION"), itemsOfType(s, "FOLLOW_UP_QUESTIONS"),
+                metrics == null ? List.of() : metrics);
     }
 
     private static List<String> contentsOfType(List<Section> sections, String type) {
@@ -148,7 +190,7 @@ public record StructuredAnswer(
      * unverifiable as one citing only a fake dataset.
      *
      * @param type        one of {@code DATASET | HIGHLIGHT | FINDINGS | RELATED_FACTS |
-     *                    RECOMMENDATION | NEXT_STEPS | TEXT} — the model's own semantic
+     *                    RECOMMENDATION | FOLLOW_UP_QUESTIONS | TEXT} — the model's own semantic
      *                    classification of this section. Not a Java enum: an unrecognized value
      *                    is passed through unresolved (see {@code resolveSections}), never coerced.
      * @param title       the model's own label for this section, e.g. "Open Purchase Orders".
@@ -163,11 +205,17 @@ public record StructuredAnswer(
      *                    ranking, substitution, or inference about how the datasets relate.
      * @param display     {@code type=DATASET} only: the model's own judgment of whether this
      *                    dataset should be shown to the user. Null defaults to {@code true}.
-     * @param items       {@code type=FINDINGS | RELATED_FACTS | NEXT_STEPS}: the section's list
-     *                    content.
+     * @param items       {@code type=FINDINGS | RELATED_FACTS | FOLLOW_UP_QUESTIONS}: the section's
+     *                    list content.
      * @param content     {@code type=HIGHLIGHT | RECOMMENDATION | TEXT}: the section's prose
      *                    content.
+     * @param reasoning   {@code type=FOLLOW_UP_QUESTIONS} only: the model's own one-line reasoning
+     *                    for why THIS section's {@code items} are plausible/useful follow-up
+     *                    questions — structurally attached to the same section as {@code items},
+     *                    never an independent top-level field (see the class javadoc). Null for
+     *                    every other section type; Java performs no validation of its content
+     *                    beyond relaying it verbatim.
      */
     public record Section(String type, String title, String purpose, List<String> datasetRefs,
-                           Boolean display, List<String> items, String content) {}
+                           Boolean display, List<String> items, String content, String reasoning) {}
 }

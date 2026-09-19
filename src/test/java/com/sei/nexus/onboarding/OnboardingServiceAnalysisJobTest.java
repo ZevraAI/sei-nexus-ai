@@ -97,6 +97,13 @@ class OnboardingServiceAnalysisJobTest {
             this.perCallDelayMs = perCallDelayMs;
         }
 
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            return chatWithJson(messages, systemPrompt);
+        }
+
         @Override
         public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
             capturedTenantSchemas.add(TenantContext.getSchema());

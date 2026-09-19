@@ -53,6 +53,42 @@ public class AzureOpenAiClient {
     @Value("${nexus.openai.embedding-model:text-embedding-ada-002}")
     private String embeddingModel;
 
+    // Model tiering (pre-production cost optimization, see application.yml): each low-complexity
+    // candidate gets its own configurable model, independent of chatModel and of each other, so
+    // one can be tuned/reverted without touching the rest. Defaults to gpt-4o-mini — the intended
+    // optimization — but each is a plain @Value like chatModel/routingModel above, so any one of
+    // them can be pinned back to gpt-4o via its own env var without a code change.
+    @Value("${nexus.openai.term-extractor-model:gpt-4o-mini}")
+    private String termExtractorModel;
+
+    // Live model-tiering evaluation (TermExtractorAndCorrectionDetectorModelTieringLiveValidation)
+    // found gpt-4o-mini unsuitable for this one: it misclassified a plain new-dimension follow-up
+    // ("what about sales by region") as a correction in 2 of 3 trials, which gpt-4o never did —
+    // that would incorrectly decrease confidence on a correct learned mapping in production. Per
+    // the audit's own rule ("if the cheaper model fails a contract, report unsuitable rather than
+    // compensating with Java logic"), this candidate stays on gpt-4o; the property still exists so
+    // it can be revisited independently later.
+    @Value("${nexus.openai.correction-detector-model:gpt-4o}")
+    private String correctionDetectorModel;
+
+    @Value("${nexus.openai.onboarding-model:gpt-4o-mini}")
+    private String onboardingModel;
+
+    @Value("${nexus.openai.memory-selection-model:gpt-4o-mini}")
+    private String memorySelectionModel;
+
+    // Phase 1 explicit prompt caching: deterministic, versioned prompt_cache_key values for the
+    // four calls whose telemetry (see nexus_usage_event by call_type) already showed a large,
+    // byte-identical, tenant-independent static prefix — this is purely a cache-routing HINT
+    // (helps OpenAI route repeat requests with the same prefix to the same cache-holding backend
+    // machine); it never appears in `instructions`/`input`, never influences what content is sent
+    // or reused, and carries no tenant/question/conversation data. "v1" so a future prompt-contract
+    // change can roll to a new key without silently sharing cache lookups with the old contract.
+    private static final String CACHE_KEY_STAGE1_CONCEPT_AND_ROUTING = "zevra:stage1-concept-and-routing:v1";
+    private static final String CACHE_KEY_PLANNER                    = "zevra:planner:v1";
+    private static final String CACHE_KEY_EVALUATOR                  = "zevra:evaluator:v1";
+    private static final String CACHE_KEY_ANSWER_COMPOSER            = "zevra:answer-composer:v1";
+
     // Global backpressure valve: this one client instance is shared by EVERY
     // tenant (chat, onboarding, packs, semantic learning) — with no cap, one
     // tenant's burst (e.g. onboarding 15 tables at once) can rate-limit-storm
@@ -467,6 +503,36 @@ public class AzureOpenAiClient {
      */
     public FileSearchResult chatWithFileSearch(String vectorStoreId, String instructions, String question,
                                                 String previousResponseId, Map<String, Object> jsonSchema) {
+        return chatWithFileSearch(vectorStoreId, instructions, question, previousResponseId, jsonSchema, null);
+    }
+
+    /**
+     * Phase 1 explicit prompt caching equivalent of the 5-arg {@link #chatWithFileSearch} for
+     * {@code ConceptScopedMetadataResolver}'s combined concept-selection + routing-decision
+     * contract — identical request shape (native {@code file_search}, strict JSON schema,
+     * {@code previous_response_id} chaining unchanged), additionally attaching {@code
+     * prompt_cache_key="zevra:stage1-concept-and-routing:v1"}. Additive: the 5-arg overload (used
+     * by the non-routing concept-selection-only variant) is unchanged.
+     */
+    public FileSearchResult chatWithFileSearchForConceptAndRouting(String vectorStoreId, String instructions,
+            String question, String previousResponseId, Map<String, Object> jsonSchema) {
+        return chatWithFileSearch(vectorStoreId, instructions, question, previousResponseId, jsonSchema,
+                CACHE_KEY_STAGE1_CONCEPT_AND_ROUTING);
+    }
+
+    /**
+     * Same as the 5-arg {@link #chatWithFileSearch}, additionally attaching an explicit Responses
+     * API {@code prompt_cache_key} (Phase 1 explicit prompt caching) when {@code promptCacheKey}
+     * is non-null/non-blank — added as the LAST top-level request field, after the existing
+     * stable {@code instructions} / dynamic {@code input} / {@code tools} / {@code
+     * previous_response_id} construction below is unchanged and complete. Purely a cache-routing
+     * hint; never part of the rendered instructions/input content, so it cannot cause one
+     * tenant's dynamic content to be served to another. {@code null} reproduces the exact prior
+     * behavior.
+     */
+    private FileSearchResult chatWithFileSearch(String vectorStoreId, String instructions, String question,
+                                                 String previousResponseId, Map<String, Object> jsonSchema,
+                                                 String promptCacheKey) {
         String url = BASE_URL + "/responses";
         Map<String, Object> tool = new HashMap<>();
         tool.put("type", "file_search");
@@ -497,6 +563,9 @@ public class AzureOpenAiClient {
         requestBody.put("text", text);
         if (previousResponseId != null && !previousResponseId.isBlank()) {
             requestBody.put("previous_response_id", previousResponseId);
+        }
+        if (promptCacheKey != null && !promptCacheKey.isBlank()) {
+            requestBody.put("prompt_cache_key", promptCacheKey);
         }
 
         long startNanos = System.nanoTime();
@@ -572,7 +641,7 @@ public class AzureOpenAiClient {
                 int inputTokens  = usage.path("input_tokens").asInt(0);
                 int outputTokens = usage.path("output_tokens").asInt(0);
                 int cachedTokens = usage.path("input_tokens_details").path("cached_tokens").asInt(0);
-                usageService.record(chatModel, inputTokens, outputTokens, cachedTokens);
+                usageService.record(chatModel, inputTokens, outputTokens, cachedTokens, tag);
                 log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
                                 + "cachedTokens={} requestChars={} operationId={}",
                         tag, chatModel, latencyMs, inputTokens, outputTokens, cachedTokens, -1,
@@ -608,10 +677,310 @@ public class AzureOpenAiClient {
     }
 
     /**
+     * Responses API equivalent of {@link #chat}: a single model turn, no tools, no File Search,
+     * plain free-form text output (no {@code text.format} at all — the same "no response format"
+     * shape {@link #doChat}'s non-JSON path already sends). One HTTP request to {@code
+     * POST /v1/responses}, sharing the exact same retry/backoff/rate-awareness/timeout
+     * infrastructure every other call on this client uses ({@link #executeWithRetry}).
+     *
+     * <p>Deliberately transport-only: no {@code previous_response_id} is sent or accepted, no
+     * strict JSON Schema, no tools — this is the least-behavior-changing Responses API shape for
+     * a caller that today gets an unconstrained text response back and parses it itself
+     * (see {@link ReasoningEvaluator}, {@code ChatService#buildMemorySelectionContext},
+     * {@link NaturalLanguageComposer} TEXT mode).
+     */
+    public String respond(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, false, chatModel);
+    }
+
+    /**
+     * Model-tiering equivalent of {@link #respond} for {@code ChatService.buildMemorySelectionContext}
+     * ("Memory Selection") — identical request shape (Responses API, free-form text, no
+     * schema), using {@code nexus.openai.memory-selection-model} (defaults to {@code
+     * gpt-4o-mini}) instead of {@link #chatModel}. Additive: {@link #respond} is unchanged for
+     * every other existing caller (Planner, Evaluator, Composer's TEXT mode).
+     */
+    public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, false, memorySelectionModel);
+    }
+
+    /**
+     * Phase 1 explicit prompt caching equivalent of {@link #respond} for {@link
+     * com.sei.nexus.reasoning.ReasoningPlanner} — identical request shape (Responses API,
+     * free-form text, no schema, same {@link #chatModel}), additionally attaching {@code
+     * prompt_cache_key="zevra:planner:v1"}. Additive: {@link #respond} is unchanged for every
+     * other existing caller.
+     */
+    public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_PLANNER);
+    }
+
+    /**
+     * Phase 1 explicit prompt caching equivalent of {@link #respond} for {@link
+     * com.sei.nexus.reasoning.ReasoningEvaluator} — identical request shape, additionally
+     * attaching {@code prompt_cache_key="zevra:evaluator:v1"}.
+     */
+    public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_EVALUATOR);
+    }
+
+    /**
+     * Phase 1 explicit prompt caching equivalent of {@link #respond} for {@link
+     * com.sei.nexus.response.NaturalLanguageComposer}'s TEXT mode — identical request shape,
+     * additionally attaching {@code prompt_cache_key="zevra:answer-composer:v1"}.
+     */
+    public String respondForComposer(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, false, chatModel, CACHE_KEY_ANSWER_COMPOSER);
+    }
+
+    /**
+     * Same as {@link #respond}, with the Responses API's {@code text.format = json_object} mode
+     * enabled — the direct equivalent of {@link #chatWithJson}'s Chat Completions {@code
+     * response_format = json_object}, not the stricter {@code json_schema}/{@code strict:true}
+     * mode {@link #chatWithFileSearch} also supports. Deliberately the least-behavior-changing
+     * structured-output equivalent: OpenAI still only guarantees syntactically valid JSON, not a
+     * specific shape — callers keep their own existing tolerant parsing exactly as before.
+     */
+    public String respondWithJson(List<ChatMessage> messages, String systemPrompt) {
+        return doRespond(messages, systemPrompt, true, chatModel);
+    }
+
+    /**
+     * Responses API call with strict JSON-schema-enforced structured output ({@code
+     * text.format={"type":"json_schema",...,"strict":true}}) — the exact same {@code text.format}
+     * discipline {@link #chatWithFileSearch(String, String, String, String, Map)} already uses,
+     * but WITHOUT attaching a {@code file_search} tool. Deliberately a separate method rather than
+     * a new overload of {@code chatWithFileSearch}: reusing that method here would misleadingly
+     * imply File Search participation for a caller (e.g. /TeachZevra's Teaching contract, PRO-XX)
+     * that has no vector store and needs no document retrieval at all.
+     *
+     * <p>This is a permitted, deliberate exception to the general "no new strict-schema Responses
+     * calls beyond Stage 1" rule for this engagement — reserved specifically for new, small,
+     * fully-deterministic contracts (like the Teaching Proposal contract) that benefit from an
+     * API-enforced exact shape rather than prose-only JSON instructions.
+     *
+     * @param jsonSchemaName a short identifier for the schema (Responses API requires a {@code
+     *                       name} alongside {@code schema}) — purely diagnostic, not user-facing.
+     * @param jsonSchema     a JSON Schema object (nested {@code Map}/{@code List}/primitive values)
+     *                       describing the exact required response shape. Must be valid strict-mode
+     *                       JSON Schema (every property required, {@code additionalProperties:false}
+     *                       at every object level) or OpenAI rejects the request.
+     */
+    public String respondWithStrictJson(List<ChatMessage> messages, String systemPrompt,
+                                         String jsonSchemaName, Map<String, Object> jsonSchema) {
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, null);
+    }
+
+    /**
+     * Phase 1 explicit prompt caching equivalent of {@link #respondWithStrictJson} for {@link
+     * com.sei.nexus.response.NaturalLanguageComposer}'s STRICT_JSON mode — identical request
+     * shape, additionally attaching {@code prompt_cache_key="zevra:answer-composer:v1"}.
+     * Additive: the 4-arg {@link #respondWithStrictJson} (used by {@code TeachingService} and any
+     * other existing caller) is unchanged.
+     */
+    public String respondWithStrictJsonForComposer(List<ChatMessage> messages, String systemPrompt,
+                                                    String jsonSchemaName, Map<String, Object> jsonSchema) {
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema, CACHE_KEY_ANSWER_COMPOSER);
+    }
+
+    /**
+     * Same as the 4-arg {@link #respondWithStrictJson}, additionally attaching an explicit
+     * Responses API {@code prompt_cache_key} (Phase 1 explicit prompt caching) when {@code
+     * promptCacheKey} is non-null/non-blank — added as the LAST top-level request field, after the
+     * existing stable {@code instructions} / dynamic {@code input} / schema construction below is
+     * unchanged and complete. Purely a cache-routing hint; never part of the rendered
+     * instructions/input content, so it cannot cause one caller's dynamic content to be served to
+     * another. {@code null} reproduces the exact prior behavior.
+     */
+    private String respondWithStrictJson(List<ChatMessage> messages, String systemPrompt,
+                                          String jsonSchemaName, Map<String, Object> jsonSchema,
+                                          String promptCacheKey) {
+        String url = BASE_URL + "/responses";
+
+        StringBuilder inputBuilder = new StringBuilder();
+        for (ChatMessage msg : messages) {
+            if (inputBuilder.length() > 0) inputBuilder.append("\n\n");
+            inputBuilder.append(msg.content() != null ? msg.content() : "");
+        }
+        String inputText = inputBuilder.toString() + "\n\n(Respond in JSON as instructed.)";
+
+        Map<String, Object> textFormat = new HashMap<>();
+        textFormat.put("type", "json_schema");
+        textFormat.put("name", jsonSchemaName);
+        textFormat.put("strict", true);
+        textFormat.put("schema", jsonSchema);
+        Map<String, Object> text = new HashMap<>();
+        text.put("format", textFormat);
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", chatModel);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            requestBody.put("instructions", systemPrompt);
+        }
+        requestBody.put("input", inputText);
+        requestBody.put("temperature", 0.2);
+        requestBody.put("max_output_tokens", 4096);
+        requestBody.put("text", text);
+        if (promptCacheKey != null && !promptCacheKey.isBlank()) {
+            requestBody.put("prompt_cache_key", promptCacheKey);
+        }
+
+        long startNanos = System.nanoTime();
+        String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            int requestChars = systemPrompt != null ? systemPrompt.length() : 0;
+            for (ChatMessage msg : messages) {
+                requestChars += msg.content() != null ? msg.content().length() : 0;
+            }
+            recordResponsesUsage(root, chatModel, latencyMs, requestChars);
+            return extractResponseText(responseBody);
+        } catch (NexusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse responses output: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Builds and sends one Responses API request, sharing {@link #executeWithRetry} with every
+     * other call on this client (identical retry/backoff/rate-limit/timeout behavior to {@link
+     * #doChat}). {@code messages} are flattened into the Responses API's plain-string {@code
+     * input} field (double-newline-joined) — every current caller of {@link #respond}/{@link
+     * #respondWithJson} passes exactly one message, so this is a lossless equivalent of what
+     * {@link #doChat} already sends as a single-turn {@code messages} array.
+     */
+    private String doRespond(List<ChatMessage> messages, String systemPrompt, boolean jsonMode, String model) {
+        return doRespond(messages, systemPrompt, jsonMode, model, null);
+    }
+
+    /**
+     * Same as the 4-arg {@link #doRespond}, additionally attaching an explicit Responses API
+     * {@code prompt_cache_key} (Phase 1 explicit prompt caching) when {@code promptCacheKey} is
+     * non-null/non-blank. Added as the LAST top-level request field, after the existing stable
+     * {@code instructions} / dynamic {@code input} construction below is unchanged and complete —
+     * this is purely a cache-routing hint for OpenAI's backend, never part of the rendered
+     * instructions/input content itself, so it cannot cause one caller's dynamic content to be
+     * served to another. {@code null} (the 4-arg overload) reproduces the exact prior behavior.
+     */
+    private String doRespond(List<ChatMessage> messages, String systemPrompt, boolean jsonMode, String model,
+                              String promptCacheKey) {
+        String url = BASE_URL + "/responses";
+
+        StringBuilder inputBuilder = new StringBuilder();
+        for (ChatMessage msg : messages) {
+            if (inputBuilder.length() > 0) inputBuilder.append("\n\n");
+            inputBuilder.append(msg.content() != null ? msg.content() : "");
+        }
+        String inputText = inputBuilder.toString();
+        if (jsonMode) {
+            // Same OpenAI API-compliance formality already documented and relied on by
+            // #chatWithFileSearch: text.format=json_object requires the literal word "json" to
+            // appear in `input` itself, not only in `instructions`. Never shown to or written by
+            // the user; does not change the question's meaning.
+            inputText = inputText + "\n\n(Respond in JSON as instructed.)";
+        }
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", model);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            requestBody.put("instructions", systemPrompt);
+        }
+        requestBody.put("input", inputText);
+        requestBody.put("temperature", 0.2);
+        requestBody.put("max_output_tokens", 4096);
+        if (jsonMode) {
+            Map<String, Object> textFormat = new HashMap<>();
+            textFormat.put("type", "json_object");
+            Map<String, Object> text = new HashMap<>();
+            text.put("format", textFormat);
+            requestBody.put("text", text);
+        }
+        if (promptCacheKey != null && !promptCacheKey.isBlank()) {
+            requestBody.put("prompt_cache_key", promptCacheKey);
+        }
+
+        long startNanos = System.nanoTime();
+        String responseBody = executeWithRetry(url, requestBody);
+        long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            int requestChars = systemPrompt != null ? systemPrompt.length() : 0;
+            for (ChatMessage msg : messages) {
+                requestChars += msg.content() != null ? msg.content().length() : 0;
+            }
+            recordResponsesUsage(root, model, latencyMs, requestChars);
+            return extractResponseText(responseBody);
+        } catch (NexusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse responses output: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Usage/cost observability for {@link #doRespond} — the same {@code LLM_METRIC} line shape
+     * {@link #recordUsage} already produces for Chat Completions calls, reading the Responses
+     * API's own usage field names ({@code input_tokens}/{@code output_tokens}/{@code
+     * input_tokens_details.cached_tokens}) instead of Chat Completions' ({@code prompt_tokens}/
+     * {@code completion_tokens}) — mirrors the identical, already-proven read {@link
+     * #recordFileSearchUsage} performs for Stage 1's Responses calls. Deliberately NOT a shared
+     * refactor of either existing method: this is the smallest additive change, and leaves
+     * Stage 1's own usage recording completely untouched.
+     */
+    private void recordResponsesUsage(JsonNode root, String model, long latencyMs, int requestChars) {
+        try {
+            JsonNode usage = root.path("usage");
+            if (!usage.isMissingNode()) {
+                int inputTokens  = usage.path("input_tokens").asInt(0);
+                int outputTokens = usage.path("output_tokens").asInt(0);
+                int cachedTokens = usage.path("input_tokens_details").path("cached_tokens").asInt(0);
+                String callType  = LlmCallTag.get();
+                usageService.record(model, inputTokens, outputTokens, cachedTokens, callType);
+                log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
+                                + "cachedTokens={} requestChars={} operationId={}",
+                        callType, model, latencyMs, inputTokens, outputTokens, cachedTokens, requestChars,
+                        OperationCorrelationId.get());
+            }
+        } catch (Exception ignored) {
+            // Usage tracking/metrics logging is measurement-only — never break the main flow
+        } finally {
+            LlmCallTag.clear();
+        }
+    }
+
+    /**
      * Sends a chat completion request and returns the assistant's text response.
      */
     public String chat(List<ChatMessage> messages, String systemPrompt) {
         return doChat(messages, systemPrompt, false, chatModel);
+    }
+
+    /**
+     * Model-tiering equivalent of {@link #chat} for {@code TermExtractor} — identical request
+     * shape (free-text output, the caller extracts its own JSON array), using {@code
+     * nexus.openai.term-extractor-model} (defaults to {@code gpt-4o-mini}) instead of {@link
+     * #chatModel}. Additive: {@link #chat} is unchanged for every other existing caller.
+     */
+    public String chatForTermExtraction(List<ChatMessage> messages, String systemPrompt) {
+        return doChat(messages, systemPrompt, false, termExtractorModel);
+    }
+
+    /**
+     * Model-tiering equivalent of {@link #chat} for {@code CorrectionDetector} — identical
+     * request shape, using {@code nexus.openai.correction-detector-model}. Currently defaults to
+     * {@code gpt-4o}: a live evaluation found {@code gpt-4o-mini} unsuitable for this call (it
+     * misclassified plain new-dimension follow-ups as corrections) — the property exists so this
+     * can be retuned independently later. Additive: {@link #chat} is unchanged for every other
+     * existing caller.
+     */
+    public String chatForCorrectionDetection(List<ChatMessage> messages, String systemPrompt) {
+        return doChat(messages, systemPrompt, false, correctionDetectorModel);
     }
 
     /**
@@ -679,6 +1048,19 @@ public class AzureOpenAiClient {
      */
     public String chatWithJsonFast(List<ChatMessage> messages, String systemPrompt) {
         return doChat(messages, systemPrompt, true, routingModel);
+    }
+
+    /**
+     * Model-tiering equivalent of {@link #chatWithJson} for the onboarding/Discover analysis
+     * family — {@code OnboardingService.recommendTables}, {@code
+     * BusinessObjectBatchAnalyzer.analyzeBatch} (shared by Onboarding's batch analysis and
+     * {@code EnterpriseMapService.analyzeForOnboarding}), and {@code
+     * EnterpriseMapService.simulate}. Identical request shape (JSON object mode), using {@code
+     * nexus.openai.onboarding-model} (defaults to {@code gpt-4o-mini}) instead of {@link
+     * #chatModel}. Additive: {@link #chatWithJson} is unchanged for every other existing caller.
+     */
+    public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+        return doChat(messages, systemPrompt, true, onboardingModel);
     }
 
     /**
@@ -848,12 +1230,13 @@ public class AzureOpenAiClient {
      */
     private void recordUsage(JsonNode root, String model, long latencyMs, int requestChars) {
         JsonNode usage = root.path("usage");
+        String callType = LlmCallTag.get(); // captured before any recordUsage()-triggered clear() below
         try {
             if (!usage.isMissingNode()) {
                 int prompt       = usage.path("prompt_tokens").asInt(0);
                 int completion   = usage.path("completion_tokens").asInt(0);
                 int cachedTokens = usage.path("prompt_tokens_details").path("cached_tokens").asInt(0);
-                usageService.record(model, prompt, completion, cachedTokens);
+                usageService.record(model, prompt, completion, cachedTokens, callType);
             }
         } catch (Exception ignored) {
             // Usage tracking is non-fatal — never break the main flow
@@ -864,7 +1247,7 @@ public class AzureOpenAiClient {
             int cachedTokens   = usage.path("prompt_tokens_details").path("cached_tokens").asInt(0);
             log.info("LLM_METRIC callType={} model={} latencyMs={} promptTokens={} completionTokens={} "
                             + "cachedTokens={} requestChars={} operationId={}",
-                    LlmCallTag.get(), model, latencyMs, prompt, completion, cachedTokens, requestChars,
+                    callType, model, latencyMs, prompt, completion, cachedTokens, requestChars,
                     OperationCorrelationId.get());
         } catch (Exception ignored) {
             // Metrics logging is measurement-only — never break the main flow

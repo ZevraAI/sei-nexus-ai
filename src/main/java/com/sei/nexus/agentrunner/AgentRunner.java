@@ -160,6 +160,9 @@ public class AgentRunner {
                 // Prune history to keep only the user message + last 2 tool-call pairs.
                 // Without pruning the prompt grows with every iteration: by step 4 the LLM
                 // re-reads all previous queries and results, doubling token cost each time.
+                // Telemetry hardening (Phase 0): this loop had no LlmCallTag — every ReAct
+                // iteration persisted as UNTAGGED/NULL call_type.
+                com.sei.nexus.ai.LlmCallTag.set("AGENT_RUNNER");
                 AgentToolResponse response =
                         openAi.chatWithTools(pruneHistory(messages, HISTORY_KEEP_PAIRS),
                                 systemPrompt, tools);
@@ -297,8 +300,8 @@ public class AgentRunner {
         if (relatedFacts instanceof List<?> l && !l.isEmpty()) semantics.put("related_facts", relatedFacts);
         Object recommendation = response.args().get("recommendation");
         if (recommendation instanceof String s && !s.isBlank()) semantics.put("recommendation", s);
-        Object nextSteps = response.args().get("next_steps");
-        if (nextSteps instanceof List<?> l && !l.isEmpty()) semantics.put("next_steps", nextSteps);
+        Object followUpQuestions = response.args().get("follow_up_questions");
+        if (followUpQuestions instanceof List<?> l && !l.isEmpty()) semantics.put("follow_up_questions", followUpQuestions);
         return semantics;
     }
 
@@ -319,6 +322,9 @@ public class AgentRunner {
                     "Give your best final answer now using only the information already gathered, " +
                     "and state clearly anything you could not verify."));
 
+            // Telemetry hardening (Phase 0): distinct tag from the main loop's "AGENT_RUNNER" so
+            // the forced-salvage path (iteration budget exhausted) is separately measurable.
+            com.sei.nexus.ai.LlmCallTag.set("AGENT_RUNNER_SALVAGE");
             AgentToolResponse response =
                     openAi.chatWithTools(salvageMessages, systemPrompt, tools);
             String answer = extractFinalAnswer(response);

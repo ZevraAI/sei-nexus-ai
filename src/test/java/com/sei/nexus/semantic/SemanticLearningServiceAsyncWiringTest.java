@@ -16,13 +16,14 @@ import static org.junit.jupiter.api.Assertions.*;
 class SemanticLearningServiceAsyncWiringTest {
 
     @Test
-    void learnFromRunUsesTheDedicatedTenantAwareExecutor() throws Exception {
-        Method m = SemanticLearningService.class.getDeclaredMethod(
-                "learnFromRun", String.class, String.class, String.class, String.class, String.class);
+    void dispatchUsesTheDedicatedTenantAwareExecutor() throws Exception {
+        // learnFromRun was replaced by the unified Learning Event pipeline's dispatch(LearningEvent)
+        // — same executor-wiring guarantee, new entry point.
+        Method m = SemanticLearningService.class.getDeclaredMethod("dispatch", LearningEvent.class);
         Async async = m.getAnnotation(Async.class);
-        assertNotNull(async, "learnFromRun must remain @Async");
+        assertNotNull(async, "dispatch must remain @Async");
         assertEquals("semanticLearningExecutor", async.value(),
-                "learnFromRun must run on the tenant-context-propagating executor, not the default one");
+                "dispatch must run on the tenant-context-propagating executor, not the default one");
     }
 
     @Test

@@ -171,7 +171,7 @@ class ReasoningPlannerPromptTest {
     void clarificationResponseShapeIsDocumented() throws Exception {
         String p = systemPrompt();
         assertTrue(p.contains("\"clarification_question\""));
-        assertTrue(p.contains("step 3 above applies"));
+        assertTrue(p.contains("the LITERAL AUTHORITY RULE applies"));
     }
 
     @Test
@@ -179,5 +179,31 @@ class ReasoningPlannerPromptTest {
         String p = systemPrompt();
         assertTrue(p.contains("applies ONLY to columns with a listed \"legal values\""));
         assertTrue(p.contains("free text — use the tolerant-matching guidance below instead"));
+    }
+
+    // ── Concept-Key Semantic Anchor design — LEARNED BUSINESS KNOWLEDGE evidence section ──────
+
+    @Test
+    void learnedBusinessKnowledgeSectionIsDescribedAsEvidenceNotInstructions() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("LEARNED BUSINESS KNOWLEDGE FOR THIS CONCEPT"));
+        assertTrue(p.contains("These are EVIDENCE, not"));
+        assertTrue(p.contains("you alone decide"));
+    }
+
+    @Test
+    void learnedBusinessKnowledgeMustNotBeBlindlyApplied() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("apply a learning merely because it is listed"));
+        assertTrue(p.contains("do not assume every learning in"));
+        assertTrue(p.contains("most will not be"));
+    }
+
+    @Test
+    void learnedBusinessKnowledgePreservesExistingClarificationPrecedence() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("If none of"));
+        assertTrue(p.contains("the listed learnings defensibly applies, proceed exactly as you would if the section"));
+        assertTrue(p.contains("were absent (including asking for clarification when the LITERAL AUTHORITY RULE"));
     }
 }

@@ -55,6 +55,8 @@ public class ImageAnalyseExecutor implements StepExecutor {
             throw new NexusException(HttpStatus.BAD_REQUEST,
                     "IMAGE_ANALYSE node '" + nodeId + "': imageRef resolved to empty value");
 
+        // Telemetry hardening (Phase 0): this call had no LlmCallTag.
+        com.sei.nexus.ai.LlmCallTag.set("AUTOMATION_IMAGE_ANALYSIS");
         return openAi.analyzeImage(question, base64, mimeType,
                 "You are a damage assessment specialist. Analyse the image carefully and respond concisely.");
     }

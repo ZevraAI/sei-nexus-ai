@@ -1,6 +1,9 @@
 package com.sei.nexus.semantic;
 
 import com.sei.nexus.common.Keys;
+import com.sei.nexus.reasoning.ReasoningRepository;
+import com.sei.nexus.reasoning.ReasoningSession;
+import com.sei.nexus.reasoning.ReasoningStep;
 import com.sei.nexus.run.NexusRun;
 import com.sei.nexus.run.RunRepository;
 import com.sei.nexus.tenant.TenantContext;
@@ -13,9 +16,11 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 /**
  * Orchestrates all three semantic learning signals:
@@ -57,6 +62,12 @@ public class SemanticLearningService {
     private final RunRepository            runRepository;
     private final TenantRepository         tenantRepository;
     private final SemanticService          semanticService;   // for promotion to vocabulary
+    private final ReasoningRepository      reasoningRepository;
+
+    // Package-private test seam: lets tests observe every LearningEvent this service processes
+    // (see LearningEvent) without needing a real DB/TermExtractor. Production default is a no-op;
+    // tests override via setLearningEventObserver(...). Hand-rolled fake convention — no Mockito.
+    private Consumer<LearningEvent> learningEventObserver = e -> { };
 
     public SemanticLearningService(TermExtractor termExtractor,
                                    CorrectionDetector correctionDetector,
@@ -64,7 +75,8 @@ public class SemanticLearningService {
                                    CorrectionRepository correctionRepository,
                                    RunRepository runRepository,
                                    TenantRepository tenantRepository,
-                                   SemanticService semanticService) {
+                                   SemanticService semanticService,
+                                   ReasoningRepository reasoningRepository) {
         this.termExtractor        = termExtractor;
         this.correctionDetector   = correctionDetector;
         this.mappingRepository    = mappingRepository;
@@ -72,55 +84,176 @@ public class SemanticLearningService {
         this.runRepository        = runRepository;
         this.tenantRepository     = tenantRepository;
         this.semanticService      = semanticService;
+        this.reasoningRepository  = reasoningRepository;
     }
 
-    // ── Signal 1: query success ───────────────────────────────────────────────
+    /** Package-private test seam — see {@link #learningEventObserver}. */
+    void setLearningEventObserver(Consumer<LearningEvent> observer) {
+        this.learningEventObserver = observer != null ? observer : e -> { };
+    }
+
+    // ── Concept-Key Semantic Anchor design: deterministic evidence lookup ──────
 
     /**
-     * Called @Async after every successful QUERY_LIVE_DATA run.
+     * Concept-scoped learned-knowledge evidence for Agent Brain: promoted mappings whose
+     * concept_key exactly matches one of the given, already-resolved concept keys (see {@code
+     * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveConceptKeys} / {@code
+     * ResolvedBusinessModel.resolvedConceptKeys()}). A thin, deterministic delegation to {@link
+     * LearnedMappingRepository#findPromotedByConceptKeys} — exposed here rather than adding a new
+     * {@code ChatService} constructor dependency, since {@code ChatService} already holds this
+     * service. Exact concept_key equality only; no ranking, scoring, or selection among results —
+     * the caller must render every returned mapping as evidence, never choose one itself.
+     */
+    public List<LearnedMapping> findPromotedByConceptKeys(List<String> conceptKeys) {
+        return mappingRepository.findPromotedByConceptKeys(conceptKeys);
+    }
+
+    // ── Unified Learning Event pipeline ───────────────────────────────────────
+    //
+    // Replaces the old "every successful query with rows → learnFromRun()" trigger.
+    // Exactly two implicit triggers now feed learning (see LearningEvent):
+    //   1. CLARIFICATION_RESOLUTION — the current run succeeded AND the immediately-prior
+    //      run in this conversation ended in a clarification request (see
+    //      #isImmediatelyPriorRunAClarification).
+    //   2. SEMANTIC_CORRECTION — CorrectionDetector judged this question a correction of the
+    //      prior answer (unchanged mechanism, now also funneled through dispatch() below).
+    // A plain successful query that is neither of these performs NO learning call at all —
+    // not even a no-op TermExtractor invocation.
+
+    /**
+     * Deterministic, persisted-state check for "did the immediately-prior run in this
+     * conversation end in a clarification request?" Never infers from question text.
      *
-     * @param runKey         The run that just completed.
-     * @param question       The user's raw question (no attachment content).
-     * @param executedSql    The best SQL step that ran successfully.
-     * @param domainKey      Agent's domain key (may be null).
-     * @param conversationId Used for correction detection against the prior turn.
+     * <p>Checks two independent, already-persisted signals, either of which counts:
+     * <ol>
+     *   <li>Planner-level: the prior run's reasoning session's LAST step has
+     *       {@code evaluatorDecision == "CLARIFICATION_NEEDED"} (see
+     *       {@code ReasoningEngine#reason} — the {@code break;} after this step guarantees
+     *       it is the session's last step whenever it fires).</li>
+     *   <li>Stage-1/Decision-Router-level: the prior run's own {@code decision_type ==
+     *       "ASK_CLARIFICATION"} (see {@code ChatService}'s concept-ambiguity short-circuit
+     *       and legacy Decision Router {@code ASK_CLARIFICATION} case, both of which persist
+     *       this literal decision_type on {@code nexus_run}).</li>
+     * </ol>
+     * Documented scope decision: both signals are treated as equivalent "prior turn asked for
+     * clarification" evidence — this is a superset of the Planner-level-only interpretation the
+     * investigation started from, added because the Stage-1 signal is equally deterministic and
+     * persisted (not text-inferred), not because it needed to be inferred or guessed.
+     */
+    public boolean isImmediatelyPriorRunAClarification(String conversationId, String currentRunKey) {
+        if (conversationId == null || conversationId.isBlank()) return false;
+        try {
+            List<NexusRun> history = runRepository.findConversationRuns(conversationId, 3);
+            NexusRun prior = null;
+            for (int i = history.size() - 1; i >= 0; i--) {
+                NexusRun r = history.get(i);
+                if (!r.runKey().equals(currentRunKey)) {
+                    prior = r;
+                    break;
+                }
+            }
+            if (prior == null) return false;
+
+            if ("ASK_CLARIFICATION".equals(prior.decisionType())) {
+                return true;
+            }
+
+            Optional<ReasoningSession> session = reasoningRepository.findSessionByRunKey(prior.runKey());
+            if (session.isEmpty()) return false;
+            List<ReasoningStep> steps = reasoningRepository.findStepsBySession(session.get().sessionKey());
+            if (steps.isEmpty()) return false;
+            ReasoningStep lastStep = steps.stream()
+                    .max(Comparator.comparingInt(ReasoningStep::stepNo))
+                    .orElse(null);
+            return lastStep != null && "CLARIFICATION_NEEDED".equals(lastStep.evaluatorDecision());
+        } catch (Exception e) {
+            log.debug("Clarification-signal lookup failed for conversation {}: {}", conversationId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Deterministic concept-identity collapse rule for {@link LearnedMapping#conceptKey()}:
+     * exactly one resolved concept key → persist it; zero, or more than one (no arbitrary
+     * pick, no LLM disambiguation) → persist {@code null}. Java never chooses among multiple
+     * resolved concepts on semantic grounds.
+     */
+    static String singleConceptKeyOrNull(List<String> resolvedConceptKeys) {
+        if (resolvedConceptKeys == null || resolvedConceptKeys.isEmpty()) return null;
+        List<String> distinct = resolvedConceptKeys.stream()
+                .filter(k -> k != null && !k.isBlank())
+                .distinct()
+                .toList();
+        return distinct.size() == 1 ? distinct.get(0) : null;
+    }
+
+    /**
+     * Single dispatch point for every Learning Event (implicit and explicit). This is the ONLY
+     * place {@link TermExtractor} is invoked for implicit learning, and it is invoked ONLY for
+     * {@link LearningEvent.Source#CLARIFICATION_RESOLUTION} — never for a plain successful query,
+     * and never for {@link LearningEvent.Source#SEMANTIC_CORRECTION} (that signal is already fully
+     * handled by {@link #detectAndSaveCorrection} before this is called; routing it through here
+     * too is purely for uniform observability). {@link LearningEvent.Source#EXPLICIT_TEACHING}
+     * (Part B) is persisted directly by the Teaching flow — which already holds a fully-formed,
+     * user-confirmed mapping and has no SQL to extract terms from — so it is not re-processed here;
+     * this call exists so it too passes through the same observable pipeline.
      */
     @Async("semanticLearningExecutor")
-    public void learnFromRun(String runKey, String question, String executedSql,
-                              String domainKey, String conversationId) {
-        if (question == null || question.isBlank() || executedSql == null || executedSql.isBlank()) {
+    public void dispatch(LearningEvent event) {
+        if (event == null) return;
+        try {
+            learningEventObserver.accept(event);
+            if (event.source() == LearningEvent.Source.CLARIFICATION_RESOLUTION) {
+                processClarificationResolution(event);
+            }
+        } catch (Exception e) {
+            log.warn("SemanticLearningService.dispatch failed for run {}: {}",
+                    event.runKey(), e.getMessage());
+        }
+    }
+
+    private void processClarificationResolution(LearningEvent event) {
+        if (event.questionOrAnswerText() == null || event.questionOrAnswerText().isBlank()
+                || event.sql() == null || event.sql().isBlank()) {
             return;
         }
-        // Cost baseline instrumentation (measurement-only): this method runs @Async on a
-        // dedicated executor thread, distinct from the request thread ChatService.ask() already
-        // tagged — re-set here so TermExtractor's/CorrectionDetector's LLM_METRIC lines still
-        // group back to the chat question that triggered this learning run.
-        com.sei.nexus.ai.OperationCorrelationId.set("CHAT:" + runKey);
+        com.sei.nexus.ai.OperationCorrelationId.set("CHAT:" + event.runKey());
         try {
-            // 1a. Extract business terms from this run
-            List<TermExtractor.ExtractedTerm> terms = termExtractor.extract(question, executedSql);
+            String conceptKey = singleConceptKeyOrNull(event.resolvedConceptKeys());
+            List<TermExtractor.ExtractedTerm> terms =
+                    termExtractor.extract(event.questionOrAnswerText(), event.sql());
             for (TermExtractor.ExtractedTerm t : terms) {
                 try {
                     LearnedMapping mapping = new LearnedMapping(
-                            null, domainKey, t.term(), t.sql(),
-                            runKey, "QUERY_SUCCESS", 0.5, 1,
-                            Instant.now(), false, null, null, null);
+                            null, event.domainKey(), t.term(), t.sql(),
+                            event.runKey(), event.source().name(), 0.5, 1,
+                            Instant.now(), false, null, null, conceptKey);
                     LearnedMapping saved = mappingRepository.upsert(mapping);
-                    log.debug("Learned mapping upserted: '{}' → '{}' (key: {})",
+                    log.debug("Learned mapping upserted (clarification resolution): '{}' → '{}' (key: {})",
                             t.term(), truncate(t.sql(), 60), saved.mappingKey());
                 } catch (Exception e) {
                     log.debug("Failed to save learned mapping '{}': {}", t.term(), e.getMessage());
                 }
             }
-
-            // 1b. Check if this question corrects the immediately prior answer
-            if (conversationId != null && !conversationId.isBlank()) {
-                detectAndSaveCorrection(runKey, question, conversationId, domainKey);
-            }
-        } catch (Exception e) {
-            log.warn("SemanticLearningService.learnFromRun failed for run {}: {}", runKey, e.getMessage());
         } finally {
             com.sei.nexus.ai.OperationCorrelationId.clear();
+        }
+    }
+
+    /**
+     * Runs the existing correction-detection mechanism (unchanged) against the prior conversation
+     * turn and, when a correction is detected, additionally dispatches a
+     * {@link LearningEvent.Source#SEMANTIC_CORRECTION} Learning Event so this trigger, too, is
+     * observable through the unified pipeline. Public (not @Async) — called synchronously from
+     * ChatService's post-answer learning block, same as before this refactor.
+     */
+    public void detectAndSaveCorrectionForRun(String runKey, String currentQuestion,
+                                               String conversationId, String domainKey,
+                                               List<String> resolvedConceptKeys) {
+        boolean corrected = detectAndSaveCorrection(runKey, currentQuestion, conversationId, domainKey);
+        if (corrected) {
+            dispatch(new LearningEvent(LearningEvent.Source.SEMANTIC_CORRECTION,
+                    currentQuestion, null, domainKey, resolvedConceptKeys, runKey, conversationId));
         }
     }
 
@@ -165,11 +298,13 @@ public class SemanticLearningService {
 
     // ── Signal 2: user correction ─────────────────────────────────────────────
 
-    private void detectAndSaveCorrection(String correctionRunKey, String currentQuestion,
-                                          String conversationId, String domainKey) {
+    /** @return true iff a correction was detected and saved (used to gate the SEMANTIC_CORRECTION
+     *  Learning Event dispatch in {@link #detectAndSaveCorrectionForRun}). */
+    private boolean detectAndSaveCorrection(String correctionRunKey, String currentQuestion,
+                                             String conversationId, String domainKey) {
         try {
             List<NexusRun> history = runRepository.findConversationRuns(conversationId, 3);
-            if (history.size() < 2) return;
+            if (history.size() < 2) return false;
 
             // Most recent run is the current one; check the one before it
             NexusRun prior = null;
@@ -179,12 +314,12 @@ public class SemanticLearningService {
                     break;
                 }
             }
-            if (prior == null) return;
+            if (prior == null) return false;
 
             Optional<CorrectionDetector.DetectedCorrection> detected =
                     correctionDetector.detect(currentQuestion, prior.question(), prior.answer());
 
-            if (detected.isEmpty()) return;
+            if (detected.isEmpty()) return false;
 
             CorrectionDetector.DetectedCorrection dc = detected.get();
             Correction correction = new Correction(
@@ -205,8 +340,10 @@ public class SemanticLearningService {
             }
             log.info("Correction recorded ({}) for conversation '{}'",
                     dc.correctionType(), conversationId);
+            return true;
         } catch (Exception e) {
             log.debug("Correction detection failed: {}", e.getMessage());
+            return false;
         }
     }
 

@@ -34,9 +34,10 @@ public record ResponseArtifacts(
         // when the answer never made a recommendation.
         String recommendation,
 
-        // Actionable follow-up prompts the platform already computed for this decision type
-        // (e.g. "Show exceptions only") — never fabricated per-answer, just carried through.
-        List<Recommendation> nextSteps,
+        // Possible questions the user may naturally ask next, based on the current investigation
+        // — the model's own semantic decision (see StructuredAnswer's followUpQuestions javadoc),
+        // never fabricated per-answer, just carried through.
+        List<Recommendation> followUpQuestions,
 
         // The model's own UI-content plan (see StructuredAnswer.Section javadoc), resolved: each
         // DATASET-type entry carries the actual rows of the investigation dataset the model
@@ -52,8 +53,12 @@ public record ResponseArtifacts(
         // hint that the frontend doesn't have to reverse-engineer chart type from raw rows.
         List<Evidence> evidence,
 
-        // Generic, real-data metric tiles — every figure here is literally present in the
-        // dataset; nothing inferred about what the columns mean.
+        // Headline metric tiles. Preferred source: the model's own whole-answer figures (see
+        // ChatService.DATA_ANSWER_JSON_SYSTEM_PROMPT's METRICS rules) — relayed verbatim, Java
+        // performs no interpretation of what they mean or how they're formatted. Fallback tier
+        // (only when the model supplied none): a mechanical, meaning-blind computation directly
+        // from the dataset (result count, a numeric column's total, a categorical column's
+        // distinct-value count) — see ResponseArtifactsBuilder#metrics.
         List<Metric> metrics,
 
         // The investigation/execution trail, normalized across the conversational reasoning
@@ -86,22 +91,63 @@ public record ResponseArtifacts(
      * dropped ENTIRELY (narrative content included) before reaching this record — see {@code
      * ChatService#resolveSections} — it never appears here partially resolved or with a
      * substituted dataset.
+     *
+     * <p>{@code reasoning} is relayed verbatim from {@code StructuredAnswer.Section} — meaningful
+     * only for {@code type=FOLLOW_UP_QUESTIONS} (the model's own reasoning for THIS section's
+     * {@code items}, structurally attached to the same section object rather than an independent
+     * top-level field); null for every other section type. Java performs no validation of it.
      */
     public record Section(String type, String title, String purpose, Boolean display,
-                           List<String> items, String content, List<ResolvedDataset> datasets) {
+                           List<String> items, String content, String reasoning,
+                           List<ResolvedDataset> datasets) {
 
-        /** One dataset a section is grounded in, preserved under its own step identity — never
-         *  merged with another dataset even when a section references more than one. */
-        public record ResolvedDataset(int stepNo, List<Map<String, Object>> rows) {}
+        /**
+         * One dataset a section is grounded in, preserved under its own step identity — never
+         * merged with another dataset even when a section references more than one.
+         *
+         * <p>{@code rows} carries the FULL row payload only for a {@code type=DATASET} section —
+         * the one case the UI actually renders a table from it. For every other section type
+         * (e.g. {@code HIGHLIGHT}/{@code TEXT}, which cite a dataset only for traceability, never
+         * to display its rows), {@code rows} is intentionally empty and {@code rowCount} alone
+         * carries the size — the frontend never reads {@code .datasets[].rows} off a non-DATASET
+         * section (it only shows a "step-N · N rows" trace tag), so duplicating the full row
+         * payload there is pure unused bloat. See {@code ChatService#resolveSections}.
+         */
+        public record ResolvedDataset(int stepNo, List<Map<String, Object>> rows, int rowCount) {}
     }
 
     /**
      * A piece of evidence backing the answer. {@code kind} is one of DATASET | CHART | METRIC.
-     * {@code chartType}/{@code xKey}/{@code yKeys} are populated only for kind=CHART, mirroring
-     * the same chart-shape decision (stats / area / bar) the platform already makes.
+     * {@code chartType}/{@code xKey}/{@code yKeys} are populated only for kind=CHART — either
+     * the legacy Java-side shape inference (stats/area/bar over the single legacy {@code
+     * queryData}), or, preferred when present and valid, an LLM-declared per-step hint (see
+     * {@code ReasoningPlanner.StepPlan}) relayed verbatim, gated only by a mechanical existence
+     * check of the referenced column(s) against that step's own rows — never a semantic
+     * decision. {@code stepNo} identifies which investigation dataset a DATASET/CHART entry
+     * belongs to (null for the legacy single-dataset path, which has no per-step identity) —
+     * lets the frontend pair each dataset's own chart hint with that same dataset, rather than
+     * applying one global hint to every chart card.
+     */
+    /**
+     * @param xLabel Optional purely presentational, LLM-authored label for {@code xKey} (see
+     *               {@code ReasoningPlanner.SYSTEM_PROMPT}'s OPTIONAL HUMAN-READABLE LABELS
+     *               guidance), relayed verbatim — null when the model didn't declare one, in
+     *               which case the frontend falls back to its own mechanical casing transform of
+     *               the raw key (unchanged fallback behavior).
+     * @param yLabels Optional LLM-authored labels parallel to {@code yKeys} (same length and
+     *                order) — empty unless the model declared the full set; never a partial/
+     *                misaligned list.
      */
     public record Evidence(String kind, String label, String chartType, String xKey,
-                            List<String> yKeys, int rowCount) {}
+                            List<String> yKeys, int rowCount, Integer stepNo,
+                            String xLabel, List<String> yLabels) {
+        /** Pre-label shape — every call site from before the OPTIONAL HUMAN-READABLE LABELS
+         *  guidance existed. Labels default to null/empty — behavior otherwise unchanged. */
+        public Evidence(String kind, String label, String chartType, String xKey,
+                        List<String> yKeys, int rowCount, Integer stepNo) {
+            this(kind, label, chartType, xKey, yKeys, rowCount, stepNo, null, List.of());
+        }
+    }
 
     /** A single real figure drawn directly from returned data — label plus its literal value. */
     public record Metric(String label, String value) {}

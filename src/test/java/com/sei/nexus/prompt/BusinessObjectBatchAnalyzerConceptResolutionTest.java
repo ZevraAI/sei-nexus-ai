@@ -82,6 +82,12 @@ class BusinessObjectBatchAnalyzerConceptResolutionTest {
             lastSystemPrompt = systemPrompt;
             return scriptedResponse;
         }
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            return chatWithJson(messages, systemPrompt);
+        }
     }
 
     private static PackEntity concept(String conceptKey, String name, List<String> aliases, String description) {

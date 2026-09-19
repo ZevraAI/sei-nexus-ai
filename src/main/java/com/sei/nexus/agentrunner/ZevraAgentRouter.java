@@ -113,6 +113,11 @@ public class ZevraAgentRouter {
 
             String userPrompt = "User message: " + userMessage + "\n\nAvailable agents:\n" + agentList;
 
+            // Telemetry hardening (Phase 0): this call had no LlmCallTag. Tagged distinctly from
+            // ChatService.resolveAgent's own "AGENT_ROUTER" since this is a separate call site
+            // (a distinct class/implementation) — not merged into that tag, to keep the two
+            // routing code paths separately measurable.
+            com.sei.nexus.ai.LlmCallTag.set("ZEVRA_AGENT_ROUTER");
             String raw = openAi.chatWithJsonFast(
                     List.of(ChatMessage.user(userPrompt)), systemPrompt);
 

@@ -323,4 +323,83 @@ class ChatServiceHardeningTest {
                 || Integer.valueOf(4).equals(r.get("step"))),
                 "metadata retrieval is reasoning evidence, not a user-facing dataset");
     }
+
+    // ── PRO-33 literal validation (LITERAL_REJECTED / LITERAL_BLOCKED) must never be relabeled
+    //    as a governance "blocked" outcome — regression coverage for the "not permitted under
+    //    current data access policy" mislabeling of a technical validation limitation. ──────────
+
+    @Test
+    void evidenceToExecResultsEmitsValidationFailedForALiteralRejectedStep_notBlocked() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.addOutcome(1, "Retrieve all open purchase orders",
+                "SELECT * FROM purchase_orders WHERE status IN "
+                        + "('draft', 'submitted', 'acknowledged', 'partially_received')",
+                "conn-1", null, "LITERAL_REJECTED",
+                "'status IN (...)' is not a legal value of purchase_orders.status; "
+                        + "legal values: [draft, submitted, acknowledged, partially_received, "
+                        + "received, cancelled, closed]", 0L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("validationFailed"));
+        assertFalse(results.get(0).containsKey("blocked"),
+                "a literal-validation outcome must never be mislabeled as a governance block");
+        assertFalse(results.get(0).containsKey("error"));
+        assertFalse(results.get(0).containsKey("rows"));
+    }
+
+    @Test
+    void evidenceToExecResultsEmitsValidationFailedForALiteralBlockedStep_notBlocked() {
+        // "LITERAL_BLOCKED" contains the substring "BLOCK" — the generic blocked-outcome branch
+        // must not catch it ahead of the dedicated literal-validation branch.
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.addOutcome(1, "Retrieve all open purchase orders", "SELECT ...", "conn-1", null,
+                "LITERAL_BLOCKED", "'status IN (...)' is not a legal value of purchase_orders.status", 0L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("validationFailed"));
+        assertFalse(results.get(0).containsKey("blocked"));
+    }
+
+    @Test
+    void resultSystemPromptDistinguishesValidationFailedFromGovernanceBlocked() {
+        String validationFailed = ChatService.resultSystemPrompt(false, false, false, false, true, false);
+        String blocked          = ChatService.resultSystemPrompt(false, false, true, false, false, false);
+
+        assertNotEquals(validationFailed, blocked);
+        String vf = validationFailed.toLowerCase();
+        assertTrue(vf.contains("technical"), "must be framed as a technical limitation");
+        assertFalse(vf.contains("governance"),
+                "must not conflate a validation limitation with a governance/access-policy decision");
+        // "not permitted" legitimately appears once, inside the explicit "Do NOT say ..."
+        // prohibition — same pattern as failedExecutionNeverClaimsSuccessOrNoRecords above.
+        assertTrue(vf.contains("do not say the request is not permitted"),
+                "the prompt must explicitly forbid the policy-denial phrasing");
+    }
+
+    @Test
+    void validationFailedTakesPrecedenceOverGovernanceBlockedWhenBothOccurInOneInvestigation() {
+        // A later step's genuine governance block must not overwrite an earlier, more specific
+        // literal-validation outcome's honest framing — validationFailed wins over blocked.
+        assertEquals(
+                ChatService.resultSystemPrompt(false, false, true, false, true, false),
+                ChatService.resultSystemPrompt(false, false, false, false, true, false));
+    }
+
+    @Test
+    void dataRowsStillWinOverValidationFailed() {
+        assertEquals(ChatService.resultSystemPrompt(true, false, false, false, false, false),
+                ChatService.resultSystemPrompt(true, false, false, false, true, false));
+    }
+
+    @Test
+    void validationFailedFallbackMessageIsDistinctAndNeverSaysPolicy() {
+        String fallback = ChatService.resultFallbackMessage(false, false, false, false, true);
+        assertFalse(fallback.toLowerCase().contains("governance"));
+        assertFalse(fallback.toLowerCase().contains("policy"));
+        assertTrue(fallback.toLowerCase().contains("technical"));
+    }
 }

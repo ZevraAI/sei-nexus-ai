@@ -31,10 +31,16 @@ class ReasoningPlannerClarificationTest {
         ScriptedAiClient() { super(new ObjectMapper(), null); }
 
         @Override
-        public String chat(List<ChatMessage> messages, String systemPrompt) {
+        public String respond(List<ChatMessage> messages, String systemPrompt) {
             lastUserMessage  = messages.get(0).content();
             lastSystemPrompt = systemPrompt;
             return scriptedResponse;
+        }
+        // Phase 1 explicit prompt caching: Planner now calls respondForPlanner
+        // (prompt_cache_key="zevra:planner:v1") instead of respond.
+        @Override
+        public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
+            return respond(messages, systemPrompt);
         }
     }
 
@@ -157,5 +163,113 @@ class ReasoningPlannerClarificationTest {
         assertEquals("SELECT * FROM retail_core.purchase_orders WHERE status = 'open'", plan.sql(),
                 "Java must never silently rewrite, correct, or substitute the LLM's literal — it only relays or, "
                         + "via the clarification path, declines");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+    // LITERAL AUTHORITY RULE — the closed-enumeration fix (RCA: "status = 'open'" was produced
+    // despite the model already having the correct legal values; the prior 3-step rule was
+    // correct in content but buried as one bullet among many, and clarification was not framed
+    // as a co-equal top-level action alongside SQL/metadata-request). These tests are prompt-text
+    // pins (this repo's established convention) — they prove the new closed-enumeration wording
+    // is present and unambiguous, plus scripted-parsing tests proving Java's handling of a
+    // correct clarification response. They cannot, and do not claim to, prove a live model
+    // always complies — that compliance is Agent Brain's own responsibility, not something Java
+    // enforces or repairs.
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+
+    private static String systemPrompt() throws Exception {
+        java.lang.reflect.Field f = ReasoningPlanner.class.getDeclaredField("SYSTEM_PROMPT");
+        f.setAccessible(true);
+        return (String) f.get(null);
+    }
+
+    @Test
+    void clarificationIsFramedAsAThirdCoEqualActionNotABuriedException() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("choose exactly ONE of three equally valid actions"),
+                "clarification must be elevated to the same structural tier as SQL/metadata-request");
+        assertTrue(p.contains("(c) A clarification question"));
+        assertTrue(p.contains("There is no fourth action"),
+                "the framing must explicitly close off any implicit 'just guess something plausible' path");
+    }
+
+    @Test
+    void literalAuthorityRuleDefinesAClosedThreeCaseEnumeration() throws Exception {
+        String p = systemPrompt();
+        assertTrue(p.contains("LITERAL AUTHORITY RULE"));
+        assertTrue(p.contains("A. EXACT MATCH"));
+        assertTrue(p.contains("B. AUTHORITATIVE MAPPING"));
+        assertTrue(p.contains("C. UNCONSTRAINED FREE TEXT"));
+        assertTrue(p.contains("If none of A, B, or C applies"));
+        assertTrue(p.contains("you MUST NOT invent, guess, or substitute a legal-sounding value"));
+        assertTrue(p.contains("A user typing a word is never sufficient authorization on its own"),
+                "must explicitly reject 'the user said it, so it must be valid' as a justification");
+    }
+
+    @Test
+    void literalAuthorityRuleAppliesToAnyLiteralNotJustPreExistingExamples() throws Exception {
+        // Domain neutrality: the rule text itself must not name "open", "purchase order", or any
+        // other example term as a special case — it is a general decision procedure, not a
+        // per-term patch.
+        String p = systemPrompt();
+        int start = p.indexOf("LITERAL AUTHORITY RULE");
+        int end = p.indexOf("Rules:", start);
+        String rule = p.substring(start, end).toLowerCase(java.util.Locale.ROOT);
+        for (String forbidden : List.of("purchase order", "'open'", "supplier", "inventory")) {
+            assertFalse(rule.contains(forbidden),
+                    "the general rule text must not hardcode '" + forbidden + "' as a special case");
+        }
+    }
+
+    @Test
+    void unmappedBusinessTermCorrectlyDeclinedByTheModelIsRelayedAsClarificationNeverAsGuessedSql() {
+        // The exact reported scenario: "open" has no exact legal-value match and no authoritative
+        // mapping is available in this context. A model complying with the LITERAL AUTHORITY RULE
+        // returns clarification_question — Java relays it exactly, never substitutes a guessed
+        // IN(...) list or a bare literal of its own.
+        aiClient.scriptedResponse = """
+                {"done":false,"clarification_question":"'open' does not match any legal value of purchase_orders.status (draft, submitted, acknowledged, partially_received, received, cancelled, closed), and no business definition maps it. Which status did you mean?","rationale":"no exact match and no authoritative mapping for 'open'"}""";
+
+        ReasoningPlanner.StepPlan plan = planner.nextStep(
+                "show me all open purchase orders", "schema context", evidence);
+
+        assertNotNull(plan);
+        assertTrue(plan.isClarification());
+        assertNull(plan.sql());
+        assertFalse(plan.clarificationQuestion().contains("status = 'open'"),
+                "the clarification must not itself smuggle in the invalid literal as if it were usable");
+    }
+
+    @Test
+    void aResponseCarryingBothSqlAndClarificationIsTreatedAsClarificationNeverExecutesSql() {
+        // Defense-in-depth against an ambiguous/malformed model response: clarification takes
+        // precedence over sql when a response carries both, so a step is never silently executed
+        // just because a "sql" field happens to be present alongside a decline.
+        aiClient.scriptedResponse = """
+                {"done":false,"sql":"SELECT * FROM retail_core.purchase_orders WHERE status = 'open'","clarification_question":"'open' is not a legal value. Which status did you mean?","rationale":"ambiguous response"}""";
+
+        ReasoningPlanner.StepPlan plan = planner.nextStep(
+                "show me all open purchase orders", "schema context", evidence);
+
+        assertNotNull(plan);
+        assertTrue(plan.isClarification(),
+                "clarification must win over a co-present sql field — never execute a guessed query");
+    }
+
+    @Test
+    void reasoningPlannerHasNoDependencyOnLearnedVocabularyOrLearnedMappingRepositories() {
+        // Tenant independence (Step 8): ReasoningPlanner's only collaborators are the AI client
+        // and an ObjectMapper — structurally, it cannot read nexus_operational_vocabulary or
+        // nexus_learned_mapping, so the LITERAL AUTHORITY RULE's correctness can never depend on
+        // whether a tenant has accumulated learned vocabulary. A fresh tenant gets the exact same
+        // instruction and the exact same (correct) behavioral contract as an established one.
+        java.lang.reflect.Constructor<?>[] ctors = ReasoningPlanner.class.getDeclaredConstructors();
+        assertEquals(1, ctors.length);
+        for (Class<?> paramType : ctors[0].getParameterTypes()) {
+            String name = paramType.getName();
+            assertFalse(name.contains("LearnedMapping"), "must not depend on " + name);
+            assertFalse(name.contains("OperationalVocabulary"), "must not depend on " + name);
+            assertFalse(name.contains("Correction"), "must not depend on " + name);
+        }
     }
 }

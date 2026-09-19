@@ -138,13 +138,24 @@ public class AgentBrain {
 
         Optional<SemanticModel> conceptScoped;
         Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision;
+        List<String> resolvedConceptKeys;
+        // Concept-Level Disjunctive Ambiguity design: present only via the routing overload (the
+        // live ChatService call graph — see conceptScopedModelWithRouting's own javadoc). Left
+        // Optional.empty() for the memoryAvailable == null overload (conceptScopedModel), a dead
+        // path for ChatService's own live traffic — deliberately not extended, matching the
+        // "smallest insertion point, do not touch the dead path" discipline this change follows.
+        Optional<String> conceptAmbiguityClarification = Optional.empty();
         if (memoryAvailable == null) {
-            conceptScoped = conceptScopedModel(connectionKeys, question, conversationId);
+            ConceptScopedResolution r = conceptScopedModel(connectionKeys, question, conversationId);
+            conceptScoped = r.model();
             routingDecision = Optional.empty();
+            resolvedConceptKeys = r.conceptKeys();
         } else {
             ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, question, conversationId, memoryAvailable);
             conceptScoped = r.model();
             routingDecision = r.routing();
+            resolvedConceptKeys = r.conceptKeys();
+            conceptAmbiguityClarification = r.conceptAmbiguityClarification();
         }
         SemanticModel model = conceptScoped.orElseGet(() -> assembleByFallback(connectionKeys, domainKeys));
 
@@ -158,9 +169,18 @@ public class AgentBrain {
         // entirely independent of which concepts the Stage-1 LLM call selected for THIS
         // question's prompt. When narrowing did not apply at all, `model` already IS that full
         // baseline, so no second, redundant assembly is performed.
-        SemanticModel executionScope = conceptScoped.isPresent()
-                ? assembleByFallback(connectionKeys, domainKeys)
-                : model;
+        //
+        // Concept-Level Disjunctive Ambiguity design — CRITICAL DOWNSTREAM BOUNDARY: this
+        // "ranking never narrows execution" rule is deliberately suspended for an unresolved
+        // ambiguity. Approving the full, unnarrowed catalog as executable while Agent Brain has
+        // explicitly said it does not yet know which business concept the user means would let a
+        // caller that skips the clarification short-circuit still execute SQL against an
+        // unintended object. executionScope stays the SAME empty model as `model` in this one
+        // case — no physical object is ever approved for an unresolved ambiguity.
+        SemanticModel executionScope = conceptAmbiguityClarification.isPresent() ? model
+                : conceptScoped.isPresent()
+                        ? assembleByFallback(connectionKeys, domainKeys)
+                        : model;
 
         // Rank the resolved objects by relevance to the request (business reasoning) so
         // grounding leads with what the user most likely means — without narrowing the surface.
@@ -174,7 +194,7 @@ public class AgentBrain {
         return new ResolvedBusinessModel(agentId, connectionKeys, question,
                 ranked, model.objectTargets(), model.attributeTargets(),
                 resolution, literalScopeOf(resolution), conceptScoped.isPresent(), routingDecision,
-                Optional.of(executionScope));
+                Optional.of(executionScope), resolvedConceptKeys, conceptAmbiguityClarification);
     }
 
     // ── Business scope (owned here from Phase 3) ───────────────────────────────
@@ -254,27 +274,47 @@ public class AgentBrain {
      * Java) decides what is relevant — the same non-negotiable ownership rule Apply Pack's own
      * classification path already enforces.
      */
-    private Optional<SemanticModel> conceptScopedModel(List<String> connectionKeys, String question, String conversationId) {
+    private ConceptScopedResolution conceptScopedModel(List<String> connectionKeys, String question, String conversationId) {
         if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
-            return Optional.empty();
+            return new ConceptScopedResolution(Optional.empty(), List.of());
         }
         List<String> allObjectKeys = new ArrayList<>();
+        List<String> allConceptKeys = new ArrayList<>();
         for (String connectionKey : connectionKeys) {
             Optional<List<String>> objectKeys = conceptResolver.resolveObjectKeys(connectionKey, question, conversationId);
-            if (objectKeys.isEmpty()) return Optional.empty();
+            if (objectKeys.isEmpty()) return new ConceptScopedResolution(Optional.empty(), List.of());
             allObjectKeys.addAll(objectKeys.get());
+            // Concept-Key Semantic Anchor design: a second, separate call for the exact concept_key(s)
+            // Stage 1 selected — never rederived from objectKeys, never inferred. Its own fallback
+            // discipline (Optional.empty() on anything that isn't a clean Stage 1 result) means a
+            // resolver that doesn't support this yet (or fails) simply contributes no concept keys,
+            // without affecting the objectKeys-driven narrowing decision above in any way.
+            conceptResolver.resolveConceptKeys(connectionKey, question, conversationId)
+                    .ifPresent(allConceptKeys::addAll);
         }
+        List<String> distinctConceptKeys = allConceptKeys.stream().distinct().toList();
         if (allObjectKeys.isEmpty()) {
             // Every in-scope connection is concept-classified, and the LLM found none of the
             // available concepts relevant — a legitimate, honest "nothing applies" outcome.
-            return Optional.of(new SemanticModel(List.of(), Map.of(), Map.of()));
+            return new ConceptScopedResolution(
+                    Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), distinctConceptKeys);
         }
-        return Optional.of(assembler.assembleByObjectKeys(allObjectKeys));
+        return new ConceptScopedResolution(Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), distinctConceptKeys);
     }
 
-    /** Combined semantic model + routing decision — see {@link #conceptScopedModelWithRouting}. */
+    /** {@link #conceptScopedModel}'s result, additionally carrying the exact concept_key(s) Stage 1
+     *  selected (Concept-Key Semantic Anchor design) — see {@link ResolvedBusinessModel#resolvedConceptKeys()}. */
+    private record ConceptScopedResolution(Optional<SemanticModel> model, List<String> conceptKeys) {}
+
+    /** Combined semantic model + routing decision, additionally carrying the exact concept_key(s)
+     *  Stage 1 selected (Concept-Key Semantic Anchor design) — see {@link #conceptScopedModelWithRouting}
+     *  and {@link ResolvedBusinessModel#resolvedConceptKeys()} — and the Concept-Level Disjunctive
+     *  Ambiguity signal (see {@link ResolvedBusinessModel#conceptAmbiguityClarification()}), when
+     *  Stage 1 explicitly marked the question ambiguous between mutually exclusive concepts. */
     private record ConceptScopedModelResult(Optional<SemanticModel> model,
-                                            Optional<ConceptScopedMetadataResolver.RoutingDecision> routing) {}
+                                            Optional<ConceptScopedMetadataResolver.RoutingDecision> routing,
+                                            List<String> conceptKeys,
+                                            Optional<String> conceptAmbiguityClarification) {}
 
     /**
      * Same as {@link #conceptScopedModel}, additionally requesting the Decision Router
@@ -293,23 +333,51 @@ public class AgentBrain {
     private ConceptScopedModelResult conceptScopedModelWithRouting(List<String> connectionKeys, String question,
                                                                     String conversationId, boolean memoryAvailable) {
         if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
-            return new ConceptScopedModelResult(Optional.empty(), Optional.empty());
+            return new ConceptScopedModelResult(Optional.empty(), Optional.empty(), List.of(), Optional.empty());
         }
         List<String> allObjectKeys = new ArrayList<>();
+        List<String> allConceptKeys = new ArrayList<>();
         Optional<ConceptScopedMetadataResolver.RoutingDecision> routing = Optional.empty();
+        // Concept-Level Disjunctive Ambiguity design: the first connection to signal ambiguity
+        // wins — the same all-or-nothing, first-wins discipline this method already documents for
+        // routing above (a whole-REQUEST decision from a per-CONNECTION call).
+        Optional<String> ambiguity = Optional.empty();
         for (String connectionKey : connectionKeys) {
             ConceptScopedMetadataResolver.CombinedResolution resolution =
                     conceptResolver.resolveObjectKeysWithRouting(connectionKey, question, conversationId, memoryAvailable);
             if (resolution.objectKeys().isEmpty()) {
-                return new ConceptScopedModelResult(Optional.empty(), Optional.empty());
+                return new ConceptScopedModelResult(Optional.empty(), Optional.empty(), List.of(), Optional.empty());
             }
             allObjectKeys.addAll(resolution.objectKeys().get());
+            resolution.conceptKeys().ifPresent(allConceptKeys::addAll);
             if (routing.isEmpty()) routing = resolution.routing();
+            if (ambiguity.isEmpty()) ambiguity = resolution.conceptAmbiguityClarification();
+        }
+        List<String> distinctConceptKeys = allConceptKeys.stream().distinct().toList();
+        // CRITICAL DOWNSTREAM BOUNDARY: checked explicitly and BEFORE the allObjectKeys.isEmpty()
+        // branch below, rather than relying on allObjectKeys happening to be empty — a
+        // multi-connection scope where one connection is ambiguous but ANOTHER connection
+        // legitimately contributed object keys must still never approve those object keys.
+        // Ambiguity on any one connection empties the WHOLE scope, mirroring this method's
+        // existing all-or-nothing semantics for a connection that fails outright (see the
+        // `resolution.objectKeys().isEmpty()` branch above) — assembleByObjectKeys is never
+        // reached in this case.
+        if (ambiguity.isPresent()) {
+            return new ConceptScopedModelResult(
+                    Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing, distinctConceptKeys,
+                    ambiguity);
         }
         if (allObjectKeys.isEmpty()) {
-            return new ConceptScopedModelResult(Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing);
+            // Every in-scope connection is concept-classified, and the LLM found none of the
+            // available concepts relevant — a legitimate, honest "nothing applies" outcome,
+            // distinct from ambiguity (already handled above).
+            return new ConceptScopedModelResult(
+                    Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing, distinctConceptKeys,
+                    Optional.empty());
         }
-        return new ConceptScopedModelResult(Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), routing);
+        return new ConceptScopedModelResult(
+                Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), routing, distinctConceptKeys,
+                Optional.empty());
     }
 
     /** Restricts a domain scope to objects reachable through the approved connections. */

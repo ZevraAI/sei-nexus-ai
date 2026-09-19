@@ -342,7 +342,11 @@ public class OnboardingService {
             com.sei.nexus.ai.LlmCallTag.set("ONBOARDING_RECOMMEND");
             com.sei.nexus.usage.UsageContext.set("onboarding", null);
             com.sei.nexus.ai.OperationCorrelationId.set("ONBOARDING_RECOMMEND:" + cacheKey);
-            String aiResponse = aiClient.chatWithJson(
+            // Model tiering (pre-production cost optimization): recommending which tables to
+            // onboard from a table/column-name list is low-complexity JSON extraction —
+            // nexus.openai.onboarding-model (defaults to gpt-4o-mini) instead of the core chat
+            // model. Prompt/parsing/error handling below are unchanged.
+            String aiResponse = aiClient.chatWithJsonForOnboarding(
                     List.of(ChatMessage.user(userMessage)), systemPrompt);
             Map<String, Object> parsed = parseJson(aiResponse);
             recommended = (List<Map<String, Object>>) parsed.getOrDefault(

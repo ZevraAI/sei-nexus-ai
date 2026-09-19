@@ -275,7 +275,7 @@ class DeterministicLiteralResolutionTest {
     void captureLiteralBindingEntersExistingLearnedMappingLifecycle() {
         RecordingMappingRepository repo = new RecordingMappingRepository();
         SemanticLearningService svc = new SemanticLearningService(
-                null, null, repo, null, null, null, null);
+                null, null, repo, null, null, null, null, null);
 
         svc.captureLiteralBinding("run-1", "retail", "TX", "stores.state_province", "Texas");
 
@@ -292,7 +292,7 @@ class DeterministicLiteralResolutionTest {
     void captureIgnoresBlankInputsAndRepositoryFailures() {
         RecordingMappingRepository repo = new RecordingMappingRepository();
         SemanticLearningService svc = new SemanticLearningService(
-                null, null, repo, null, null, null, null);
+                null, null, repo, null, null, null, null, null);
 
         svc.captureLiteralBinding("run-1", "retail", "", "c", "v");
         svc.captureLiteralBinding("run-1", "retail", "s", null, "v");
@@ -303,7 +303,7 @@ class DeterministicLiteralResolutionTest {
                     @Override public LearnedMapping upsert(LearnedMapping m) {
                         throw new IllegalStateException("db down");
                     }
-                }, null, null, null, null);
+                }, null, null, null, null, null);
         // Must not throw — learning never blocks the response
         assertDoesNotThrow(() ->
                 failing.captureLiteralBinding("run-1", "retail", "TX", "c", "v"));

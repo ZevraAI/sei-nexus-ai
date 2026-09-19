@@ -7,6 +7,7 @@ import com.sei.nexus.response.NaturalLanguageComposer.CompositionRequest;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -24,14 +25,33 @@ class NaturalLanguageComposerTest {
     static class FakeAi extends AzureOpenAiClient {
         String seenUser;
         String seenSystem;
-        String calledMethod;      // "chat" (TEXT) or "chatWithJson" (JSON)
+        String calledMethod;      // "respond" (TEXT), "respondWithJson" (JSON), or "respondWithStrictJson"
+        String seenSchemaName;
+        Map<String, Object> seenSchema;
         boolean throwOnCall = false;
         FakeAi() { super(new ObjectMapper(), null); }
-        @Override public String chat(List<ChatMessage> messages, String systemPrompt) {
-            calledMethod = "chat"; return record(messages, systemPrompt, "TEXT OUTPUT");
+        @Override public String respond(List<ChatMessage> messages, String systemPrompt) {
+            calledMethod = "respond"; return record(messages, systemPrompt, "TEXT OUTPUT");
         }
-        @Override public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
-            calledMethod = "chatWithJson"; return record(messages, systemPrompt, "{\"json\":true}");
+        @Override public String respondWithJson(List<ChatMessage> messages, String systemPrompt) {
+            calledMethod = "respondWithJson"; return record(messages, systemPrompt, "{\"json\":true}");
+        }
+        @Override public String respondWithStrictJson(List<ChatMessage> messages, String systemPrompt,
+                                                        String jsonSchemaName, Map<String, Object> jsonSchema) {
+            calledMethod = "respondWithStrictJson";
+            seenSchemaName = jsonSchemaName;
+            seenSchema = jsonSchema;
+            return record(messages, systemPrompt, "{\"strict\":true}");
+        }
+        // Phase 1 explicit prompt caching: NaturalLanguageComposer's TEXT/STRICT_JSON modes now
+        // call respondForComposer/respondWithStrictJsonForComposer (both attaching
+        // prompt_cache_key="zevra:answer-composer:v1") instead of respond/respondWithStrictJson.
+        @Override public String respondForComposer(List<ChatMessage> messages, String systemPrompt) {
+            return respond(messages, systemPrompt);
+        }
+        @Override public String respondWithStrictJsonForComposer(List<ChatMessage> messages, String systemPrompt,
+                                                                   String jsonSchemaName, Map<String, Object> jsonSchema) {
+            return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema);
         }
         private String record(List<ChatMessage> messages, String systemPrompt, String out) {
             this.seenSystem = systemPrompt;
@@ -48,7 +68,7 @@ class NaturalLanguageComposerTest {
                 .compose(CompositionRequest.text("USER PROMPT", "SYSTEM POLICY", "fallback"));
 
         assertEquals("TEXT OUTPUT", out);
-        assertEquals("chat", ai.calledMethod, "TEXT mode uses the plain chat method");
+        assertEquals("respond", ai.calledMethod, "TEXT mode uses the plain (non-JSON) response method");
         assertEquals("USER PROMPT", ai.seenUser);
         assertEquals("SYSTEM POLICY", ai.seenSystem, "the composition policy is passed through unchanged");
     }
@@ -60,7 +80,7 @@ class NaturalLanguageComposerTest {
                 .compose(CompositionRequest.json("q", "sys", "fb"));
 
         assertEquals("{\"json\":true}", out);
-        assertEquals("chatWithJson", ai.calledMethod, "JSON mode uses the json response method");
+        assertEquals("respondWithJson", ai.calledMethod, "JSON mode uses the json response method");
     }
 
     @Test
@@ -87,6 +107,30 @@ class NaturalLanguageComposerTest {
                 () -> { evaluatedOnFailure.set(true); return "lazy fb"; }));
         assertEquals("lazy fb", out);
         assertTrue(evaluatedOnFailure.get(), "the lazy fallback is evaluated only when the call fails");
+    }
+
+    @Test
+    void strictJsonModeUsesTheStrictJsonMethodAndPassesTheSchemaThrough() {
+        FakeAi ai = new FakeAi();
+        Map<String, Object> schema = Map.of("type", "object");
+        String out = new NaturalLanguageComposer(ai)
+                .compose(CompositionRequest.strictJson("q", "sys", "my_schema", schema, "fb"));
+
+        assertEquals("{\"strict\":true}", out);
+        assertEquals("respondWithStrictJson", ai.calledMethod,
+                "STRICT_JSON mode uses the strict-schema response method");
+        assertEquals("my_schema", ai.seenSchemaName);
+        assertSame(schema, ai.seenSchema, "the schema object is passed through unchanged");
+    }
+
+    @Test
+    void strictJsonModeReturnsFallbackOnFailure() {
+        FakeAi ai = new FakeAi();
+        ai.throwOnCall = true;
+        assertEquals("safe fallback",
+                new NaturalLanguageComposer(ai).compose(
+                        CompositionRequest.strictJson("q", "sys", "schema", Map.of(), "safe fallback")),
+                "a strict-schema call failure (e.g. a genuine API error) still degrades to the caller's fallback");
     }
 
     /** A null fallback (jsonPropagating) means the caller wants failures to propagate — e.g. Brief. */

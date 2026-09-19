@@ -32,7 +32,11 @@ public class LearnedMappingRepository {
         Optional<LearnedMapping> existing = findByTerm(m.domainKey(), m.businessTerm());
 
         if (existing.isPresent()) {
-            // Reinforce: nudge confidence up slightly and record latest use
+            // Reinforce: nudge confidence up slightly and record latest use.
+            // concept_key uses COALESCE(?, concept_key) — a null incoming concept_key preserves
+            // whatever concept_key the existing row already has (e.g. previously admin-assigned),
+            // while a non-null incoming value overwrites it. Purely deterministic SQL null-
+            // coalescing — no Java-side conditional branching on semantic grounds.
             LearnedMapping e = existing.get();
             double newConf = Math.min(e.confidence() + 0.05, 1.0);
             int    newCount = e.useCount() + 1;
@@ -41,11 +45,12 @@ public class LearnedMappingRepository {
                     SET confidence    = ?,
                         use_count     = ?,
                         sql_pattern   = ?,
+                        concept_key   = COALESCE(?, concept_key),
                         last_used_at  = NOW(),
                         updated_at    = NOW()
                     WHERE mapping_key = ?
                     """,
-                    newConf, newCount, m.sqlPattern(), e.mappingKey());
+                    newConf, newCount, m.sqlPattern(), m.conceptKey(), e.mappingKey());
             return findByKey(e.mappingKey()).orElse(e);
         }
 
@@ -54,8 +59,8 @@ public class LearnedMappingRepository {
                 INSERT INTO nexus_learned_mapping
                     (mapping_key, domain_key, business_term, sql_pattern,
                      source_run_key, source, confidence, use_count,
-                     last_used_at, promoted, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,NOW(),FALSE,NOW(),NOW())
+                     last_used_at, promoted, created_at, updated_at, concept_key)
+                VALUES (?,?,?,?,?,?,?,?,NOW(),FALSE,NOW(),NOW(),?)
                 """,
                 key,
                 m.domainKey(),
@@ -64,7 +69,42 @@ public class LearnedMappingRepository {
                 m.sourceRunKey(),
                 m.source(),
                 m.confidence(),
-                m.useCount());
+                m.useCount(),
+                m.conceptKey());
+        return findByKey(key).orElseThrow();
+    }
+
+    /**
+     * Explicit-teaching insert (/TeachZevra, Part B) — the ONLY writer of {@code connection_key}.
+     * A connection-scoped teaching (user selected "Specific connection" in the form) is persisted
+     * with that exact, Java-validated, authorized connection key; a tenant-wide teaching passes
+     * {@code connectionKey = null}, identical in shape to every other row in this table. This is a
+     * dedicated insert (not folded into {@link #upsert}) because {@link LearnedMapping} itself does
+     * not carry a connection-key field — adding one would ripple through every existing 13-arg
+     * {@code LearnedMapping} construction site across the codebase for a value only this one write
+     * path ever needs. Never reinforces/upserts an existing row — explicit teaching always creates
+     * a new mapping row, one per confirmed teaching action.
+     */
+    public LearnedMapping insertExplicitTeaching(LearnedMapping m, String connectionKey) {
+        String key = m.mappingKey() != null ? m.mappingKey() : Keys.uniqueKey("lmap");
+        jdbc.update("""
+                INSERT INTO nexus_learned_mapping
+                    (mapping_key, domain_key, business_term, sql_pattern,
+                     source_run_key, source, confidence, use_count,
+                     last_used_at, promoted, created_at, updated_at, concept_key, connection_key)
+                VALUES (?,?,?,?,?,?,?,?,NOW(),?,NOW(),NOW(),?,?)
+                """,
+                key,
+                m.domainKey(),
+                m.businessTerm(),
+                m.sqlPattern(),
+                m.sourceRunKey(),
+                m.source(),
+                m.confidence(),
+                m.useCount(),
+                m.promoted(),
+                m.conceptKey(),
+                connectionKey);
         return findByKey(key).orElseThrow();
     }
 
@@ -242,6 +282,34 @@ public class LearnedMappingRepository {
                 WHERE promoted = TRUE AND concept_key = ?
                 ORDER BY confidence DESC, use_count DESC
                 """, mapper(), conceptKey);
+    }
+
+    /**
+     * Concept-Key Semantic Anchor design: promoted learned mappings whose {@code concept_key}
+     * exactly matches one of the given, already-resolved concept keys — the deterministic
+     * evidence lookup that makes concept-scoped learning available to Agent Brain (see
+     * {@code ChatService}'s concept-scoped learned-knowledge context section). Exact equality
+     * only — no LIKE, no fuzzy/partial matching, no ranking beyond the existing confidence/
+     * use_count ordering, and no selection among results: every promoted mapping under any of
+     * the given concept keys is returned, and the caller must render all of them as evidence
+     * rather than choosing one. Returns {@code List.of()} for a null/empty conceptKeys list
+     * rather than querying, since there is nothing to scope to.
+     */
+    public List<LearnedMapping> findPromotedByConceptKeys(List<String> conceptKeys) {
+        if (conceptKeys == null || conceptKeys.isEmpty()) {
+            return List.of();
+        }
+        List<String> distinct = conceptKeys.stream().filter(k -> k != null && !k.isBlank()).distinct().toList();
+        if (distinct.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", distinct.stream().map(k -> "?").toList());
+        Object[] args = distinct.toArray();
+        return jdbc.query("""
+                SELECT * FROM nexus_learned_mapping
+                WHERE promoted = TRUE AND concept_key IN (%s)
+                ORDER BY confidence DESC, use_count DESC
+                """.formatted(placeholders), mapper(), args);
     }
 
     /** Admin sync-status visibility: how many promoted mappings still have no concept_key, i.e.

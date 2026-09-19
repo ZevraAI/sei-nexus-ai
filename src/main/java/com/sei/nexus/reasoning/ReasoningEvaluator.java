@@ -176,7 +176,11 @@ public class ReasoningEvaluator {
                     + "Evidence gathered so far:\n" + evidence.buildContextForLlm();
 
             com.sei.nexus.ai.LlmCallTag.set("EVALUATOR");
-            String raw  = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
+            // Phase 1 Responses API migration: transport-only — same prompt/context, same
+            // free-form-text (non-schema) output contract, same tolerant JSON extraction below.
+            // Phase 1 explicit prompt caching: identical request shape, additionally attaching
+            // prompt_cache_key="zevra:evaluator:v1" (a pure cache-routing hint).
+            String raw  = aiClient.respondForEvaluator(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 

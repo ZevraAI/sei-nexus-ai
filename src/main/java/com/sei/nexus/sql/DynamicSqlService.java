@@ -90,7 +90,13 @@ public class DynamicSqlService {
             }
 
         } catch (SQLException ex) {
-            log.error("Query execution failed on connection {}: {}", connectionKey, ex.getMessage());
+            // The SQL text itself was not previously logged here, which made a driver-reported
+            // syntax error (e.g. "syntax error at or near 'X', Position: N") undiagnosable after
+            // the fact — the position is meaningless without the string it indexes into. Logged
+            // truncated (never the full statement, which can be large) at ERROR alongside the
+            // driver's own message; this does not change execution or error-handling behavior.
+            log.error("Query execution failed on connection {}: {} | sql={}",
+                    connectionKey, ex.getMessage(), truncateForLog(approvedSql));
             throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR, "Query failed: " + ex.getMessage());
         }
     }
@@ -254,6 +260,15 @@ public class DynamicSqlService {
 
     private static String cap(String s) {
         return s.length() > MAX_COMMENT_CHARS ? s.substring(0, MAX_COMMENT_CHARS) + "…[truncated]" : s;
+    }
+
+    private static final int MAX_LOGGED_SQL_CHARS = 500;
+
+    /** Bounds a SQL statement for a log line — diagnosable without risking an unbounded log
+     *  entry for a pathological/very long generated query. */
+    private static String truncateForLog(String sql) {
+        if (sql == null) return "null";
+        return sql.length() > MAX_LOGGED_SQL_CHARS ? sql.substring(0, MAX_LOGGED_SQL_CHARS) + "…[truncated]" : sql;
     }
 
     private String fetchPostgresTableComment(NexusConnection conn, String schemaName, String tableName) throws SQLException {

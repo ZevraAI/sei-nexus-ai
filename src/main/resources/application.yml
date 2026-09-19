@@ -71,6 +71,17 @@ nexus:
     api-key: ${OPENAI_API_KEY}
     chat-model: ${OPENAI_CHAT_MODEL:gpt-4o}
     embedding-model: ${OPENAI_EMBEDDING_MODEL:text-embedding-ada-002}
+    # Model tiering (pre-production cost optimization): low-complexity, structured-extraction
+    # calls run on a cheaper model than the core Agent Brain reasoning path (chat-model above),
+    # which stays on gpt-4o. Each has its own property so one candidate can be tuned/reverted
+    # independently of the others — see AzureOpenAiClient's chatForTermExtraction /
+    # chatForCorrectionDetection / chatWithJsonForOnboarding / respondForMemorySelection.
+    term-extractor-model: ${OPENAI_TERM_EXTRACTOR_MODEL:gpt-4o-mini}
+    # Live evaluation found gpt-4o-mini unsuitable here (misclassified plain follow-ups as
+    # corrections) — kept on gpt-4o; see AzureOpenAiClient's correctionDetectorModel comment.
+    correction-detector-model: ${OPENAI_CORRECTION_DETECTOR_MODEL:gpt-4o}
+    onboarding-model: ${OPENAI_ONBOARDING_MODEL:gpt-4o-mini}
+    memory-selection-model: ${OPENAI_MEMORY_SELECTION_MODEL:gpt-4o-mini}
   security:
     jwt-secret: ${NEXUS_JWT_SECRET:change-me-in-production}
     session-expiry-hours: 24

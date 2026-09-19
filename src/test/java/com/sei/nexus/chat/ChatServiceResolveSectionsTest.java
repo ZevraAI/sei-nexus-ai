@@ -35,12 +35,12 @@ class ChatServiceResolveSectionsTest {
 
     @SafeVarargs
     private static InvestigationDataset dataset(int stepNo, String description, Map<String, Object>... rows) {
-        return new InvestigationDataset(stepNo, description, List.of(rows));
+        return new InvestigationDataset(stepNo, description, List.of(rows), null, null, List.of());
     }
 
     private static StructuredAnswer.Section section(String type, String title, List<String> refs,
             List<String> items, String content) {
-        return new StructuredAnswer.Section(type, title, "purpose", refs, true, items, content);
+        return new StructuredAnswer.Section(type, title, "purpose", refs, true, items, content, null);
     }
 
     // ── 1. Single-dataset section ────────────────────────────────────────────────────────────
@@ -81,8 +81,13 @@ class ChatServiceResolveSectionsTest {
         assertEquals(2, out.datasets().size(), "both grounding datasets must be present");
         assertEquals(3, out.datasets().get(0).stepNo());
         assertEquals(5, out.datasets().get(1).stepNo());
-        assertEquals("X", out.datasets().get(0).rows().get(0).get("product_id"));
-        assertEquals("Widget A", out.datasets().get(1).rows().get(0).get("name"));
+        // A HIGHLIGHT section cites a dataset for traceability only — the UI never renders its
+        // table, so (per the payload-bloat fix) full rows are carried ONLY for type=DATASET;
+        // rowCount alone is preserved here.
+        assertTrue(out.datasets().get(0).rows().isEmpty());
+        assertTrue(out.datasets().get(1).rows().isEmpty());
+        assertEquals(1, out.datasets().get(0).rowCount());
+        assertEquals(1, out.datasets().get(1).rowCount());
     }
 
     // ── 3. Three datasets ─────────────────────────────────────────────────────────────────────
@@ -119,13 +124,12 @@ class ChatServiceResolveSectionsTest {
 
         var datasets = resolved.get(0).datasets();
         assertEquals(1, datasets.get(0).stepNo());
-        assertEquals(2, datasets.get(0).rows().size());
         assertEquals(5, datasets.get(1).stepNo());
-        assertEquals(1, datasets.get(1).rows().size());
-        assertFalse(datasets.get(0).rows().get(0).containsKey("name"),
-                "step-1's rows must never contain step-5's columns — no merge occurred");
-        assertFalse(datasets.get(1).rows().get(0).containsKey("po_number"),
-                "step-5's rows must never contain step-1's columns — no merge occurred");
+        // This is a HIGHLIGHT section — full rows are carried only for type=DATASET (see the
+        // payload-bloat fix); rowCount preserves each dataset's own size independently, which is
+        // itself proof the two were never merged into one combined count.
+        assertEquals(2, datasets.get(0).rowCount());
+        assertEquals(1, datasets.get(1).rowCount());
     }
 
     // ── 6. Exact step identity resolution only ───────────────────────────────────────────────
@@ -253,8 +257,11 @@ class ChatServiceResolveSectionsTest {
         assertEquals(1, resolved.size(), "Java resolves the real reference regardless of whether "
                 + "the narrative's stated number matches — it never inspects content");
         assertEquals("The most ordered item has 1,500 units ordered.", resolved.get(0).content());
-        assertEquals(999, resolved.get(0).datasets().get(0).rows().get(0).get("total_ordered_qty"),
-                "the actual evidence value is transported unmodified, whatever the narrative claims");
+        // A HIGHLIGHT section's cited dataset carries rowCount only, not full rows (see the
+        // payload-bloat fix) — but the section is still resolved and kept exactly as named,
+        // regardless of the narrative/evidence mismatch, which remains the point of this test.
+        assertTrue(resolved.get(0).datasets().get(0).rows().isEmpty());
+        assertEquals(1, resolved.get(0).datasets().get(0).rowCount());
     }
 
     // ── 18. One dataset or multiple — the model decides the cardinality ─────────────────────

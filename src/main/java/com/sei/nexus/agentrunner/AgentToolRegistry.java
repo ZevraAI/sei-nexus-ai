@@ -159,9 +159,10 @@ public class AgentToolRegistry {
                                                 "description", "One sentence on what the business should consider "
                                                         + "doing, grounded in the evidence you actually gathered. "
                                                         + "Omit if none is warranted.")),
-                                        Map.entry("next_steps", Map.of("type", "array", "items", Map.of("type", "string"),
-                                                "description", "Concrete follow-up investigations specific to this "
-                                                        + "question — not generic filler. Empty if none apply."))
+                                        Map.entry("follow_up_questions", Map.of("type", "array", "items", Map.of("type", "string"),
+                                                "description", "Possible questions the user may naturally ask next "
+                                                        + "based on this investigation — not generic filler. "
+                                                        + "Empty if none apply."))
                                 ),
                                 "required", List.of("answer")
                         ))
@@ -420,6 +421,10 @@ public class AgentToolRegistry {
         String imageBase64 = getString(args, "image_base64");
         String question    = getString(args, "question");
         String mimeType    = args.getOrDefault("mime_type", "image/jpeg").toString();
+        // Telemetry hardening (Phase 0): this nested tool call happens on its own HTTP request,
+        // after the ReAct loop's own "AGENT_RUNNER" tag has already been consumed/cleared by that
+        // call's usage recording — without its own tag this would persist as UNTAGGED/NULL.
+        com.sei.nexus.ai.LlmCallTag.set("AGENT_TOOL_IMAGE_ANALYSIS");
         return openAi.analyzeImage(question, imageBase64, mimeType,
                 "You are a visual inspection AI. Analyse the image accurately.");
     }

@@ -189,7 +189,11 @@ public class BusinessObjectBatchAnalyzer {
                 + entityCandidates.resolutionContract(anyCandidateSample);
 
         try {
-            String analysisJson = aiClient.chatWithJson(
+            // Model tiering (pre-production cost optimization): batched table/column business-
+            // object analysis is low-complexity structured extraction, shared by both Onboarding
+            // and Discover — nexus.openai.onboarding-model (defaults to gpt-4o-mini) instead of
+            // the core chat model. Prompt/parsing/error handling below are unchanged.
+            String analysisJson = aiClient.chatWithJsonForOnboarding(
                     List.of(ChatMessage.user(userMessage.toString())), systemPrompt);
             Map<String, Object> parsed = parseJson(analysisJson);
 

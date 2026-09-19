@@ -90,48 +90,66 @@ class SemanticLearningServiceLogicTest {
         correctionRepository = new FakeCorrectionRepository();
         runRepository = new FakeRunRepository();
         service = new SemanticLearningService(termExtractor, correctionDetector, mappingRepository,
-                correctionRepository, runRepository, new TenantRepository(null), null);
+                correctionRepository, runRepository, new TenantRepository(null), null,
+                new com.sei.nexus.reasoning.ReasoningRepository(null));
     }
 
-    // ── TermExtractor → upsert (Signal 1) — the exact clarification-answer scenario ─────────────
+    // ── TermExtractor → upsert (Signal 1, now CLARIFICATION_RESOLUTION) — the exact
+    //    clarification-answer scenario, dispatched as a Learning Event ─────────────
 
     @Test
-    void learnFromRunExtractsAndPersistsTheExactClarificationMapping() {
+    void clarificationResolutionExtractsAndPersistsTheExactClarificationMapping() {
         setUp();
         termExtractor.scripted = List.of(new TermExtractor.ExtractedTerm(
                 "open", "status IN ('submitted', 'acknowledged', 'partially_received')"));
 
-        service.learnFromRun("run-1", "open means status in submitted, acknowledged, partially_received",
+        service.dispatch(new LearningEvent(LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                "open means status in submitted, acknowledged, partially_received",
                 "SELECT ... WHERE status IN ('submitted', 'acknowledged', 'partially_received')",
-                "PLATFORM", null);
+                "PLATFORM", List.of(), "run-1", null));
 
         assertEquals(1, mappingRepository.upserted.size());
         LearnedMapping saved = mappingRepository.upserted.get(0);
         assertEquals("open", saved.businessTerm());
         assertEquals("status IN ('submitted', 'acknowledged', 'partially_received')", saved.sqlPattern());
-        assertEquals("QUERY_SUCCESS", saved.source());
+        assertEquals("CLARIFICATION_RESOLUTION", saved.source());
         assertEquals(0.5, saved.confidence());
         assertEquals(1, saved.useCount());
     }
 
     @Test
-    void learnFromRunPersistsNothingWhenTermExtractorFindsNoTerms() {
+    void clarificationResolutionPersistsNothingWhenTermExtractorFindsNoTerms() {
         setUp();
         termExtractor.scripted = List.of(); // the "no meaningful terms" case
 
-        service.learnFromRun("run-1", "show me all purchase orders", "SELECT * FROM purchase_orders",
-                "PLATFORM", null);
+        service.dispatch(new LearningEvent(LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                "show me all purchase orders", "SELECT * FROM purchase_orders",
+                "PLATFORM", List.of(), "run-1", null));
 
         assertEquals(0, mappingRepository.upserted.size());
     }
 
     @Test
-    void learnFromRunDoesNothingForBlankQuestionOrSql() {
+    void clarificationResolutionDoesNothingForBlankQuestionOrSql() {
         setUp();
-        service.learnFromRun("run-1", "", "SELECT 1", "PLATFORM", null);
-        service.learnFromRun("run-1", "q", "", "PLATFORM", null);
+        service.dispatch(new LearningEvent(LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                "", "SELECT 1", "PLATFORM", List.of(), "run-1", null));
+        service.dispatch(new LearningEvent(LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                "q", "", "PLATFORM", List.of(), "run-1", null));
         assertEquals(0, mappingRepository.upserted.size());
         assertNull(termExtractor.lastQuestion, "TermExtractor must not even be called for blank input");
+    }
+
+    @Test
+    void plainSuccessfulQueryNeverInvokesTermExtractor() {
+        setUp();
+        // A SEMANTIC_CORRECTION event (or no event at all) must never reach TermExtractor —
+        // only CLARIFICATION_RESOLUTION (and, in Part B, EXPLICIT_TEACHING) do.
+        service.dispatch(new LearningEvent(LearningEvent.Source.SEMANTIC_CORRECTION,
+                "show me all purchase orders", "SELECT * FROM purchase_orders",
+                "PLATFORM", List.of(), "run-1", "conv-1"));
+        assertNull(termExtractor.lastQuestion, "TermExtractor must not be invoked for a plain/correction event");
+        assertEquals(0, mappingRepository.upserted.size());
     }
 
     // ── captureLiteralBinding (Signal 1b) ────────────────────────────────────────────────────────
@@ -157,13 +175,16 @@ class SemanticLearningServiceLogicTest {
         assertEquals(0, mappingRepository.upserted.size());
     }
 
-    // ── Correction detection (Signal 2) — reached only from learnFromRun, unaffected by the fix ──
+    // ── Correction detection (Signal 2) — now reached via detectAndSaveCorrectionForRun ──────────
 
     @Test
     void correctionDetectionIsSkippedWhenConversationIdIsNull() {
         setUp();
         termExtractor.scripted = List.of();
-        service.learnFromRun("run-1", "q", "SELECT 1", "PLATFORM", null);
+        // ChatService only calls detectAndSaveCorrectionForRun when conversationId is non-blank;
+        // this asserts the (blank) case is a no-op guarded at the call site, and even when called
+        // with a blank id it does nothing.
+        service.detectAndSaveCorrectionForRun("run-1", "q", "", "PLATFORM", List.of());
         assertEquals(0, correctionRepository.saved.size(), "no conversationId ⇒ correction detection never runs");
     }
 

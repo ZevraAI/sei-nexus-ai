@@ -36,6 +36,12 @@ class BusinessObjectBatchAnalyzerCommentEnrichmentTest {
             lastUserMessage = messages.get(0).content();
             return "{\"tables\":[{\"table_name\":\"t\",\"category\":\"Other\"}]}";
         }
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            return chatWithJson(messages, systemPrompt);
+        }
     }
 
     /** Returns a scripted {@link DynamicSqlService.TableDescription} instead of hitting a real DB. */

@@ -35,11 +35,11 @@ class ChatServiceComposeAnswerContextTest {
         List<InvestigationDataset> datasets = List.of(
                 new InvestigationDataset(1, "List all open purchase orders",
                         List.of(row("po_number", "PO-1"), row("po_number", "PO-2"),
-                                row("po_number", "PO-3"), row("po_number", "PO-4"), row("po_number", "PO-5"))),
+                                row("po_number", "PO-3"), row("po_number", "PO-4"), row("po_number", "PO-5")), null, null, List.of()),
                 new InvestigationDataset(3, "Determine the most ordered item",
-                        List.of(row("product_id", "p1", "total_ordered_qty", 1500))),
+                        List.of(row("product_id", "p1", "total_ordered_qty", 1500)), null, null, List.of()),
                 new InvestigationDataset(5, "Retrieve descriptive information for the identified item",
-                        List.of(row("name", "Widget ABC", "sku", "SKU-123"))));
+                        List.of(row("name", "Widget ABC", "sku", "SKU-123")), null, null, List.of()));
 
         String ctx = ChatService.buildInvestigationDatasetsBlock(datasets, interp);
 
@@ -61,9 +61,9 @@ class ChatServiceComposeAnswerContextTest {
     @Test
     void datasetOrderInTheContextMatchesStepOrderNeverReordered() {
         List<InvestigationDataset> datasets = List.of(
-                new InvestigationDataset(1, "First", List.of(row("a", 1))),
-                new InvestigationDataset(2, "Second", List.of(row("a", 2))),
-                new InvestigationDataset(3, "Third", List.of(row("a", 3))));
+                new InvestigationDataset(1, "First", List.of(row("a", 1)), null, null, List.of()),
+                new InvestigationDataset(2, "Second", List.of(row("a", 2)), null, null, List.of()),
+                new InvestigationDataset(3, "Third", List.of(row("a", 3)), null, null, List.of()));
 
         String ctx = ChatService.buildInvestigationDatasetsBlock(datasets, interp);
 
@@ -76,8 +76,8 @@ class ChatServiceComposeAnswerContextTest {
     @Test
     void datasetsAreNeverFlattenedOrMergedEachBlockIsSeparatelyDelimited() {
         List<InvestigationDataset> datasets = List.of(
-                new InvestigationDataset(1, "Orders", List.of(row("po_number", "PO-1"))),
-                new InvestigationDataset(5, "Product", List.of(row("name", "Widget ABC"))));
+                new InvestigationDataset(1, "Orders", List.of(row("po_number", "PO-1")), null, null, List.of()),
+                new InvestigationDataset(5, "Product", List.of(row("name", "Widget ABC")), null, null, List.of()));
 
         String ctx = ChatService.buildInvestigationDatasetsBlock(datasets, interp);
 

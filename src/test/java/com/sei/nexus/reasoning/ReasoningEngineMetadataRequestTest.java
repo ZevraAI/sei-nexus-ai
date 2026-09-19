@@ -125,11 +125,18 @@ class ReasoningEngineMetadataRequestTest {
                     return StepPlan.metadataRequest("Need line item columns",
                             "columns were omitted from the schema context", "order_lines", "columns");
                 }
-                // Second call: the real column list must now be visible in schemaCtx.
-                assertTrue(schemaCtx.contains("ordered_qty"),
-                        "the planner's second call must see the retrieved column metadata");
-                return new StepPlan("Sum ordered quantity", "SELECT SUM(ordered_qty) FROM order_lines",
-                        CONN, "", "now that columns are known");
+                if (call == 2) {
+                    // The real column list must now be visible in schemaCtx.
+                    assertTrue(schemaCtx.contains("ordered_qty"),
+                            "the planner's second call must see the retrieved column metadata");
+                    return new StepPlan("Sum ordered quantity", "SELECT SUM(ordered_qty) FROM order_lines",
+                            CONN, "", "now that columns are known");
+                }
+                // Loop-control fix (chart-hint architecture investigation, 2026-09): once the
+                // evaluator marks the step SUFFICIENT, the engine gives the Planner one bounded
+                // extra opportunity to add an optional supplementary step before concluding —
+                // this fake, like a real well-behaved planner, says done.
+                return null;
             }
         };
 
@@ -153,7 +160,11 @@ class ReasoningEngineMetadataRequestTest {
                 "rsession", "schema context", "run-1", "user@test.com", false, null, null, false,
                 "conv-1", null, null, resolvedContract());
 
-        assertEquals(2, plannerCalls.get(), "one metadata-request call, one SQL-planning call");
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): one bounded extra
+        // post-sufficiency Planner call (see the fake's call==3 branch above), yielding no
+        // further step/execution.
+        assertEquals(3, plannerCalls.get(), "one metadata-request call, one SQL-planning call, "
+                + "one bounded post-sufficiency opportunity that yields no further step");
         assertEquals(1, executions.get(), "SQL executes only after columns were received");
         assertFalse(result.queryData().isEmpty());
 
@@ -187,11 +198,16 @@ class ReasoningEngineMetadataRequestTest {
                             "the object exists but was never resolved into this request's scope",
                             "catalog_entries", "columns");
                 }
-                assertTrue(schemaCtx.contains("label"),
-                        "the object's real column, retrieved via the enterprise-metadata "
-                                + "fallback, must reach the next planner call");
-                return new StepPlan("Use the retrieved column", "SELECT label FROM catalog_entries",
-                        CONN, "", "now that columns are known");
+                if (call == 2) {
+                    assertTrue(schemaCtx.contains("label"),
+                            "the object's real column, retrieved via the enterprise-metadata "
+                                    + "fallback, must reach the next planner call");
+                    return new StepPlan("Use the retrieved column", "SELECT label FROM catalog_entries",
+                            CONN, "", "now that columns are known");
+                }
+                // Loop-control fix (chart-hint architecture investigation, 2026-09): one bounded
+                // extra post-sufficiency Planner call — a real well-behaved planner says done.
+                return null;
             }
         };
         ReasoningEvaluator fakeEvaluator = new ReasoningEvaluator(null, null) {
@@ -216,7 +232,9 @@ class ReasoningEngineMetadataRequestTest {
                 .reason("q", "q", "rsession", "schema context", "run-1", "user@test.com", false, null, null, false,
                         "conv-1", null, null, resolvedContract());
 
-        assertEquals(2, plannerCalls.get());
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): one bounded extra
+        // post-sufficiency Planner call (see the fake's call==3 branch above).
+        assertEquals(3, plannerCalls.get());
         assertEquals(1, executions.get());
         assertFalse(result.queryData().isEmpty());
     }
@@ -408,8 +426,14 @@ class ReasoningEngineMetadataRequestTest {
         ReasoningPlanner fakePlanner = new ReasoningPlanner(null, null) {
             @Override
             public StepPlan nextStep(String question, String schemaCtx, EvidenceStore evidence) {
-                plannerCalls.incrementAndGet();
-                return new StepPlan("normal step", "SELECT id FROM orders", CONN, "", "r");
+                int call = plannerCalls.incrementAndGet();
+                if (call == 1) return new StepPlan("normal step", "SELECT id FROM orders", CONN, "", "r");
+                // Loop-control fix (chart-hint architecture investigation, 2026-09): once the
+                // evaluator marks the step SUFFICIENT, the engine gives the Planner one bounded
+                // extra opportunity to add an optional supplementary step before concluding —
+                // this fake, like a real well-behaved planner, says done rather than repeating
+                // the same query.
+                return null;
             }
         };
         ReasoningEvaluator fakeEvaluator = new ReasoningEvaluator(null, null) {
@@ -430,7 +454,9 @@ class ReasoningEngineMetadataRequestTest {
                 "q", "q", "rsession", "schema context", "run-1", "user@test.com",
                 false, null, null, false, "conv-1", null, null, resolvedContract());
 
-        assertEquals(1, plannerCalls.get());
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): one bounded extra
+        // post-sufficiency Planner call, yielding no further execution.
+        assertEquals(2, plannerCalls.get());
         assertEquals(1, executions.get());
     }
 }

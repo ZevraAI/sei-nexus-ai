@@ -46,7 +46,22 @@ public final class EvidenceStore {
             String                       evaluatorRationale,
             String                       plannerRationale,
             Instant                      executedAt,
-            long                         executionMs
+            long                         executionMs,
+            // Optional LLM-declared chart hint for THIS step's own result, carried through
+            // verbatim from ReasoningPlanner.StepPlan (see its javadoc) — null/empty unless the
+            // planner explicitly declared one. Never Java-inferred; Java's only later use of these
+            // is a mechanical existence check against this step's own rows (see
+            // ResponseArtifactsBuilder.evidence()).
+            String                       chartType,
+            String                       categoryKey,
+            List<String>                 valueKeys,
+            // Optional, purely presentational LLM-authored labels for the chart hint fields above
+            // — see ReasoningPlanner.SYSTEM_PROMPT's OPTIONAL HUMAN-READABLE LABELS guidance.
+            // Never Java-derived, never Java-interpreted; relayed verbatim. Null/empty when the
+            // planner didn't declare one.
+            String                       categoryLabel,
+            List<String>                 valueLabels,
+            String                       metricLabel
     ) {}
 
     private final List<StepEvidence> steps = new ArrayList<>();
@@ -62,11 +77,43 @@ public final class EvidenceStore {
     public void add(int stepNo, String description, String sql, String connectionKey,
                     List<Map<String, Object>> rows, String plannerRationale,
                     String evaluatorDecision, String evaluatorRationale, long executionMs) {
+        add(stepNo, description, sql, connectionKey, rows, plannerRationale,
+                evaluatorDecision, evaluatorRationale, executionMs, null, null, List.of());
+    }
+
+    /**
+     * As the 9-arg {@link #add}, additionally carrying the planner's optional LLM-declared chart
+     * hint for this step (see {@code ReasoningPlanner.StepPlan}) verbatim — {@code chartType}/
+     * {@code categoryKey}/{@code valueKeys} are null/empty when the planner didn't declare one.
+     * Never Java-inferred here.
+     */
+    public void add(int stepNo, String description, String sql, String connectionKey,
+                    List<Map<String, Object>> rows, String plannerRationale,
+                    String evaluatorDecision, String evaluatorRationale, long executionMs,
+                    String chartType, String categoryKey, List<String> valueKeys) {
+        add(stepNo, description, sql, connectionKey, rows, plannerRationale,
+                evaluatorDecision, evaluatorRationale, executionMs, chartType, categoryKey, valueKeys,
+                null, List.of(), null);
+    }
+
+    /**
+     * As the 12-arg {@link #add}, additionally carrying the planner's optional, purely
+     * presentational LLM-authored labels for the chart hint fields (see {@code
+     * ReasoningPlanner.SYSTEM_PROMPT}'s OPTIONAL HUMAN-READABLE LABELS guidance) — null/empty
+     * when the planner didn't declare any. Never Java-derived.
+     */
+    public void add(int stepNo, String description, String sql, String connectionKey,
+                    List<Map<String, Object>> rows, String plannerRationale,
+                    String evaluatorDecision, String evaluatorRationale, long executionMs,
+                    String chartType, String categoryKey, List<String> valueKeys,
+                    String categoryLabel, List<String> valueLabels, String metricLabel) {
         steps.add(new StepEvidence(
                 stepNo, description, sql, connectionKey,
                 rows, buildRowSummary(rows),
                 OUTCOME_QUERY_SUCCEEDED, evaluatorDecision, evaluatorRationale, plannerRationale,
-                Instant.now(), executionMs));
+                Instant.now(), executionMs,
+                chartType, categoryKey, valueKeys == null ? List.of() : valueKeys,
+                categoryLabel, valueLabels == null ? List.of() : valueLabels, metricLabel));
     }
 
     /**
@@ -86,7 +133,7 @@ public final class EvidenceStore {
                 stepNo, description, sql == null ? "" : sql, connectionKey == null ? "" : connectionKey,
                 List.of(), detail,
                 outcome, null, detail, plannerRationale,
-                Instant.now(), executionMs));
+                Instant.now(), executionMs, null, null, List.of(), null, List.of(), null));
     }
 
     /**

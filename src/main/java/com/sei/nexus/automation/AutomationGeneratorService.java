@@ -87,6 +87,9 @@ public class AutomationGeneratorService {
                 Return only valid JSON — no markdown, no extra text.
                 """;
 
+        // Telemetry hardening (Phase 0): this call had no LlmCallTag. Distinct from the Step-2
+        // "generate full workflow graph" call below — different prompt/purpose, same class.
+        com.sei.nexus.ai.LlmCallTag.set("AUTOMATION_GENERATOR_ANALYZE");
         String raw = openAi.chatWithJson(
                 List.of(ChatMessage.user("Analyse this automation requirement:\n\n" + requirement)),
                 systemPrompt);
@@ -158,6 +161,9 @@ public class AutomationGeneratorService {
                 """.formatted(requirement, summary,
                 schemaCtx.isEmpty() ? "No schema provided — use trigger fields only." : schemaCtx);
 
+        // Telemetry hardening (Phase 0): this call had no LlmCallTag. Distinct from the Step-1
+        // "analyse requirement" call above.
+        com.sei.nexus.ai.LlmCallTag.set("AUTOMATION_GENERATOR_GENERATE");
         String raw = openAi.chatWithJson(
                 List.of(ChatMessage.user(userMessage)),
                 buildGenerationSystemPrompt());

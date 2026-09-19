@@ -27,8 +27,14 @@ class ReasoningPlannerMetadataRequestTest {
         String scriptedResponse;
         ScriptedAiClient() { super(new ObjectMapper(), null); }
         @Override
-        public String chat(List<ChatMessage> messages, String systemPrompt) {
+        public String respond(List<ChatMessage> messages, String systemPrompt) {
             return scriptedResponse;
+        }
+        // Phase 1 explicit prompt caching: Planner now calls respondForPlanner
+        // (prompt_cache_key="zevra:planner:v1") instead of respond.
+        @Override
+        public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
+            return respond(messages, systemPrompt);
         }
     }
 
@@ -283,9 +289,10 @@ class ReasoningPlannerMetadataRequestTest {
     void systemPromptPresentsSqlAndMetadataRequestAsTwoEquallyValidActions() throws Exception {
         String prompt = plannerSystemPrompt();
 
-        assertTrue(prompt.contains("choose exactly ONE of two equally valid actions"),
-                "the opening framing must present SQL and requires_metadata as co-equal actions, "
-                        + "not SQL as the default job with requires_metadata as a secondary exception");
+        assertTrue(prompt.contains("choose exactly ONE of three equally valid actions"),
+                "the opening framing must present SQL, requires_metadata, and clarification as "
+                        + "co-equal actions, not SQL as the default job with the others as secondary "
+                        + "exceptions");
         assertTrue(prompt.contains("only when you already have confirmed columns"),
                 "SQL must be explicitly gated on confirmed columns for every referenced table");
         assertTrue(prompt.contains("is not a shortcut to"),
@@ -331,7 +338,7 @@ class ReasoningPlannerMetadataRequestTest {
     @Test
     void actionFramingFixIsDomainNeutral() throws Exception {
         String prompt = plannerSystemPrompt();
-        int start = prompt.indexOf("Every turn, choose exactly ONE of two equally valid actions");
+        int start = prompt.indexOf("Every turn, choose exactly ONE of three equally valid actions");
         assertTrue(start >= 0);
         int end = prompt.indexOf("Rules:", start);
         String framing = prompt.substring(start, end).toLowerCase(java.util.Locale.ROOT);

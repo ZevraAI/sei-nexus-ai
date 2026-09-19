@@ -72,7 +72,11 @@ public class TermExtractor {
         try {
             String prompt = "Question: " + question + "\n\nSQL:\n" + truncate(sql, 1000);
             com.sei.nexus.ai.LlmCallTag.set("TERM_LEARNING_ASYNC");
-            String raw    = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
+            // Model tiering (pre-production cost optimization): structured term/SQL-pattern
+            // extraction from a fixed, narrow prompt is low-complexity — nexus.openai.term-extractor-model
+            // (defaults to gpt-4o-mini) instead of the core chat model. Prompt/parsing/error
+            // handling below are unchanged.
+            String raw    = aiClient.chatForTermExtraction(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json   = extractJsonArray(raw);
             List<Map<String, Object>> parsed = objectMapper.readValue(
                     json, new TypeReference<List<Map<String, Object>>>() {});

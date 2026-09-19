@@ -90,7 +90,13 @@ public class CorrectionDetector {
             // line attributes to correction detection rather than inheriting whatever tag was
             // last set on this (async learning) thread. No effect on the call itself.
             com.sei.nexus.ai.LlmCallTag.set("CORRECTION_DETECTION");
-            String raw  = aiClient.chat(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
+            // Model tiering (pre-production cost optimization): evaluated for gpt-4o-mini via
+            // nexus.openai.correction-detector-model, but live evaluation found it unsuitable
+            // (misclassified plain follow-ups as corrections) — the property defaults to gpt-4o,
+            // so this call stays on the core model for now. Prompt/parsing/error handling below
+            // are unchanged; chatForCorrectionDetection exists so this can be retuned independently
+            // later without touching this call site again.
+            String raw  = aiClient.chatForCorrectionDetection(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
             String json = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 

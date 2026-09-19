@@ -67,7 +67,7 @@ class ResponseArtifactsBuilderTest {
         assertNull(a.recommendation());
         assertTrue(a.keyFindings().isEmpty());
         assertTrue(a.relatedFacts().isEmpty());
-        assertTrue(a.nextSteps().isEmpty());
+        assertTrue(a.followUpQuestions().isEmpty());
         assertTrue(a.evidence().isEmpty());
         assertTrue(a.metrics().isEmpty());
         assertTrue(a.trail().isEmpty());
@@ -94,12 +94,49 @@ class ResponseArtifactsBuilderTest {
         assertEquals(List.of("value"), chart.yKeys());
 
         assertEquals(3, a.metrics().size());
-        assertEquals("results", a.metrics().get(0).label());
+        // "Results" — Title Case, consistent with every other metric label (previously the only
+        // lowercase label in the strip; see ResponseArtifactsBuilder#titleCase applied here).
+        assertEquals("Results", a.metrics().get(0).label());
         assertEquals("3", a.metrics().get(0).value());
-        assertEquals("total value", a.metrics().get(1).label());
+        // No LLM-declared metric/value label was available for this dataset (no matching
+        // investigationDatasets hint) — labels fall back to the mechanical, meaning-blind
+        // Title Case transform (see ResponseArtifactsBuilder#titleCase), never the raw column
+        // alias verbatim (the exact production defect this fallback change fixes).
+        assertEquals("Total Value", a.metrics().get(1).label());
         assertEquals("350", a.metrics().get(1).value());
-        assertEquals("distinct supplier", a.metrics().get(2).label());
+        // "Distinct Suppliers" — this metric counts DISTINCT values, so the mechanical fallback
+        // now pluralizes the column name via standard suffix rules (see
+        // ResponseArtifactsBuilder#pluralize) before title-casing it, rather than the
+        // grammatically-off singular "Distinct Supplier".
+        assertEquals("Distinct Suppliers", a.metrics().get(2).label());
         assertEquals("2", a.metrics().get(2).value());
+    }
+
+    // LLM-authored metric labels (OPTIONAL HUMAN-READABLE LABELS guidance): when the same rows
+    // also appear as an investigationDatasets entry carrying category_label/value_labels, those
+    // verbatim LLM-authored labels are preferred over the mechanical Title Case fallback — Java
+    // performs no lookup, no domain inference, only a mechanical existence/length check before
+    // relaying the model's own strings.
+    @Test
+    void llmAuthoredValueAndCategoryLabelsArePreferredOverMechanicalFallback() {
+        List<Map<String, Object>> rows = List.of(
+                row("status", "OPEN", "order_count", 7),
+                row("status", "PARTIALLY_RECEIVED", "order_count", 3));
+
+        Map<String, Object> ds = row(
+                "stepNo", 1, "description", "Breakdown", "rows", rows,
+                "chartType", "bar", "categoryKey", "status", "categoryLabel", "Order Status",
+                "valueKeys", List.of("order_count"), "valueLabels", List.of("Order Count"),
+                "metricLabel", null);
+
+        ResponseArtifacts a = ResponseArtifactsBuilder.build(
+                "Group orders by status", "Most orders are open.",
+                List.of(), rows, List.of(ds), List.of(), null, null);
+
+        var totalMetric = a.metrics().stream()
+                .filter(m -> m.label().startsWith("Total")).findFirst().orElseThrow();
+        assertEquals("Total Order Count", totalMetric.label(),
+                "the model's own value_labels entry must be used verbatim, not the raw 'order_count' alias");
     }
 
     @Test
@@ -178,8 +215,8 @@ class ResponseArtifactsBuilderTest {
     }
 
     // quickRefinements is a SEPARATE tactical-actions concept, transported directly via
-    // ChatResponse#quickRefinements — it must never be merged into nextSteps, which is
-    // exclusively Agent Brain's own decision. An empty model nextSteps is an honest "no next
+    // ChatResponse#quickRefinements — it must never be merged into followUpQuestions, which is
+    // exclusively Agent Brain's own decision. An empty model followUpQuestions is an honest "no
     // step" signal, not a trigger to substitute Java's canned tactical actions.
     @Test
     void quickRefinementsAreNeverMergedIntoNextStepsEvenWhenModelNextStepsIsEmpty() {
@@ -190,9 +227,9 @@ class ResponseArtifactsBuilderTest {
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "Show orders", "Here are the open orders.", List.of(), List.of(), List.of(), quickRefs, null, null);
 
-        assertTrue(a.nextSteps().isEmpty(),
-                "quickRefinements must never populate nextSteps — an absent llmSemantics/empty "
-                        + "model nextSteps must stay empty, not be silently replaced");
+        assertTrue(a.followUpQuestions().isEmpty(),
+                "quickRefinements must never populate followUpQuestions — an absent llmSemantics/empty "
+                        + "model followUpQuestions must stay empty, not be silently replaced");
     }
 
     @Test
@@ -205,8 +242,8 @@ class ResponseArtifactsBuilderTest {
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "Show orders", "answer", List.of(), List.of(), List.of(), quickRefs, null, semantics);
 
-        assertTrue(a.nextSteps().isEmpty(),
-                "the model explicitly provided an empty nextSteps list — that must be honored "
+        assertTrue(a.followUpQuestions().isEmpty(),
+                "the model explicitly provided an empty followUpQuestions list — that must be honored "
                         + "as-is, never backfilled from quickRefinements");
     }
 
@@ -351,9 +388,9 @@ class ResponseArtifactsBuilderTest {
         assertEquals(semantics.keyFindings(), a.keyFindings());
         assertEquals(semantics.relatedFacts(), a.relatedFacts());
         assertEquals(semantics.recommendation(), a.recommendation());
-        assertEquals(2, a.nextSteps().size());
-        assertEquals("Show only partially received orders", a.nextSteps().get(0).label());
-        assertEquals("Show only partially received orders", a.nextSteps().get(0).prompt(),
+        assertEquals(2, a.followUpQuestions().size());
+        assertEquals("Show only partially received orders", a.followUpQuestions().get(0).label());
+        assertEquals("Show only partially received orders", a.followUpQuestions().get(0).prompt(),
                 "a plain-text LLM next step is used as both label and prompt — clicking it asks that literal question");
     }
 
@@ -423,7 +460,7 @@ class ResponseArtifactsBuilderTest {
         assertEquals("understanding", a.understanding());
         assertTrue(a.keyFindings().isEmpty());
         assertTrue(a.relatedFacts().isEmpty());
-        assertTrue(a.nextSteps().isEmpty());
+        assertTrue(a.followUpQuestions().isEmpty());
     }
 
     // 6. Agent response — same artifact contract as direct chat, sourced from the agent's own
@@ -451,8 +488,8 @@ class ResponseArtifactsBuilderTest {
         assertEquals(agentSemantics.keyFindings(), a.keyFindings());
         assertEquals(agentSemantics.relatedFacts(), a.relatedFacts());
         assertEquals(agentSemantics.recommendation(), a.recommendation());
-        assertEquals(1, a.nextSteps().size());
-        assertEquals("Compare against contract SLAs", a.nextSteps().get(0).label());
+        assertEquals(1, a.followUpQuestions().size());
+        assertEquals("Compare against contract SLAs", a.followUpQuestions().get(0).label());
         assertEquals("Supply Chain Agent", a.agentContext().agentName(), "agentContext stays runtime-owned, unaffected by llmSemantics");
         assertEquals(1, a.trail().size(), "trail stays runtime-owned, normalized from reasoningSteps regardless of llmSemantics");
     }
@@ -476,7 +513,7 @@ class ResponseArtifactsBuilderTest {
         assertEquals(semantics.understanding(), a.understanding());
         assertEquals(semantics.keyFindings(), a.keyFindings());
         assertEquals(semantics.recommendation(), a.recommendation());
-        assertEquals(2, a.nextSteps().size());
+        assertEquals(2, a.followUpQuestions().size());
     }
 
     // 8. Legacy response — no llmSemantics at all (an older code path / non-data outcome) still
@@ -493,10 +530,14 @@ class ResponseArtifactsBuilderTest {
         assertNotNull(a.recommendation());
     }
 
-    // 9. Deterministic evidence — metrics/chart/data evidence remain runtime-derived from
-    //    queryData regardless of llmSemantics; the model has no influence over them at all.
+    // 9. Deterministic evidence — chart/data evidence remains runtime-derived from queryData
+    //    regardless of llmSemantics; the model has no influence over it at all. Metrics are the
+    //    one exception (see the "LLM-authored metrics" tests below) — but ONLY when the model
+    //    actually supplies a non-empty metrics list; a StructuredAnswer whose metrics() is empty
+    //    (e.g. this one, built via the pre-metrics 6-arg constructor) still falls through to the
+    //    exact same mechanical computation as llmSemantics == null.
     @Test
-    void evidenceAndMetricsRemainRuntimeDerivedRegardlessOfLlmSemantics() {
+    void evidenceAlwaysRuntimeDerivedAndMetricsFallBackWhenLlmSuppliesNoMetrics() {
         List<Map<String, Object>> rows = List.of(
                 row("supplier", "Acme", "value", 100),
                 row("supplier", "Globex", "value", 200));
@@ -511,7 +552,56 @@ class ResponseArtifactsBuilderTest {
         assertEquals(withoutLlm.evidence(), withLlm.evidence(),
                 "evidence is computed from queryData only — identical regardless of llmSemantics");
         assertEquals(withoutLlm.metrics(), withLlm.metrics(),
-                "metrics are computed from queryData only — identical regardless of llmSemantics");
+                "an empty LLM metrics list falls back to the same mechanical computation as no llmSemantics at all");
+        assertFalse(withoutLlm.metrics().isEmpty(), "sanity: the mechanical fallback itself produced metrics here");
+    }
+
+    // 10. LLM-authored metrics take precedence outright over the mechanical row-count/distinct-
+    //     count computation when the model supplies a non-empty "metrics" list — Java relays
+    //     label/value verbatim, performing zero interpretation, and does NOT also compute or
+    //     append the mechanical figures alongside them.
+    @Test
+    void llmAuthoredMetricsTakePrecedenceOverMechanicalFallbackWhenPresent() {
+        List<Map<String, Object>> rows = List.of(
+                row("supplier", "Acme", "value", 100),
+                row("supplier", "Globex", "value", 200));
+        StructuredAnswer semantics = new StructuredAnswer("answer", List.of(), "understanding",
+                List.of(), List.of(), null, List.of(),
+                List.of(new StructuredAnswer.Metric("Top Buyer", "Marcus Webb"),
+                        new StructuredAnswer.Metric("Total Value", "$373,750"),
+                        new StructuredAnswer.Metric("Earliest Delivery", "Oct 3, 2025")));
+
+        ResponseArtifacts a = ResponseArtifactsBuilder.build(
+                "q", "answer", List.of(), rows, List.of(), List.of(), null, semantics);
+
+        assertEquals(3, a.metrics().size());
+        assertEquals("Top Buyer", a.metrics().get(0).label());
+        assertEquals("Marcus Webb", a.metrics().get(0).value());
+        assertEquals("Total Value", a.metrics().get(1).label());
+        assertEquals("$373,750", a.metrics().get(1).value());
+        assertEquals("Earliest Delivery", a.metrics().get(2).label());
+        assertEquals("Oct 3, 2025", a.metrics().get(2).value());
+        // Never blended with the mechanical "Results"/"Total Value"(column)/"Distinct ..." tiles —
+        // the model's own list wins outright, exactly as understanding/keyFindings/etc. do.
+        assertTrue(a.metrics().stream().noneMatch(m -> "Results".equals(m.label())));
+    }
+
+    // 11. The mechanical fallback still works exactly as before when llmSemantics is null
+    //     entirely (a response that never went through structured composition) — the LLM-metrics
+    //     addition never removes this safety net.
+    @Test
+    void mechanicalMetricsFallbackStillWorksWhenLlmSemanticsIsAbsentEntirely() {
+        List<Map<String, Object>> rows = List.of(
+                row("status", "OPEN", "amount", 100),
+                row("status", "CLOSED", "amount", 200),
+                row("status", "OPEN", "amount", 300));
+
+        ResponseArtifacts a = ResponseArtifactsBuilder.build(
+                "q", "answer", List.of(), rows, List.of(), List.of(), null, null);
+
+        assertFalse(a.metrics().isEmpty());
+        assertEquals("Results", a.metrics().get(0).label());
+        assertEquals("3", a.metrics().get(0).value());
     }
 
     // 10. No additional LLM call — structural, not runtime-observable: build() takes an
@@ -534,10 +624,10 @@ class ResponseArtifactsBuilderTest {
     void resolvedSectionsAreCarriedThroughUnchanged() {
         List<ResponseArtifacts.Section> sections = List.of(
                 new ResponseArtifacts.Section("DATASET", "Open Orders", "Shows open orders", true,
-                        null, null, List.of(new ResponseArtifacts.Section.ResolvedDataset(
-                                1, List.of(row("po", "PO-1"))))),
+                        null, null, null, List.of(new ResponseArtifacts.Section.ResolvedDataset(
+                                1, List.of(row("po", "PO-1")), 1))),
                 new ResponseArtifacts.Section("FINDINGS", "Key Findings", null, null,
-                        List.of("finding one"), null, List.of()));
+                        List.of("finding one"), null, null, List.of()));
 
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "q", "a", List.of(), List.of(), List.of(), List.of(), null, null, sections);
@@ -554,9 +644,9 @@ class ResponseArtifactsBuilderTest {
     void resolvedSectionCanCarryMultipleGroundingDatasetsPreservedSeparately() {
         List<ResponseArtifacts.Section> sections = List.of(
                 new ResponseArtifacts.Section("HIGHLIGHT", "Most Ordered Item", "...", null, null,
-                        "Widget A has 1,500 units ordered.",
-                        List.of(new ResponseArtifacts.Section.ResolvedDataset(3, List.of(row("qty", 1500))),
-                                new ResponseArtifacts.Section.ResolvedDataset(5, List.of(row("name", "Widget A"))))));
+                        "Widget A has 1,500 units ordered.", null,
+                        List.of(new ResponseArtifacts.Section.ResolvedDataset(3, List.of(row("qty", 1500)), 1),
+                                new ResponseArtifacts.Section.ResolvedDataset(5, List.of(row("name", "Widget A")), 1))));
 
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "q", "a", List.of(), List.of(), List.of(), List.of(), null, null, sections);

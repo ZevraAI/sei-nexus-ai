@@ -151,6 +151,9 @@ public class PackEntityMapper {
                   .append(" (aliases: ").append(String.join(", ", safeList(e.aliases()))).append(")\n");
         }
 
+        // Telemetry hardening (Phase 0): this call had no LlmCallTag — distinct from
+        // IndustryPackService's own "PACK_CONCEPT_CLASSIFICATION" tag (a different call site).
+        com.sei.nexus.ai.LlmCallTag.set("PACK_ENTITY_MAPPING");
         String raw = aiClient.chat(List.of(ChatMessage.user(prompt.toString())), SYSTEM_PROMPT);
         String json = extractJson(raw);
         Map<String, String> parsed = objectMapper.readValue(json, new TypeReference<Map<String, String>>() {});

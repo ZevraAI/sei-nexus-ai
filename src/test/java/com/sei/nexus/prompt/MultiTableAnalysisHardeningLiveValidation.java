@@ -94,6 +94,14 @@ class MultiTableAnalysisHardeningLiveValidation {
             calls.incrementAndGet();
             return real.chatWithJson(messages, systemPrompt);
         }
+
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            calls.incrementAndGet();
+            return real.chatWithJsonForOnboarding(messages, systemPrompt);
+        }
     }
 
     /** Discovers the connection's real physical table list live — never hardcoded/stale. */

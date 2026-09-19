@@ -77,6 +77,15 @@ class BusinessObjectSemanticGroundingLiveValidation {
             lastUserMessage = messages.get(0).content();
             return real.chatWithJson(messages, systemPrompt);
         }
+
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            calls.incrementAndGet();
+            lastUserMessage = messages.get(0).content();
+            return real.chatWithJsonForOnboarding(messages, systemPrompt);
+        }
     }
 
     /** Wraps the real DynamicSqlService but strips comments (real columns/udt untouched) — isolates

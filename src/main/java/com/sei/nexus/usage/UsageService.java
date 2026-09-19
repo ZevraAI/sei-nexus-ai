@@ -47,7 +47,7 @@ public class UsageService {
      * Silently swallows errors — usage tracking must never break the main flow.
      */
     public void record(String model, int promptTokens, int completionTokens) {
-        record(model, promptTokens, completionTokens, 0);
+        record(model, promptTokens, completionTokens, 0, null);
     }
 
     /**
@@ -59,12 +59,28 @@ public class UsageService {
      * report it) — never added on top of it.
      */
     public void record(String model, int promptTokens, int completionTokens, int cachedTokens) {
+        record(model, promptTokens, completionTokens, cachedTokens, null);
+    }
+
+    /**
+     * Same as {@link #record(String, int, int, int)}, additionally given the call site's {@link
+     * com.sei.nexus.ai.LlmCallTag} label (e.g. {@code "PLANNER"}, {@code "ANSWER_COMPOSER"},
+     * {@code "MEMORY_SELECTION"}) so per-call-type cost/token breakdowns (finer-grained than the
+     * existing {@code feature} column) can be queried later — see {@link
+     * UsageRepository#summaryByCallType} / {@link UsageRepository#platformByCallType}.
+     *
+     * @param callType the caller's current {@code LlmCallTag}, or {@code null}/blank when the
+     *                 caller has none to report — persisted as SQL {@code NULL}, never inferred
+     *                 or guessed from {@code model}/{@code feature}/prompt content.
+     */
+    public void record(String model, int promptTokens, int completionTokens, int cachedTokens, String callType) {
         try {
             UsageContext.Ctx ctx = UsageContext.get();
             String feature   = ctx != null ? ctx.feature()   : "chat";
             String userEmail = ctx != null ? ctx.userEmail()  : null;
             String agentName = ctx != null ? ctx.agentName()  : null;
             String schema    = TenantContext.getSchema();
+            String type      = (callType != null && !callType.isBlank()) ? callType : null;
 
             double[] price      = PRICING.getOrDefault(model, PRICING.get("gpt-4o"));
             int      cached     = Math.min(Math.max(cachedTokens, 0), promptTokens);
@@ -74,7 +90,7 @@ public class UsageService {
                                  + completionTokens * price[1];
 
             repo.insert(schema, userEmail, feature, agentName,
-                        model, promptTokens, completionTokens, costUsd);
+                        model, promptTokens, completionTokens, costUsd, cached, type);
         } catch (Exception e) {
             log.debug("Usage recording failed (non-fatal): {}", e.getMessage());
         }
@@ -88,6 +104,7 @@ public class UsageService {
         result.put("period",       p);
         result.put("totals",       repo.tenantMonthlyCost(tenantSchema, p));
         result.put("by_feature",   repo.summaryByFeature(tenantSchema, p));
+        result.put("by_call_type", repo.summaryByCallType(tenantSchema, p));
         result.put("by_user",      repo.summaryByUser(tenantSchema, p));
         result.put("by_agent",     repo.summaryByAgent(tenantSchema, p));
         result.put("daily",        repo.dailyTotals(tenantSchema, p));
@@ -101,6 +118,7 @@ public class UsageService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("period",        p);
         result.put("by_tenant",     repo.allTenantsSummary(p));
+        result.put("by_call_type",  repo.platformByCallType(p));
         result.put("daily",         repo.platformDailyTotals(p));
         return result;
     }

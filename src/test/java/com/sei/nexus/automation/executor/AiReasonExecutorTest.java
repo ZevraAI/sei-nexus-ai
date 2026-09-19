@@ -28,11 +28,16 @@ class AiReasonExecutorTest {
         boolean fail = false;
         String jsonReturn = "{\"ok\":true}";
         FakeAi() { super(new ObjectMapper(), null); }
-        @Override public String chat(List<ChatMessage> messages, String systemPrompt) {
-            usedMethod = "chat"; return record(messages, systemPrompt, "plain text answer");
+        @Override public String respond(List<ChatMessage> messages, String systemPrompt) {
+            usedMethod = "respond"; return record(messages, systemPrompt, "plain text answer");
         }
-        @Override public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
-            usedMethod = "chatWithJson"; return record(messages, systemPrompt, jsonReturn);
+        // Phase 1 explicit prompt caching: NaturalLanguageComposer's TEXT mode now calls
+        // respondForComposer (prompt_cache_key="zevra:answer-composer:v1") instead of respond.
+        @Override public String respondForComposer(List<ChatMessage> messages, String systemPrompt) {
+            usedMethod = "respond"; return record(messages, systemPrompt, "plain text answer");
+        }
+        @Override public String respondWithJson(List<ChatMessage> messages, String systemPrompt) {
+            usedMethod = "respondWithJson"; return record(messages, systemPrompt, jsonReturn);
         }
         private String record(List<ChatMessage> messages, String systemPrompt, String out) {
             this.seenSystem = systemPrompt;
@@ -56,7 +61,7 @@ class AiReasonExecutorTest {
                 Map.of("userPrompt", "Summarize {{name}} status", "outputFormat", "text"), ctx);
 
         assertEquals("plain text answer", out);
-        assertEquals("chat", ai.usedMethod, "text output uses the plain chat method");
+        assertEquals("respond", ai.usedMethod, "text output uses the plain (non-JSON) response method");
         assertEquals("Summarize inventory status", ai.seenUser, "the {{variable}} template is resolved by the executor");
         assertEquals("You are a helpful assistant.", ai.seenSystem, "the executor's default text system prompt is preserved");
     }
@@ -67,7 +72,7 @@ class AiReasonExecutorTest {
         Object out = executor(ai).execute("n1",
                 Map.of("userPrompt", "give json", "outputFormat", "json"), new ExecutionContext());
 
-        assertEquals("chatWithJson", ai.usedMethod, "json output uses the json response method");
+        assertEquals("respondWithJson", ai.usedMethod, "json output uses the json response method");
         assertEquals("You are a helpful assistant. Respond in JSON.", ai.seenSystem, "the executor's default json system prompt is preserved");
         assertInstanceOf(Map.class, out);
         assertEquals(Boolean.TRUE, ((Map<?, ?>) out).get("ok"), "valid model JSON is parsed into a Map");

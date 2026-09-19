@@ -71,6 +71,8 @@ public class LlmExecutionStrategySelector implements ExecutionStrategySelector {
         }
 
         try {
+            // Telemetry hardening (Phase 0): this call had no LlmCallTag.
+            com.sei.nexus.ai.LlmCallTag.set("EXECUTION_STRATEGY_SELECTOR");
             String raw = openAi.chatWithJsonFast(
                     List.of(ChatMessage.user("Question: " + question)), SYSTEM_PROMPT);
             return parseAnalysis(raw, mapper);

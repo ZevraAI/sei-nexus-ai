@@ -54,6 +54,63 @@ class LiteralValidatorTest {
         assertTrue(r.valid());
     }
 
+    // ── Multi-value IN clause: one binding per value (the "open purchase orders" regression) ──
+
+    @Test
+    void multiValueInClauseWithOneDeclaredBindingPerValueAllPasses() {
+        // A business-concept term ("open") resolved to several legal values, declared correctly —
+        // one literal_binding per value, never one binding whose value is the whole clause.
+        Result r = LiteralValidator.validate(
+                "SELECT * FROM stores WHERE status IN ('open', 'closed')",
+                List.of(new LiteralBinding("open", "stores.status", "open"),
+                        new LiteralBinding("open", "stores.status", "closed")),
+                scope(), "show me all open stores");
+
+        assertTrue(r.valid());
+    }
+
+    @Test
+    void multiValueInClauseDeclaredAsOneBindingForTheWholeClauseIsAViolation() {
+        // The exact malformed shape that caused the regression: the model declares a SINGLE
+        // literal_binding whose "value" is the entire raw IN (...) clause text instead of one
+        // binding per value — every value inside is individually legal, but the declared binding
+        // itself is not a legal value of the column, so it is correctly rejected. This proves the
+        // validator's own logic was never the bug: it faithfully rejects whatever is declared.
+        Result r = LiteralValidator.validate(
+                "SELECT * FROM stores WHERE status IN ('open', 'closed')",
+                List.of(new LiteralBinding("open stores",
+                        "stores.status", "status IN ('open', 'closed')")),
+                scope(), "show me all open stores");
+
+        assertEquals(1, r.violations().size());
+        assertEquals("status IN ('open', 'closed')", r.violations().get(0).literal());
+    }
+
+    @Test
+    void multiValueInClauseWithoutAnyDeclaredBindingsStillValidatesEachValueFromSqlText() {
+        // Omitting literal_bindings entirely for a multi-value IN clause is also correct — the
+        // deterministic SQL-text extraction path (defense in depth) already validates each value
+        // in the list independently, so an all-legal IN list passes with zero declared bindings.
+        assertTrue(LiteralValidator.validate(
+                "SELECT * FROM stores WHERE status IN ('open', 'closed')",
+                List.of(), scope(), "show me all open and closed stores").valid());
+    }
+
+    @Test
+    void multiValueInClauseWithOneGenuinelyIllegalValueIsStillRejected() {
+        // The gate must still correctly reject a real illegal value inside a multi-value list —
+        // fixing the false-positive on legal values must never weaken this.
+        Result r = LiteralValidator.validate(
+                "SELECT * FROM stores WHERE status IN ('open', 'archived')",
+                List.of(new LiteralBinding("open", "stores.status", "open"),
+                        new LiteralBinding("shut", "stores.status", "archived")),
+                scope(), "show me all open and shut stores");
+
+        assertEquals(1, r.violations().size());
+        assertEquals("archived", r.violations().get(0).literal());
+        assertTrue(r.violations().get(0).authoritative());
+    }
+
     @Test
     void bindingToNonExistentValueIsViolationWithLegalList() {
         // The model kept the user's abbreviation instead of choosing a stored value

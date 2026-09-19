@@ -75,7 +75,8 @@ class OpenPurchaseOrdersClarificationLearningRealTenantValidation {
         CorrectionDetector correctionDetector = new CorrectionDetector(aiClient, objectMapper);
         SemanticLearningService learningService = new SemanticLearningService(
                 termExtractor, correctionDetector, mappingRepository, correctionRepository,
-                runRepository, tenantRepository, semanticService);
+                runRepository, tenantRepository, semanticService,
+                new com.sei.nexus.reasoning.ReasoningRepository(jdbc));
 
         Tenant tenant = tenantRepository.findBySlug(TENANT_SLUG).orElseThrow();
         String schema = tenant.schemaName();
@@ -108,20 +109,23 @@ class OpenPurchaseOrdersClarificationLearningRealTenantValidation {
             Integer countBefore = jdbc.queryForObject("SELECT COUNT(*) FROM nexus_learned_mapping", Integer.class);
             System.out.println("\nnexus_learned_mapping count BEFORE = " + countBefore);
 
-            // ── Step 3: the REAL, unmodified learnFromRun(), called directly (bypasses only the
-            //    Spring @Async proxy — the learning LOGIC itself is completely unmodified) ──────
-            System.out.println("\n=== STEP 2: SemanticLearningService.learnFromRun(...) — the real production method ===");
+            // ── Step 3: the REAL, unmodified dispatch(LearningEvent), called directly (bypasses
+            //    only the Spring @Async proxy — the learning LOGIC itself is completely
+            //    unmodified). Post-refactor, this scenario (an answer immediately following a
+            //    clarification request) is exactly a CLARIFICATION_RESOLUTION Learning Event. ──
+            System.out.println("\n=== STEP 2: SemanticLearningService.dispatch(LearningEvent) — the real production method ===");
             System.out.println("runKey=" + runKey + " question=" + turn2Question + " domainKey=" + domainKey
                     + " conversationId=" + conversationId);
             Exception thrown = null;
             try {
-                learningService.learnFromRun(runKey, turn2Question, turn2Sql, domainKey, conversationId);
+                learningService.dispatch(new LearningEvent(LearningEvent.Source.CLARIFICATION_RESOLUTION,
+                        turn2Question, turn2Sql, domainKey, List.of(), runKey, conversationId));
             } catch (Exception e) {
                 thrown = e;
-                System.out.println("learnFromRun THREW (should not happen — method catches internally): " + e);
+                System.out.println("dispatch THREW (should not happen — method catches internally): " + e);
                 e.printStackTrace();
             }
-            System.out.println("learnFromRun returned normally=" + (thrown == null));
+            System.out.println("dispatch returned normally=" + (thrown == null));
 
             // ── Step 4: count AFTER + actual persisted rows ──────────────────────────────────
             Integer countAfter = jdbc.queryForObject("SELECT COUNT(*) FROM nexus_learned_mapping", Integer.class);

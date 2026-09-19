@@ -93,6 +93,13 @@ class ConnectionScopedPackSemanticAssignmentLifecycleTest {
 
         ScriptedAiClient() { super(new ObjectMapper(), null); }
 
+        // Model tiering (pre-production cost optimization): BusinessObjectBatchAnalyzer now calls
+        // chatWithJsonForOnboarding (nexus.openai.onboarding-model) instead of chatWithJson.
+        @Override
+        public String chatWithJsonForOnboarding(List<ChatMessage> messages, String systemPrompt) {
+            return chatWithJson(messages, systemPrompt);
+        }
+
         @Override
         public String chatWithJson(List<ChatMessage> messages, String systemPrompt) {
             StringBuilder json = new StringBuilder("{\"tables\":[");

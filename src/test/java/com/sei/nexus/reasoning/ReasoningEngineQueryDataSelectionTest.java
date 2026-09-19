@@ -92,7 +92,15 @@ class ReasoningEngineQueryDataSelectionTest {
                 question, question, "rsession-test", "schema context", "run-test", "user@test.com",
                 false, null, null, false, "conv-test", null, null, null);
 
-        assertEquals(2, plannerCalls.get());
+        // Loop-control fix (chart-hint architecture investigation, 2026-09): once the evaluator
+        // marks a step SUFFICIENT, the engine now gives the Planner one bounded extra
+        // opportunity to add its own optional supplementary step (see ReasoningEngine#reason's
+        // loop-control comment) before concluding — so the fake planner is invoked once more
+        // (call 3) than before this fix, returns null (its own "done"), and the loop ends with
+        // no additional executed step. This is the deliberate behavior change under investigation
+        // in this turn, not a regression: previously the Planner was never re-consulted at all
+        // once sufficiency was reached.
+        assertEquals(3, plannerCalls.get());
 
         // The SUFFICIENT step (Step 2, the purchase order) must be shown — not Step 1's product id,
         // even though both steps returned exactly one row.

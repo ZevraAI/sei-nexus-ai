@@ -64,11 +64,16 @@ class ChatServiceConversationMemoryTest {
         final AtomicInteger callCount = new AtomicInteger();
         String lastSystemPrompt;
         FakeAzureOpenAiClient() { super(new ObjectMapper(), null); }
-        @Override public String chat(List<ChatMessage> messages, String systemPrompt) {
+        @Override public String respond(List<ChatMessage> messages, String systemPrompt) {
             callCount.incrementAndGet();
             lastSystemPrompt = systemPrompt;
             if (throwOnCall) throw new RuntimeException("simulated LLM failure");
             return canned;
+        }
+        // Model tiering (pre-production cost optimization): ChatService.buildMemorySelectionContext
+        // now calls respondForMemorySelection (nexus.openai.memory-selection-model) instead of respond.
+        @Override public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt) {
+            return respond(messages, systemPrompt);
         }
     }
 

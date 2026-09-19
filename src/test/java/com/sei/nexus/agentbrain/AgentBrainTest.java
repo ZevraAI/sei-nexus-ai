@@ -52,6 +52,10 @@ class AgentBrainTest {
      *  ConceptScopedMetadataResolverTest}) is what's under test here. */
     static class FakeConceptResolver extends ConceptScopedMetadataResolver {
         Map<String, java.util.Optional<List<String>>> resultByConnection = new java.util.HashMap<>();
+        // Concept-Key Semantic Anchor design: the raw Stage 1 concept_key selection, scripted
+        // independently of resultByConnection (Stage 2's resolved object keys) — mirrors how the
+        // real resolver exposes the two via separate methods on the same underlying Stage 1 call.
+        Map<String, java.util.Optional<List<String>>> conceptKeysByConnection = new java.util.HashMap<>();
         List<String> seenConnectionKeys = new java.util.ArrayList<>();
         String seenQuestion;
         String seenConversationId;
@@ -61,6 +65,9 @@ class AgentBrainTest {
             seenQuestion = question;
             seenConversationId = conversationId;
             return resultByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
+        }
+        @Override public java.util.Optional<List<String>> resolveConceptKeys(String connectionKey, String question, String conversationId) {
+            return conceptKeysByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
         }
     }
 
@@ -666,5 +673,198 @@ class AgentBrainTest {
                 "assembleByDomains is called to compute execution-authorization scope even when "
                         + "every connection qualified for narrowing");
         assertTrue(model.executionScope().isPresent());
+    }
+
+    // ── Concept-Key Semantic Anchor design — ResolvedBusinessModel#resolvedConceptKeys() ────
+    // (the durable concept identity Stage 1 already selected, carried through so a downstream,
+    // exact-key lookup can retrieve concept-scoped learned-knowledge evidence — see
+    // LearnedMappingRepository#findPromotedByConceptKeys. Java never rederives or chooses among
+    // these keys itself; they are relayed verbatim from Stage 1's own validated selection.)
+
+    @Test
+    void stage1SelectedConceptKeysSurviveOntoResolvedBusinessModel() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        conceptResolver.conceptKeysByConnection.put("conn-1", java.util.Optional.of(List.of("purchase-order")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "show me all open orders");
+
+        assertEquals(List.of("purchase-order"), model.resolvedConceptKeys(),
+                "the exact concept_key(s) Stage 1 selected must survive, unmodified, onto the resolved model");
+    }
+
+    @Test
+    void resolvedConceptKeysAreDeduplicatedAcrossMultipleConnectionsWithoutReordering() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-a")));
+        conceptResolver.resultByConnection.put("conn-2", java.util.Optional.of(List.of("obj-b")));
+        conceptResolver.conceptKeysByConnection.put("conn-1", java.util.Optional.of(List.of("purchase-order")));
+        conceptResolver.conceptKeysByConnection.put("conn-2", java.util.Optional.of(List.of("purchase-order", "inventory-balance")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("purchase-order", "inventory-balance"), model.resolvedConceptKeys(),
+                "distinct, in encounter order — Java only deduplicates, it never reorders/ranks/chooses");
+    }
+
+    @Test
+    void resolvedConceptKeysDefaultToEmptyWhenTheResolverDoesNotSupplyThem() {
+        // Backward compatibility: a resolver that only overrides resolveObjectKeys (every
+        // pre-existing fake/caller in this file) must not break — resolvedConceptKeys defaults to
+        // empty rather than throwing or fabricating a value.
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1")), "how much stock do we have?");
+
+        assertTrue(model.resolvedConceptKeys().isEmpty());
+    }
+
+    @Test
+    void resolvedConceptKeysAreEmptyOnFallbackAndWhenNoResolverIsWired() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // no entry ⇒ Optional.empty()
+        AgentBrain brainWithResolver = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+        AgentBrain brainWithoutResolver = new AgentBrain(assembler, new FakeResolver());
+
+        assertTrue(brainWithResolver.resolve(agent(List.of("conn-1")), "how many orders")
+                .resolvedConceptKeys().isEmpty());
+        assertTrue(brainWithoutResolver.resolve(agent(List.of("conn-1")), "how many orders")
+                .resolvedConceptKeys().isEmpty());
+    }
+
+    // ── Concept-Level Disjunctive Ambiguity design ──────────────────────────────────────────
+    // (ResolvedBusinessModel#conceptAmbiguityClarification() — exercised through the LIVE
+    // ChatService call graph, i.e. the 6-arg resolve() overload with a non-null memoryAvailable,
+    // which dispatches to conceptScopedModelWithRouting(). The plain memoryAvailable==null
+    // overload (conceptScopedModel()) is a dead path for ChatService's own live traffic and is
+    // deliberately NOT exercised for ambiguity here — see AgentBrain's own resolve() javadoc.)
+
+    /** A fake concept resolver scripting {@code resolveObjectKeysWithRouting}'s full {@code
+     *  CombinedResolution} directly — the exact method the live routing call graph invokes. */
+    static class FakeRoutingConceptResolver extends ConceptScopedMetadataResolver {
+        Map<String, ConceptScopedMetadataResolver.CombinedResolution> resultByConnection = new java.util.HashMap<>();
+        List<String> seenConnectionKeys = new java.util.ArrayList<>();
+        FakeRoutingConceptResolver() { super(null, null, null, null); }
+        @Override
+        public ConceptScopedMetadataResolver.CombinedResolution resolveObjectKeysWithRouting(
+                String connectionKey, String question, String conversationId, boolean memoryAvailable) {
+            seenConnectionKeys.add(connectionKey);
+            return resultByConnection.getOrDefault(connectionKey, ConceptScopedMetadataResolver.CombinedResolution.EMPTY);
+        }
+    }
+
+    private static ConceptScopedMetadataResolver.CombinedResolution combined(
+            List<String> objectKeys, List<String> conceptKeys, String ambiguityClarification) {
+        return new ConceptScopedMetadataResolver.CombinedResolution(
+                java.util.Optional.of(objectKeys),
+                java.util.Optional.empty(),
+                java.util.Optional.of(conceptKeys),
+                ambiguityClarification == null ? java.util.Optional.empty() : java.util.Optional.of(ambiguityClarification));
+    }
+
+    // CASE 1 — SINGLE CONCEPT: unaffected, proceeds to metadata resolution exactly as today.
+    @Test
+    void singleConceptResolutionProceedsToObjectResolutionUnaffected() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1",
+                combined(List.of("obj-inv"), List.of("purchase-order"), null));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"), List.of(),
+                "show me open purchase orders", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isEmpty());
+        assertEquals(List.of("purchase-order"), model.resolvedConceptKeys());
+        assertEquals(List.of("obj-inv"), assembler.seenObjectKeys,
+                "Stage 2 / assembleByObjectKeys must run normally for a single resolved concept");
+        assertFalse(model.objects().isEmpty());
+        assertTrue(model.executionScope().isPresent());
+    }
+
+    // CASE 2 — MULTI-CONCEPT SPAN: both concepts proceed together, unaffected.
+    @Test
+    void multiConceptSpanProceedsWithBothConceptsUnaffected() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", combined(
+                List.of("obj-po", "obj-sales"), List.of("purchase-order", "sales-transaction"), null));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"), List.of(),
+                "compare purchase order spend with sales revenue", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isEmpty());
+        assertEquals(List.of("purchase-order", "sales-transaction"), model.resolvedConceptKeys());
+        assertEquals(List.of("obj-po", "obj-sales"), assembler.seenObjectKeys,
+                "both concepts' objects must be resolved together for a genuine multi-concept span");
+    }
+
+    // CASE 3 — MUTUALLY EXCLUSIVE AMBIGUITY: no physical object resolution at all.
+    @Test
+    void ambiguousResolutionNeverCallsAssembleByObjectKeysAndCarriesTheClarification() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", combined(
+                List.of(), List.of("purchase-order", "sales-transaction"),
+                "Do you mean purchase orders or sales orders?"));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"), List.of(),
+                "show me all open orders", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isPresent());
+        assertEquals("Do you mean purchase orders or sales orders?", model.conceptAmbiguityClarification().get());
+        assertNull(assembler.seenObjectKeys,
+                "assembleByObjectKeys must NEVER be called when Stage 1 signaled disjunctive ambiguity");
+        assertTrue(model.objects().isEmpty(), "no physical object may be approved for an unresolved ambiguity");
+        assertTrue(model.objectTargets().isEmpty());
+        assertTrue(model.executionScope().isPresent());
+        assertTrue(model.executionScope().get().objects().isEmpty(),
+                "execution-authorization scope must also stay empty — an ambiguity must never become executable scope");
+        // The candidate concepts are still carried, as evidence of what was ambiguous — Java
+        // neither drops them nor picks one.
+        assertEquals(List.of("purchase-order", "sales-transaction"), model.resolvedConceptKeys());
+    }
+
+    @Test
+    void ambiguousResolutionAcrossMultipleConnectionsUsesFirstSignalWins() {
+        // Mirrors this method's existing documented all-or-nothing/first-wins discipline for
+        // routing — the same principle now applies to the ambiguity signal.
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", combined(
+                List.of(), List.of("purchase-order", "sales-transaction"), "Do you mean A or B?"));
+        conceptResolver.resultByConnection.put("conn-2", combined(List.of("obj-x"), List.of("supplier"), null));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of(),
+                "show me all open orders", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isPresent());
+        assertEquals("Do you mean A or B?", model.conceptAmbiguityClarification().get());
+    }
+
+    @Test
+    void nonAmbiguousQuestionsNeverCarryAClarification() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver(); // no entry ⇒ EMPTY
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1"), List.of(),
+                "how many orders", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isEmpty());
     }
 }
