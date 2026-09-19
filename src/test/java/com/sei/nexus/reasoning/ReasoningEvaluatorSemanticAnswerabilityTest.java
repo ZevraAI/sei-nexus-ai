@@ -36,7 +36,8 @@ class ReasoningEvaluatorSemanticAnswerabilityTest {
         }
         // Phase 1 explicit prompt caching: Evaluator now calls respondForEvaluator
         // (prompt_cache_key="zevra:evaluator:v1") instead of respond.
-        @Override public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt) {
+        @Override public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt,
+                                                      String jsonSchemaName, Map<String, Object> jsonSchema) {
             return respond(messages, systemPrompt);
         }
     }

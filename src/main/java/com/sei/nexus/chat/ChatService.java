@@ -1128,11 +1128,16 @@ public class ChatService {
             String prompt = "Question: " + question + "\n\nAlready known in this conversation:\n" + index;
             com.sei.nexus.ai.LlmCallTag.set("MEMORY_SELECTION");
             // Phase 1 Responses API migration: transport-only — same prompt/roster context, same
-            // free-form-text (non-schema) output contract, same exact-roster-membership validation below.
-            // Model tiering (pre-production cost optimization): selecting entity_keys by exact
-            // match from a short roster is low-complexity — nexus.openai.memory-selection-model
-            // (defaults to gpt-4o-mini) instead of the core chat model.
-            String resp = aiClient.respondForMemorySelection(List.of(ChatMessage.user(prompt)), MEMORY_SELECTION_SYSTEM_PROMPT);
+            // exact-roster-membership validation below. Model tiering (pre-production cost
+            // optimization): selecting entity_keys by exact match from a short roster is
+            // low-complexity — nexus.openai.memory-selection-model (defaults to gpt-4o-mini)
+            // instead of the core chat model. Phase 4 Structured Outputs: the response now
+            // carries an OpenAI strict json_schema (see #memorySelectionJsonSchema) guaranteeing
+            // "entity_keys" is always a (possibly empty) array of strings — the exact-roster
+            // membership check per key below is completely unchanged; no new cache key is
+            // introduced here (Memory Selection has never had one, per Phase 1 scope).
+            String resp = aiClient.respondForMemorySelection(List.of(ChatMessage.user(prompt)), MEMORY_SELECTION_SYSTEM_PROMPT,
+                    "memory_selection", memorySelectionJsonSchema());
 
             Map<String, Object> parsed = objectMapper.readValue(extractJson(resp),
                     new TypeReference<Map<String, Object>>() {});
@@ -1163,6 +1168,30 @@ public class ChatService {
             log.warn("Conversation memory selection failed, continuing without it: {}", e.getMessage());
             return "";
         }
+    }
+
+    /**
+     * The strict JSON Schema for {@link #MEMORY_SELECTION_SYSTEM_PROMPT}'s {@code
+     * {"entity_keys": ["..."]}} contract — formalized as an OpenAI Structured-Outputs strict
+     * schema (same idiom as {@link #dataAnswerJsonSchema}). STRUCTURE enforcement only:
+     * guarantees {@code entity_keys} is always present as a (possibly empty) array of strings;
+     * WHICH keys (if any) it selects remains entirely the model's judgment, and {@link
+     * #buildMemorySelectionContext}'s own exact-roster-membership validation per key is
+     * completely unchanged — an unknown/hallucinated key is still silently rejected there, never
+     * enforced by this schema.
+     *
+     * <p>Package-private static seam — a pure function of no inputs, for direct unit testing.
+     */
+    static Map<String, Object> memorySelectionJsonSchema() {
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("entity_keys", Map.of("type", "array", "items", Map.of("type", "string")));
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("entity_keys"));
+        schema.put("additionalProperties", false);
+        return schema;
     }
 
     /**

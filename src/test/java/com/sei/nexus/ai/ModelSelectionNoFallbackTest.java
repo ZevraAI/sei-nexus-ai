@@ -92,7 +92,8 @@ class ModelSelectionNoFallbackTest {
         setField(client, "plannerModel", "gpt-4.1");
 
         NexusException thrown = assertThrows(NexusException.class,
-                () -> client.respondForPlanner(List.of(ChatMessage.user("q")), "system"));
+                () -> client.respondForPlanner(List.of(ChatMessage.user("q")), "system",
+                        "planner_step", java.util.Map.of("type", "object")));
         assertTrue(thrown.getMessage().contains("simulated persistent failure")
                         || thrown.getMessage().toLowerCase().contains("openai"),
                 "the existing failure must propagate, not be masked: " + thrown.getMessage());
@@ -113,7 +114,8 @@ class ModelSelectionNoFallbackTest {
         setField(client, "evaluatorModel", "gpt-4.1");
 
         assertThrows(NexusException.class,
-                () -> client.respondForEvaluator(List.of(ChatMessage.user("q")), "system"));
+                () -> client.respondForEvaluator(List.of(ChatMessage.user("q")), "system",
+                        "evaluator_result", java.util.Map.of("type", "object")));
 
         assertFalse(client.requestedModels.isEmpty());
         for (String model : client.requestedModels) {

@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -332,11 +333,18 @@ public class ReasoningPlanner {
         try {
             String prompt = buildPrompt(question, schemaCtx, evidence);
             com.sei.nexus.ai.LlmCallTag.set("PLANNER");
-            // Phase 2 Responses API migration: transport-only — same prompt/context, same
-            // free-form-text (non-schema) output contract, same JSON extraction/parsing below.
-            // Phase 1 explicit prompt caching: identical request shape, additionally attaching
-            // prompt_cache_key="zevra:planner:v1" (a pure cache-routing hint).
-            String raw    = aiClient.respondForPlanner(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
+            // Phase 2 Responses API migration: transport-only — same prompt/context, same JSON
+            // extraction/parsing below. Phase 1 explicit prompt caching: identical request shape,
+            // additionally attaching prompt_cache_key="zevra:planner:v1" (a pure cache-routing
+            // hint). Phase 4 Structured Outputs: the response now carries an OpenAI strict
+            // json_schema (see #plannerJsonSchema) guaranteeing the shape below — every field this
+            // method already reads (done/requires_metadata/clarification_question/sql/
+            // connection_key/literal_bindings/chart_hint/...) is now always present (possibly
+            // null), never absent. The parsing/precedence logic itself is completely unchanged:
+            // a schema-guaranteed null field is indistinguishable, to this code, from the same
+            // field previously being absent from a loosely-formatted response.
+            String raw    = aiClient.respondForPlanner(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT,
+                    "planner_step", plannerJsonSchema());
             String json   = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 
@@ -397,6 +405,88 @@ public class ReasoningPlanner {
             log.warn("ReasoningPlanner failed: {}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * The strict JSON Schema for the SYSTEM_PROMPT's four response shapes — (a) SQL, (b) metadata
+     * request, (c) clarification, (d) done — formalized as ONE FLAT OpenAI Structured-Outputs
+     * strict schema (mirrors {@code ChatService#dataAnswerJsonSchema}'s established idiom: every
+     * property required, genuine per-shape optionality expressed as nullable rather than absent).
+     * A true discriminated union is not usable here — OpenAI strict mode forbids {@code anyOf} at
+     * the schema root — so this single object carries every field any shape might populate, all
+     * others left {@code null}; {@link #nextStep}'s own precedence checks (done →
+     * requires_metadata → clarification_question → sql) are completely unchanged and already
+     * treat a schema-guaranteed null exactly like a previously-absent key.
+     *
+     * <p>STRUCTURE enforcement only: which keys exist and their shape. Every field's actual
+     * content — which shape the planner chooses, what SQL it writes, which literal bindings it
+     * declares — remains entirely the model's judgment; nothing here moves reasoning into Java.
+     *
+     * <p>Package-private static seam — a pure function of no inputs, for direct unit testing.
+     */
+    static Map<String, Object> plannerJsonSchema() {
+        Map<String, Object> metadataRequestProps = new LinkedHashMap<>();
+        metadataRequestProps.put("object", Map.of("type", "string"));
+        metadataRequestProps.put("metadataType", Map.of("type", List.of("string", "null")));
+        Map<String, Object> metadataRequestSchema = new LinkedHashMap<>();
+        metadataRequestSchema.put("type", "object");
+        metadataRequestSchema.put("properties", metadataRequestProps);
+        metadataRequestSchema.put("required", List.of("object", "metadataType"));
+        metadataRequestSchema.put("additionalProperties", false);
+
+        Map<String, Object> bindingProps = new LinkedHashMap<>();
+        bindingProps.put("surface", Map.of("type", "string"));
+        bindingProps.put("column", Map.of("type", "string"));
+        bindingProps.put("value", Map.of("type", "string"));
+        Map<String, Object> bindingSchema = new LinkedHashMap<>();
+        bindingSchema.put("type", "object");
+        bindingSchema.put("properties", bindingProps);
+        bindingSchema.put("required", List.of("surface", "column", "value"));
+        bindingSchema.put("additionalProperties", false);
+
+        Map<String, Object> chartHintProps = new LinkedHashMap<>();
+        chartHintProps.put("chart_type", Map.of("type", "string",
+                "enum", List.of("stats", "bar", "area", "donut")));
+        chartHintProps.put("category_key", Map.of("type", List.of("string", "null")));
+        chartHintProps.put("value_keys", Map.of(
+                "type", List.of("array", "null"),
+                "items", Map.of("type", "string")));
+        chartHintProps.put("category_label", Map.of("type", List.of("string", "null")));
+        chartHintProps.put("value_labels", Map.of(
+                "type", List.of("array", "null"),
+                "items", Map.of("type", "string")));
+        chartHintProps.put("metric_label", Map.of("type", List.of("string", "null")));
+        Map<String, Object> chartHintSchema = new LinkedHashMap<>();
+        chartHintSchema.put("type", "object");
+        chartHintSchema.put("properties", chartHintProps);
+        chartHintSchema.put("required", List.of("chart_type", "category_key", "value_keys",
+                "category_label", "value_labels", "metric_label"));
+        chartHintSchema.put("additionalProperties", false);
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("done", Map.of("type", "boolean"));
+        properties.put("description", Map.of("type", List.of("string", "null")));
+        properties.put("sql", Map.of("type", List.of("string", "null")));
+        properties.put("connection_key", Map.of("type", List.of("string", "null")));
+        properties.put("object_keys", Map.of("type", List.of("string", "null")));
+        properties.put("rationale", Map.of("type", List.of("string", "null")));
+        properties.put("literal_bindings", Map.of(
+                "type", List.of("array", "null"),
+                "items", bindingSchema));
+        chartHintSchema.put("type", List.of("object", "null"));
+        properties.put("chart_hint", chartHintSchema);
+        metadataRequestSchema.put("type", List.of("object", "null"));
+        properties.put("requires_metadata", metadataRequestSchema);
+        properties.put("clarification_question", Map.of("type", List.of("string", "null")));
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("done", "description", "sql", "connection_key",
+                "object_keys", "rationale", "literal_bindings", "chart_hint", "requires_metadata",
+                "clarification_question"));
+        schema.put("additionalProperties", false);
+        return schema;
     }
 
     private String buildPrompt(String question, String schemaCtx, EvidenceStore evidence) {

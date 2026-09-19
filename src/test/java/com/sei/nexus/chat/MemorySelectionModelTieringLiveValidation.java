@@ -87,7 +87,8 @@ class MemorySelectionModelTieringLiveValidation {
     private static List<String> select(AzureOpenAiClient client, ObjectMapper mapper, Case c) throws Exception {
         String prompt = "Question: " + c.question() + "\n\nAlready known in this conversation:\n" + c.roster();
         String resp = client.respondForMemorySelection(
-                List.of(ChatMessage.user(prompt)), ChatService.MEMORY_SELECTION_SYSTEM_PROMPT);
+                List.of(ChatMessage.user(prompt)), ChatService.MEMORY_SELECTION_SYSTEM_PROMPT,
+                "memory_selection", ChatService.memorySelectionJsonSchema());
         String json = extractJson(resp);
         Map<String, Object> parsed = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
         Object keys = parsed.get("entity_keys");

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -38,8 +39,11 @@ class ReasoningPlannerClarificationTest {
         }
         // Phase 1 explicit prompt caching: Planner now calls respondForPlanner
         // (prompt_cache_key="zevra:planner:v1") instead of respond.
+        // Phase 4 Structured Outputs: respondForPlanner now takes a schema — this fake ignores
+        // it (it exists purely to prove Java's parsing of a given response body).
         @Override
-        public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
+        public String respondForPlanner(List<ChatMessage> messages, String systemPrompt,
+                                         String jsonSchemaName, Map<String, Object> jsonSchema) {
             return respond(messages, systemPrompt);
         }
     }

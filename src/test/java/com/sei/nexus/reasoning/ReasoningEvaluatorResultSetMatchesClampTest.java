@@ -6,6 +6,7 @@ import com.sei.nexus.ai.ChatMessage;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -33,7 +34,8 @@ class ReasoningEvaluatorResultSetMatchesClampTest {
         }
         // Phase 1 explicit prompt caching: Evaluator now calls respondForEvaluator
         // (prompt_cache_key="zevra:evaluator:v1") instead of respond.
-        @Override public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt) {
+        @Override public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt,
+                                                      String jsonSchemaName, Map<String, Object> jsonSchema) {
             return respond(messages, systemPrompt);
         }
     }

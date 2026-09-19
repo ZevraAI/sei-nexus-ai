@@ -710,34 +710,51 @@ public class AzureOpenAiClient {
     }
 
     /**
-     * Model-tiering equivalent of {@link #respond} for {@code ChatService.buildMemorySelectionContext}
-     * ("Memory Selection") — identical request shape (Responses API, free-form text, no
-     * schema), using {@code nexus.openai.memory-selection-model} (defaults to {@code
-     * gpt-4o-mini}) instead of {@link #chatModel}. Additive: {@link #respond} is unchanged for
-     * every other existing caller (Planner, Evaluator, Composer's TEXT mode).
+     * Phase 4 Structured Outputs equivalent of {@link #respond} for {@code
+     * ChatService.buildMemorySelectionContext} ("Memory Selection") — same {@code
+     * nexus.openai.memory-selection-model}, now attaching a strict Responses API JSON Schema
+     * (see {@code ChatService#memorySelectionJsonSchema}) instead of the prior unconstrained
+     * free-form text. The API now guarantees the {@code entity_keys} array shape; Java's own
+     * exact-roster membership validation is completely unchanged. Additive: {@link #respond} is
+     * unchanged for every other existing caller (Composer's TEXT mode).
      */
-    public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, memorySelectionModel);
+    public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt,
+                                             String jsonSchemaName, Map<String, Object> jsonSchema) {
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema,
+                memorySelectionModel, null);
     }
 
     /**
-     * Phase 1 explicit prompt caching equivalent of {@link #respond} for {@link
-     * com.sei.nexus.reasoning.ReasoningPlanner} — identical request shape (Responses API,
-     * free-form text, no schema, same {@link #chatModel}), additionally attaching {@code
-     * prompt_cache_key="zevra:planner:v1"}. Additive: {@link #respond} is unchanged for every
-     * other existing caller.
+     * Phase 4 Structured Outputs equivalent of {@link #respond} for {@link
+     * com.sei.nexus.reasoning.ReasoningPlanner} — same {@link #plannerModel} and {@code
+     * prompt_cache_key="zevra:planner:v1"} as Phase 1/3, now attaching a strict Responses API
+     * JSON Schema (see {@code ReasoningPlanner#plannerJsonSchema}) covering every currently
+     * valid Planner response shape (SQL step, metadata request, clarification, done) as one flat
+     * schema with per-shape fields nullable — the exact same "required but nullable" idiom
+     * {@code ChatService#dataAnswerJsonSchema} already established for Composer. Java's existing
+     * precedence-based parsing ({@code nextStep}'s own field checks) is completely unchanged: a
+     * field the schema now guarantees present-as-null behaves identically to the same field being
+     * absent, which is exactly how the existing {@code Map}-based parsing already treated it.
      */
-    public String respondForPlanner(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, plannerModel, CACHE_KEY_PLANNER);
+    public String respondForPlanner(List<ChatMessage> messages, String systemPrompt,
+                                     String jsonSchemaName, Map<String, Object> jsonSchema) {
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema,
+                plannerModel, CACHE_KEY_PLANNER);
     }
 
     /**
-     * Phase 1 explicit prompt caching equivalent of {@link #respond} for {@link
-     * com.sei.nexus.reasoning.ReasoningEvaluator} — identical request shape, additionally
-     * attaching {@code prompt_cache_key="zevra:evaluator:v1"}.
+     * Phase 4 Structured Outputs equivalent of {@link #respond} for {@link
+     * com.sei.nexus.reasoning.ReasoningEvaluator} — same {@link #evaluatorModel} and {@code
+     * prompt_cache_key="zevra:evaluator:v1"}, now attaching a strict Responses API JSON Schema
+     * (see {@code ReasoningEvaluator#evaluatorJsonSchema}) so {@code resultSetMatches}/{@code
+     * decision}/{@code rationale} are always present — the safety-relevant {@code
+     * resultSetMatches} clamp in {@code evaluate()} is unchanged, it simply can no longer be
+     * skipped by a missing/malformed field.
      */
-    public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt) {
-        return doRespond(messages, systemPrompt, false, evaluatorModel, CACHE_KEY_EVALUATOR);
+    public String respondForEvaluator(List<ChatMessage> messages, String systemPrompt,
+                                       String jsonSchemaName, Map<String, Object> jsonSchema) {
+        return respondWithStrictJson(messages, systemPrompt, jsonSchemaName, jsonSchema,
+                evaluatorModel, CACHE_KEY_EVALUATOR);
     }
 
     /**

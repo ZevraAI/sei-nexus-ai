@@ -17,6 +17,7 @@ import java.lang.reflect.Method;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -72,7 +73,8 @@ class ChatServiceConversationMemoryTest {
         }
         // Model tiering (pre-production cost optimization): ChatService.buildMemorySelectionContext
         // now calls respondForMemorySelection (nexus.openai.memory-selection-model) instead of respond.
-        @Override public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt) {
+        @Override public String respondForMemorySelection(List<ChatMessage> messages, String systemPrompt,
+                                                            String jsonSchemaName, Map<String, Object> jsonSchema) {
             return respond(messages, systemPrompt);
         }
     }

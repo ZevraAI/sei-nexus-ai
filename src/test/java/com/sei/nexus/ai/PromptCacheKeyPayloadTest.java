@@ -78,6 +78,15 @@ class PromptCacheKeyPayloadTest {
 
     // ── 1. Planner sends the expected cache key ─────────────────────────────────────────────────
 
+    /** Minimal valid strict-mode schema — sufficient for exercising the transport/plumbing this
+     *  test targets; the exact field shape is irrelevant here (that is covered by {@code
+     *  ReasoningPlanner}/{@code ReasoningEvaluator}'s own schema-builder tests). */
+    private static final Map<String, Object> MINIMAL_SCHEMA = Map.of(
+            "type", "object",
+            "properties", Map.of(),
+            "required", List.of(),
+            "additionalProperties", false);
+
     @Test
     void plannerSendsTheExpectedCacheKey() throws Exception {
         AzureOpenAiClient client = client();
@@ -85,7 +94,8 @@ class PromptCacheKeyPayloadTest {
         String question = "TENANT-SPECIFIC-QUESTION-MARKER-conn-9f1a";
 
         JsonNode keyed = capture(() ->
-                client.respondForPlanner(List.of(ChatMessage.user(question)), systemPrompt));
+                client.respondForPlanner(List.of(ChatMessage.user(question)), systemPrompt,
+                        "planner_step", MINIMAL_SCHEMA));
 
         assertEquals("zevra:planner:v1", keyed.path("prompt_cache_key").asText());
         assertEquals(systemPrompt, keyed.path("instructions").asText(), "instructions must be transmitted unchanged");
@@ -95,7 +105,10 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() ->
                 client.respond(List.of(ChatMessage.user(question)), systemPrompt));
-        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
+        // Phase 4 Structured Outputs: the migrated call now also carries a "text" (json_schema)
+        // field the unkeyed free-form-text call does not — an intentional, additional difference
+        // on top of Phase 3's model change, not a regression in the stable prefix/dynamic content.
+        assertFieldsIdenticalExceptCacheKeyModelAndSchema(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     // ── 2. Evaluator sends the expected cache key ───────────────────────────────────────────────
@@ -107,7 +120,8 @@ class PromptCacheKeyPayloadTest {
         String question = "TENANT-SPECIFIC-EVIDENCE-MARKER-conn-2b7c";
 
         JsonNode keyed = capture(() ->
-                client.respondForEvaluator(List.of(ChatMessage.user(question)), systemPrompt));
+                client.respondForEvaluator(List.of(ChatMessage.user(question)), systemPrompt,
+                        "evaluator_result", MINIMAL_SCHEMA));
 
         assertEquals("zevra:evaluator:v1", keyed.path("prompt_cache_key").asText());
         assertEquals(systemPrompt, keyed.path("instructions").asText());
@@ -116,7 +130,7 @@ class PromptCacheKeyPayloadTest {
 
         JsonNode unkeyed = capture(() ->
                 client.respond(List.of(ChatMessage.user(question)), systemPrompt));
-        assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
+        assertFieldsIdenticalExceptCacheKeyModelAndSchema(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
     // ── 3. Composer sends the expected cache key (TEXT and STRICT_JSON modes) ──────────────────
@@ -255,6 +269,51 @@ class PromptCacheKeyPayloadTest {
             assertEquals(unkeyed.path(field), keyed.path(field),
                     "field '" + field + "' must be byte-for-byte identical between the keyed and unkeyed calls "
                             + "— only model and prompt_cache_key are expected to differ post-migration");
+        }
+    }
+
+    /**
+     * Phase 4 Structured Outputs variant of {@link #assertFieldsIdenticalExceptCacheKeyAndModel}:
+     * the migrated (Planner/Evaluator) call additionally gains a {@code text} field (the strict
+     * json_schema format) the unkeyed free-form-text call never had, and its {@code input}
+     * carries the same "(Respond in JSON as instructed.)" API-compliance suffix {@link
+     * #respondWithStrictJsonForComposer}'s own strict-mode call already adds — verified here by
+     * containment (the dynamic content itself) rather than exact equality. These are intentional,
+     * additive differences on top of the model change, not a reordering/restructuring of the
+     * stable prefix or dynamic content. Every field other than {@code model}, {@code
+     * prompt_cache_key}, {@code text}, and {@code input} must still be byte-for-byte identical.
+     */
+    private static void assertFieldsIdenticalExceptCacheKeyModelAndSchema(
+            JsonNode unkeyed, JsonNode keyed, String expectedUnkeyedModel, String expectedKeyedModel) {
+        assertEquals(expectedUnkeyedModel, unkeyed.path("model").asText(),
+                "the existing (non-migrated) method must still use the original model");
+        assertEquals(expectedKeyedModel, keyed.path("model").asText(),
+                "the migrated method must use its own dedicated model field");
+        assertEquals("json_schema", keyed.path("text").path("format").path("type").asText(),
+                "the migrated call must carry the strict Structured Outputs format");
+        assertTrue(keyed.path("input").asText().startsWith(unkeyed.path("input").asText()),
+                "the migrated call's input must carry the same dynamic content, only extended by the "
+                        + "required JSON-mode suffix");
+
+        var unkeyedFields = new java.util.TreeSet<String>();
+        unkeyed.fieldNames().forEachRemaining(unkeyedFields::add);
+        var keyedFields = new java.util.TreeSet<String>();
+        keyed.fieldNames().forEachRemaining(keyedFields::add);
+
+        assertFalse(unkeyedFields.contains("prompt_cache_key"),
+                "the existing (non-cache-keyed) method must never itself gain a prompt_cache_key");
+        assertFalse(unkeyedFields.contains("text"),
+                "the existing free-form-text method must never itself gain a text/json_schema format");
+        keyedFields.remove("prompt_cache_key");
+        keyedFields.remove("text");
+        assertEquals(unkeyedFields, keyedFields,
+                "the migrated call must add prompt_cache_key/text and nothing else besides model/input");
+
+        for (String field : unkeyedFields) {
+            if ("model".equals(field) || "input".equals(field)) continue;
+            assertEquals(unkeyed.path(field), keyed.path(field),
+                    "field '" + field + "' must be byte-for-byte identical between the keyed and unkeyed calls "
+                            + "— only model, input, prompt_cache_key, and text are expected to differ post-migration");
         }
     }
 }

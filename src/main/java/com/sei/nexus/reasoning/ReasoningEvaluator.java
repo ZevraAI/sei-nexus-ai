@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -177,10 +178,14 @@ public class ReasoningEvaluator {
 
             com.sei.nexus.ai.LlmCallTag.set("EVALUATOR");
             // Phase 1 Responses API migration: transport-only — same prompt/context, same
-            // free-form-text (non-schema) output contract, same tolerant JSON extraction below.
-            // Phase 1 explicit prompt caching: identical request shape, additionally attaching
-            // prompt_cache_key="zevra:evaluator:v1" (a pure cache-routing hint).
-            String raw  = aiClient.respondForEvaluator(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT);
+            // tolerant JSON extraction below. Phase 1 explicit prompt caching: identical request
+            // shape, additionally attaching prompt_cache_key="zevra:evaluator:v1" (a pure
+            // cache-routing hint). Phase 4 Structured Outputs: the response now carries an
+            // OpenAI strict json_schema (see #evaluatorJsonSchema) guaranteeing decision/
+            // rationale/resultSetMatches are always present — the deterministic clamp below,
+            // and boolOrNull's "unknown means never clamp" handling, are completely unchanged.
+            String raw  = aiClient.respondForEvaluator(List.of(ChatMessage.user(prompt)), SYSTEM_PROMPT,
+                    "evaluator_result", evaluatorJsonSchema());
             String json = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 
@@ -210,6 +215,36 @@ public class ReasoningEvaluator {
             log.warn("ReasoningEvaluator failed: {}; defaulting to SUFFICIENT", e.getMessage());
             return new EvaluationResult("SUFFICIENT", "Defaulted due to evaluation error.");
         }
+    }
+
+    /**
+     * The strict JSON Schema for the SYSTEM_PROMPT's {@code
+     * {resultSetMatches, decision, rationale}} contract — formalized as an OpenAI
+     * Structured-Outputs strict schema (same idiom as {@code
+     * ChatService#dataAnswerJsonSchema}/{@code ReasoningPlanner#plannerJsonSchema}). STRUCTURE
+     * enforcement only: guarantees all three fields are always present; the model's judgment
+     * on their VALUES — including {@code resultSetMatches} itself, which {@link #evaluate}'s
+     * deterministic clamp reads — is entirely unconstrained by this schema. {@code decision}'s
+     * enum lists only the three values the prompt actually asks for ({@code
+     * NEED_DIFFERENT_APPROACH} is handled by {@link EvaluationResult#shouldContinue} for
+     * defensiveness but is never requested by this prompt, so it is intentionally not added to
+     * the enum here).
+     *
+     * <p>Package-private static seam — a pure function of no inputs, for direct unit testing.
+     */
+    static Map<String, Object> evaluatorJsonSchema() {
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("resultSetMatches", Map.of("type", "boolean"));
+        properties.put("decision", Map.of("type", "string",
+                "enum", List.of("SUFFICIENT", "NEED_MORE_DATA", "DEAD_END")));
+        properties.put("rationale", Map.of("type", "string"));
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("resultSetMatches", "decision", "rationale"));
+        schema.put("additionalProperties", false);
+        return schema;
     }
 
     private String extractJson(String raw) {
