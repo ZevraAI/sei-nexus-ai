@@ -95,7 +95,7 @@ class PromptHardeningLiveProbe {
         List<AgentMessage> messages = new ArrayList<>();
         messages.add(AgentMessage.user(QUESTION));
         for (int i = 0; i < 5; i++) {
-            AgentToolResponse r = client.chatWithTools(messages, systemPrompt, tools);
+            AgentToolResponse r = client.respondWithTools(messages, systemPrompt, tools);
             if (r.finalAnswer() || "final_answer".equals(r.toolName())) return null;
             if ("query_database".equals(r.toolName())) {
                 Object sql = r.args() == null ? null : r.args().get("sql");

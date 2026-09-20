@@ -30,10 +30,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * FORENSIC CAPTURE (diagnostic, not a behavioral test). Drives the real prompt pipeline
  * (AgentBrain → ExecutionContractBuilder → PromptContextBuilder → PromptAssembler →
- * AgentRunner.buildSystemPrompt) and the real {@link AzureOpenAiClient#chatWithTools} into the
- * real serialization choke point, then captures the exact JSON that would be transmitted to
- * Azure OpenAI — aborting immediately before the network send (nexus.capture.abortBeforeSend),
- * so nothing leaves the machine and no API cost is incurred.
+ * AgentRunner.buildSystemPrompt) and the real {@link AzureOpenAiClient#respondWithTools} (Phase
+ * 9C — the Responses API transport AgentRunner actually calls today) into the real serialization
+ * choke point, then captures the exact JSON that would be transmitted to OpenAI — aborting
+ * immediately before the network send (nexus.capture.abortBeforeSend), so nothing leaves the
+ * machine and no API cost is incurred.
  *
  * <p>The Enterprise Map is seeded with the columns verified live from
  * tenant_maryland_corporations / inventory_balances (object platform-conn-5780d333-inventory-balances),
@@ -135,7 +136,7 @@ class AzurePayloadCaptureTest {
         setField(client, "chatModel", "gpt-4o");   // matches OPENAI_CHAT_MODEL default in application.yml
 
         try {
-            client.chatWithTools(messages, systemPrompt, tools);
+            client.respondWithTools(messages, systemPrompt, tools);
             fail("expected abort-before-send");
         } catch (RuntimeException expected) {
             assertTrue(expected.getMessage().contains("send aborted"), expected.getMessage());

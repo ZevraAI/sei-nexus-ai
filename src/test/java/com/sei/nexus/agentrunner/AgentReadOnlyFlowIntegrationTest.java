@@ -65,7 +65,10 @@ class AgentReadOnlyFlowIntegrationTest {
         ScriptedOpenAi() { super(new ObjectMapper(), null); }
         ScriptedOpenAi then(AgentToolResponse r) { script.addLast(r); return this; }
 
-        @Override public AgentToolResponse chatWithTools(List<AgentMessage> messages,
+        // Phase 9C: AgentRunner now calls respondWithTools (Responses API) instead of
+        // chatWithTools (Chat Completions) — same AgentToolResponse contract, so this fake
+        // only needs to override the new method name.
+        @Override public AgentToolResponse respondWithTools(List<AgentMessage> messages,
                                                          String systemPrompt,
                                                          List<Map<String, Object>> tools) {
             if (script.isEmpty()) throw new IllegalStateException("LLM script exhausted");

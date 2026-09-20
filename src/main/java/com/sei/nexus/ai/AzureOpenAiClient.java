@@ -432,14 +432,14 @@ public class AzureOpenAiClient {
      * request to {@code /chat/completions} — the only difference is which OpenAI endpoint/tool
      * is used. There is no Java-implemented search algorithm, no downloaded file content, no
      * filename or citation parsing, no multi-turn tool-calling loop, and no custom function/tool
-     * exposed to the model (contrast with {@link #chatWithTools}, which genuinely does implement
-     * an OpenAI function-calling loop where the caller supplies tool results back to the model —
-     * that pattern is deliberately NOT used here). OpenAI's own infrastructure executes the
+     * exposed to the model (contrast with {@link #respondWithTools}, which genuinely does
+     * implement an OpenAI function-calling loop where the caller supplies tool results back to the
+     * model — that pattern is deliberately NOT used here). OpenAI's own infrastructure executes the
      * search against the named Vector Store server-side, entirely within this one round trip;
      * Java's role starts and ends at sending the request and reading the model's final text.
      *
      * <p>This is a general-purpose capability, not a concept-selection-specific one — it is named
-     * and shaped symmetrically with {@link #chat}/{@link #chatWithJson}/{@link #chatWithTools}
+     * and shaped symmetrically with {@link #chat}/{@link #chatWithJson}/{@link #respondWithTools}
      * precisely so it can be reused by any future caller that needs the model to consult a
      * tenant's persistent knowledge, not only {@code ConceptScopedMetadataResolver}.
      *
@@ -1102,43 +1102,42 @@ public class AzureOpenAiClient {
     }
 
     /**
-     * Sends a tool-calling request (OpenAI function calling).
-     * Returns either a tool call the LLM wants to make, or a final text answer.
+     * Sends a tool-calling request over the OpenAI Responses API — {@code AgentRunner}'s ReAct
+     * loop transport (Phase 9C). Takes {@link AgentMessage} history, returns an {@link
+     * AgentToolResponse}: either a tool call the model wants to make, or a final text answer.
+     * Fixed {@code temperature}/{@code max_output_tokens}/{@code tool_choice="auto"}, and —
+     * deliberately preserved, not "fixed" — processes only the FIRST tool call the model returns
+     * in one turn (see {@link #extractToolOrFinalAnswer}) even if the model returns several.
+     * Posts to {@code /responses}, representing conversation history as a flat Responses API
+     * {@code input} item array ({@code message} / {@code function_call} / {@code
+     * function_call_output}), never Chat Completions' role-tagged messages.
      *
-     * @param messages    conversation history (user + assistant + tool results)
-     * @param systemPrompt agent persona and goal
-     * @param tools       list of tool definitions in OpenAI format
+     * <p>Deliberately does NOT use {@code previous_response_id} — the full (pruned) history
+     * {@code AgentRunner} already builds is replayed on every call, so none of {@code
+     * AgentRunner}'s own history/pruning/caching/iteration-limit/salvage/exception-handling logic
+     * needs to change (see the Phase 9A investigation, {@code
+     * docs/architecture/phase-9-agent-runner-responses-investigation.md}, §11/§18, for why
+     * chaining is a separate, not-yet-justified design decision). {@code tools} is still supplied
+     * in {@link AgentToolRegistry}'s existing Chat-Completions-nested shape ({@code
+     * {"type":"function","function":{"name","description","parameters"}}}) — unchanged, so the
+     * tool schema itself never moves — and is flattened into the Responses API's own function-tool
+     * shape only at this transport boundary, by {@link #flattenToolsForResponsesApi}.
      */
-    public AgentToolResponse chatWithTools(List<AgentMessage> messages,
-                                            String systemPrompt,
-                                            List<Map<String, Object>> tools) {
-        String url = BASE_URL + "/chat/completions";
-
-        List<Map<String, Object>> messageList = new ArrayList<>();
-        if (systemPrompt != null && !systemPrompt.isBlank()) {
-            messageList.add(Map.of("role", "system", "content", systemPrompt));
-        }
-        for (AgentMessage msg : messages) {
-            Map<String, Object> m = new HashMap<>();
-            m.put("role", msg.role());
-            if (msg.toolCalls() != null && !msg.toolCalls().isEmpty()) {
-                m.put("tool_calls", msg.toolCalls());
-            } else {
-                m.put("content", msg.content() != null ? msg.content() : "");
-            }
-            if (msg.toolCallId() != null) {
-                m.put("tool_call_id", msg.toolCallId());
-            }
-            messageList.add(m);
-        }
+    public AgentToolResponse respondWithTools(List<AgentMessage> messages,
+                                               String systemPrompt,
+                                               List<Map<String, Object>> tools) {
+        String url = BASE_URL + "/responses";
 
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("model", chatModel);
-        requestBody.put("messages", messageList);
-        requestBody.put("tools", tools);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            requestBody.put("instructions", systemPrompt);
+        }
+        requestBody.put("input", buildResponsesInputItems(messages));
+        requestBody.put("tools", flattenToolsForResponsesApi(tools));
         requestBody.put("tool_choice", "auto");
         requestBody.put("temperature", 0.2);
-        requestBody.put("max_tokens", 4096);
+        requestBody.put("max_output_tokens", 4096);
 
         long startNanos = System.nanoTime();
         String responseBody = executeWithRetry(url, requestBody);
@@ -1150,29 +1149,110 @@ public class AzureOpenAiClient {
             for (AgentMessage msg : messages) {
                 requestChars += msg.content() != null ? msg.content().length() : 0;
             }
-            recordUsage(root, chatModel, latencyMs, requestChars);
-            JsonNode message = root.path("choices").get(0).path("message");
-            JsonNode toolCalls = message.path("tool_calls");
+            recordResponsesUsage(root, chatModel, latencyMs, requestChars);
+            return extractToolOrFinalAnswer(root);
+        } catch (NexusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to parse tool-call response: " + e.getMessage());
+        }
+    }
 
-            if (toolCalls.isArray() && toolCalls.size() > 0) {
-                JsonNode call     = toolCalls.get(0);
-                String toolCallId = call.path("id").asText();
-                String toolName   = call.path("function").path("name").asText();
-                String argsJson   = call.path("function").path("arguments").asText();
+    /**
+     * Builds the Responses API {@code input} item array from {@code AgentRunner}'s existing
+     * {@link AgentMessage} history — a lossless, one-to-one structural translation, never a
+     * reinterpretation: a plain user/assistant-text message becomes a {@code message} item; an
+     * assistant tool-call message ({@link AgentMessage#assistantToolCall}) becomes one {@code
+     * function_call} item per captured call (always exactly one today, since {@link
+     * AgentToolResponse} itself can only ever carry a single tool call — see {@link
+     * #extractToolOrFinalAnswer}); a tool-result message ({@link AgentMessage#toolResult})
+     * becomes a {@code function_call_output} item keyed by the same {@code call_id}/{@code
+     * toolCallId}, replacing Chat Completions' {@code role:"tool"}/{@code tool_call_id} linking.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Object> buildResponsesInputItems(List<AgentMessage> messages) {
+        List<Object> items = new ArrayList<>();
+        for (AgentMessage msg : messages) {
+            if (msg.toolCalls() != null && !msg.toolCalls().isEmpty()) {
+                for (Map<String, Object> call : msg.toolCalls()) {
+                    Map<String, Object> function = (Map<String, Object>) call.get("function");
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("type", "function_call");
+                    item.put("call_id", call.get("id"));
+                    item.put("name", function.get("name"));
+                    item.put("arguments", function.get("arguments"));
+                    items.add(item);
+                }
+            } else if (msg.toolCallId() != null) {
+                Map<String, Object> item = new HashMap<>();
+                item.put("type", "function_call_output");
+                item.put("call_id", msg.toolCallId());
+                item.put("output", msg.content() != null ? msg.content() : "");
+                items.add(item);
+            } else {
+                Map<String, Object> item = new HashMap<>();
+                item.put("role", msg.role());
+                item.put("content", msg.content() != null ? msg.content() : "");
+                items.add(item);
+            }
+        }
+        return items;
+    }
+
+    /**
+     * Reshapes {@link AgentToolRegistry#getToolDefinitions}'s existing Chat-Completions-nested
+     * tool definitions ({@code {"type":"function","function":{"name","description","parameters"}}})
+     * into the Responses API's own flat function-tool shape ({@code
+     * {"type":"function","name","description","parameters"}}) — a pure transport-envelope
+     * reshaping. The tool schema content itself (name/description/parameters JSON Schema) is
+     * relayed verbatim; {@link AgentToolRegistry} itself is not changed by this reshaping.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> flattenToolsForResponsesApi(List<Map<String, Object>> tools) {
+        List<Map<String, Object>> flattened = new ArrayList<>();
+        for (Map<String, Object> tool : tools) {
+            Map<String, Object> function = (Map<String, Object>) tool.get("function");
+            Map<String, Object> flat = new HashMap<>();
+            flat.put("type", "function");
+            flat.put("name", function.get("name"));
+            flat.put("description", function.get("description"));
+            flat.put("parameters", function.get("parameters"));
+            flattened.add(flat);
+        }
+        return flattened;
+    }
+
+    /**
+     * Parses a Responses API tool-calling turn: walks {@code output[]} in order and returns the
+     * FIRST {@code function_call} item found (Phase 9A/9B baseline — deliberately preserved, not
+     * "improved": any further {@code function_call} items in the same turn are silently ignored).
+     * When no {@code function_call} item is present, falls back to the same {@code message}/{@code
+     * output_text} walk {@link #extractResponseText} already uses, returning it as a final answer.
+     */
+    private AgentToolResponse extractToolOrFinalAnswer(JsonNode root) throws Exception {
+        for (JsonNode item : root.path("output")) {
+            if ("function_call".equals(item.path("type").asText())) {
+                String toolCallId = item.path("call_id").asText();
+                String toolName   = item.path("name").asText();
+                String argsJson   = item.path("arguments").asText();
 
                 @SuppressWarnings("unchecked")
                 Map<String, Object> args = objectMapper.readValue(argsJson, Map.class);
                 return AgentToolResponse.ofToolCall(toolName, toolCallId, args);
             }
-
-            // No tool call — treat content as final answer
-            String content = message.path("content").asText();
-            return AgentToolResponse.ofFinal(content);
-
-        } catch (Exception e) {
-            throw new NexusException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Failed to parse tool-call response: " + e.getMessage());
         }
+
+        StringBuilder sb = new StringBuilder();
+        for (JsonNode item : root.path("output")) {
+            if (!"message".equals(item.path("type").asText())) continue;
+            for (JsonNode content : item.path("content")) {
+                if ("output_text".equals(content.path("type").asText())) {
+                    sb.append(content.path("text").asText());
+                }
+            }
+        }
+        return AgentToolResponse.ofFinal(sb.toString());
     }
 
     private String doChat(List<ChatMessage> messages, String systemPrompt,

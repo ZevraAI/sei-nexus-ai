@@ -3,7 +3,7 @@ package com.sei.nexus.ai;
 import java.util.Map;
 
 /**
- * Result from {@link AzureOpenAiClient#chatWithTools}.
+ * Result from {@link AzureOpenAiClient#respondWithTools}.
  * Either the LLM wants to call a tool, or it has a final answer.
  */
 public record AgentToolResponse(

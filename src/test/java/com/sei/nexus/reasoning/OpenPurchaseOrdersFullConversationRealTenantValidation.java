@@ -180,7 +180,7 @@ class OpenPurchaseOrdersFullConversationRealTenantValidation {
                     + " resolutions chars=" + resolutionsBlock.length());
 
             String decisionSource = model.routingDecision().isPresent()
-                    ? "PERSISTENT_KNOWLEDGE_COMBINED" : "DECISION_ROUTER_LEGACY (routing absent — would call getLlmDecision)";
+                    ? "PERSISTENT_KNOWLEDGE_COMBINED" : "ROUTING_UNAVAILABLE (Stage 1 could not establish routing)";
             System.out.println("decisionSource=" + decisionSource);
 
             ReasoningPlanner.StepPlan plan = planner.nextStep(question, schemaCtx, new EvidenceStore());

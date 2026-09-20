@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.enterprise.DataColumn;
 import com.sei.nexus.enterprise.EnterpriseMapRepository;
 import com.sei.nexus.pack.IndustryPack;
@@ -487,63 +486,6 @@ class Phase2ALiveMaterializationRealTenantValidation {
         System.out.println(jsonBody);
         System.out.println("\n=== RAW RESPONSE (status=" + response.statusCode() + ") ===");
         System.out.println(response.body());
-    }
-
-    /**
-     * DIAGNOSTIC ONLY — captures a REAL DECISION_ROUTER response using the REAL {@code
-     * DECISION_SYSTEM_PROMPT} constant (read by reflection, verbatim, never re-typed) and a
-     * representative context string built from real materialized purchase-order knowledge already
-     * fetched earlier this session (not invented). This does NOT run through the actual
-     * `ChatService.ask()` call chain — reconstructing that entire dependency graph (agent
-     * repository, run repository, document memory, knowledge graph, semantic service, baseline
-     * service, reasoning event bus, etc.) was judged too large/risky to hand-wire reliably (as
-     * already declined once this session for the same reason). This proves what the real
-     * DECISION_ROUTER prompt/model produces for a realistic context, not that a specific live
-     * server request took this exact path — that distinction is preserved in the report.
-     */
-    @Test
-    void diagnosticRealDecisionRouterResponseForPurchaseOrderQuestion() throws Exception {
-        String apiKey = System.getenv("OPENAI_API_KEY");
-        if (isBlank(apiKey)) {
-            System.out.println("Skipping — OPENAI_API_KEY not exported.");
-            return;
-        }
-        java.lang.reflect.Field f = com.sei.nexus.chat.ChatService.class.getDeclaredField("DECISION_SYSTEM_PROMPT");
-        f.setAccessible(true);
-        String decisionSystemPrompt = (String) f.get(null);
-
-        AzureOpenAiClient aiClient = new AzureOpenAiClient(new ObjectMapper(), null);
-        setField(aiClient, "apiKey", apiKey);
-        setField(aiClient, "chatModel", "gpt-4o");
-        setField(aiClient, "maxConcurrentCalls", 6);
-        Method initThrottle = AzureOpenAiClient.class.getDeclaredMethod("initThrottle");
-        initThrottle.setAccessible(true);
-        initThrottle.invoke(aiClient);
-
-        // Representative TABLE SCHEMA context — real column/value-domain facts already
-        // materialized and observed this session for purchase_orders, formatted the way
-        // PromptAssembler renders it (business name, physical binding, columns, value domain).
-        String question = "Show me all submitted purchase orders";
-        String ctx = """
-                Business object: Purchase Orders (connection: conn-c1590229, table: retail_core.purchase_orders)
-                Purpose: This table stores header information for each purchase order raised against a supplier.
-                Columns:
-                  - po_number (identifier)
-                  - supplier_id (identifier)
-                  - status (dimension) [legal values: draft, submitted, acknowledged, partially_received, received, cancelled, closed]
-                  - ordered_date (dimension)
-                  - expected_delivery_date (dimension)
-                  - total_ordered_amount (measure)
-                """;
-        String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
-
-        String response = aiClient.chat(java.util.List.of(ChatMessage.user(prompt)), decisionSystemPrompt);
-        System.out.println("=== REAL DECISION_SYSTEM_PROMPT (verbatim, via reflection) ===");
-        System.out.println(decisionSystemPrompt);
-        System.out.println("\n=== PROMPT SENT ===");
-        System.out.println(prompt);
-        System.out.println("\n=== ACTUAL MODEL RESPONSE ===");
-        System.out.println(response);
     }
 
     /**

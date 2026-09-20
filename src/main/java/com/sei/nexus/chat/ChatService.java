@@ -156,10 +156,10 @@ public class ChatService {
 
     // Conversation Memory → Chat (Phase 3). Independent of the Agent memory-tools flag.
     // false (default): behavior identical to before this change — no memory-selection call,
-    // no context injection. true: an isolated, dedicated memory-selection call (NOT merged
-    // into getLlmDecision(), NOT a change to ReasoningEngine/ReasoningPlanner) selects
-    // already-remembered entity_keys and folds their authoritative objects into the SQL
-    // planner's context, exactly like the existing learningContextBuilder/playbook injection.
+    // no context injection. true: an isolated, dedicated memory-selection call (not a change to
+    // ReasoningEngine/ReasoningPlanner) selects already-remembered entity_keys and folds their
+    // authoritative objects into the SQL planner's context, exactly like the existing
+    // learningContextBuilder/playbook injection.
     @org.springframework.beans.factory.annotation.Value("${zevra.chat.conversation-memory.enabled:false}")
     private boolean chatMemoryEnabled;
 
@@ -531,38 +531,33 @@ public class ChatService {
                         agent, routingConfidence, false, List.of(), List.of(), List.of(), List.of(), List.of());
             }
 
-            // STEP 9: Prior result check
-            Optional<String> priorSnapshot = runRepository.latestResultSnapshot(conversationId);
-
-            // STEP 10: Routing decision. Decision Router absorption: when the combined
-            // Persistent Knowledge / File Search call (Stage 1) already produced a routing
-            // decision, it is relayed VERBATIM here — Java parses and consumes it, never
-            // overrides or second-guesses it, and the separate Decision Router LLM call is
-            // skipped entirely for this request. Only when routing is absent (Stage 1
-            // inapplicable, the legacy catalog-in-prompt fallback ran, the flag is off, or the
-            // model's own routing field was invalid/unparseable) does the legacy Decision Router
-            // call still run — this is the ONLY path that reaches getLlmDecision() today.
-            Map<String, Object> decision;
-            boolean decisionRouterCalled;
-            if (businessModel.routingDecision().isPresent()) {
-                ConceptScopedMetadataResolver.RoutingDecision routing = businessModel.routingDecision().get();
-                decision = Map.of("type", routing.type(), "clarification_question", routing.clarificationQuestion());
-                decisionRouterCalled = false;
-            } else {
-                // This is the key: the router sees "do these orders exist in the system?" and
-                // naturally picks QUERY_LIVE_DATA. It doesn't need to see the CSV to decide that.
-                decision = getLlmDecision(raw, memChunks, promptContext, semantic,
-                        findings, anomalyCtx, history, priorSnapshot.isPresent(), agent, resolved, conversationContext,
-                        businessModel.conceptScoped(), businessModel.objectTargets().keySet());
-                decisionRouterCalled = true;
+            // STEP 10: Routing decision. Stage 1 (Persistent Knowledge / File Search) is the
+            // SOLE semantic concept-and-routing mechanism for the conversational Chat path
+            // (Phase 9E). Its combined call's routing decision is relayed VERBATIM here — Java
+            // parses and consumes it, never overrides or second-guesses it. There is no second
+            // routing LLM call, no Java-side routing inference, and no keyword/heuristic agent
+            // selection. When Stage 1 cannot establish routing for this request — the
+            // connection has not completed Industry Pack / concept-catalog onboarding, or the
+            // model's own routing field came back missing/invalid — the request terminates here
+            // with an explicit, deterministic readiness outcome instead of silently continuing
+            // through any alternative semantic path (see the write-intent boundary and concept-
+            // ambiguity boundary above for the same early-termination shape).
+            if (businessModel.routingDecision().isEmpty()) {
+                String ans = "I can't determine how to route this question yet — this connection "
+                        + "hasn't completed the setup Zevra needs to answer it (an Industry Pack "
+                        + "with classified business concepts). Apply a Pack for this connection, "
+                        + "or contact your Zevra admin, and try again.";
+                log.info("DECISION_SOURCE conversationId={} source=ROUTING_UNAVAILABLE", conversationId);
+                runRepository.update(runKey, ans, "ROUTING_UNAVAILABLE", "COMPLETE", null);
+                reasoningEventBus.publish(runKey, "answer_ready", Map.of("answer", ans));
+                reasoningEventBus.complete(runKey);
+                return buildResponse(conversationId, runKey, ans, "ROUTING_UNAVAILABLE",
+                        agent, routingConfidence, false, List.of(), List.of(), List.of(), List.of(), List.of());
             }
-            // Observability (Decision Router absorption): distinguishes, without logging the
-            // question or any routing/clarification content, whether this request's routing
-            // decision came from the combined Persistent Knowledge call or the legacy Decision
-            // Router LLM call.
-            log.info("DECISION_SOURCE conversationId={} source={} decisionRouterCalled={}",
-                    conversationId, decisionRouterCalled ? "DECISION_ROUTER_LEGACY" : "PERSISTENT_KNOWLEDGE_COMBINED",
-                    decisionRouterCalled);
+            ConceptScopedMetadataResolver.RoutingDecision routing = businessModel.routingDecision().get();
+            Map<String, Object> decision =
+                    Map.of("type", routing.type(), "clarification_question", routing.clarificationQuestion());
+            log.info("DECISION_SOURCE conversationId={} source=PERSISTENT_KNOWLEDGE_COMBINED", conversationId);
             String decisionType = (String) decision.getOrDefault("type", "ANSWER_FROM_MEMORY");
 
             String answer;
@@ -617,9 +612,9 @@ public class ChatService {
             // execution phase inside their own case (bracketing reasoningEngine.reason); every
             // other decision type has no execution step, so "forming business judgment" starts
             // here, directly after retrieval.
-            // ANSWER_FROM_PRIOR_RESULTS is kept here only as a defensive alias in case the
-            // router still emits it (prompt/model drift) — it is no longer a distinct decision
-            // type in DECISION_SYSTEM_PROMPT and carries no special behavior of its own. It is
+            // ANSWER_FROM_PRIOR_RESULTS is kept here only as a defensive alias in case Stage 1
+            // still emits it (prompt/model drift) — it is no longer a distinct decision type and
+            // carries no special behavior of its own. It is
             // routed through the exact same investigation path as QUERY_LIVE_DATA; whether prior
             // evidence is enough is decided by ReasoningEvaluator (see reasoningEngine.reason
             // below, seeded from the existing ExecutionReference), not by this switch.
@@ -704,9 +699,9 @@ public class ChatService {
                     }
 
                     // ── Conversation Memory → Chat (Phase 3): an isolated, dedicated
-                    // memory-selection call — NOT merged into getLlmDecision(), NOT a change
-                    // to ReasoningEngine/ReasoningPlanner. Empty string (no-op) when disabled,
-                    // when the roster is empty, or on any failure — see buildMemorySelectionContext.
+                    // memory-selection call — not a change to ReasoningEngine/ReasoningPlanner.
+                    // Empty string (no-op) when disabled, when the roster is empty, or on any
+                    // failure — see buildMemorySelectionContext.
                     String memoryCtx = buildMemorySelectionContext(raw, conversationId);
                     if (!memoryCtx.isBlank()) {
                         schemaCtx = schemaCtx + "\n\n" + memoryCtx;
@@ -1002,89 +997,13 @@ public class ChatService {
     // =========================================================================
 
     /**
-     * Decision-router system prompt. Package-private constant so tests can pin
-     * the routing contract.
-     *
-     * <p>ANSWER_FROM_PRIOR_RESULTS was removed as a decision type: it asked this router to
-     * judge whether previously-gathered evidence is sufficient to answer a new question,
-     * without the router ever seeing that evidence — a judgment {@link ReasoningEvaluator}
-     * already exists to make, from the actual evidence, for every other decision type. Every
-     * follow-up that needs investigation now routes to QUERY_LIVE_DATA; ReasoningEngine seeds
-     * evidence from the conversation's last {@link com.sei.nexus.runtime.ExecutionReference}
-     * and asks the evaluator whether it already answers the new question before planning
-     * anything new. This router now answers one question only: does this need investigation,
-     * or not.
-     *
-     * <p>Rule 6 is the PRO-34 fix: the LITERAL CANDIDATES section (PRO-32/33)
-     * renders into this router's context too, and its text — "matched no known
-     * term" plus the planner-directed clarification instruction — read, to a
-     * router with no rule about it, like grounds for ASK_CLARIFICATION. That
-     * pre-empted the approved flow: the SQL planner (which owns the
-     * constrained literal choice) never ran. Rule 6 makes the section's
-     * meaning explicit at the routing layer: candidates present ⇒ the term is
-     * resolvable downstream ⇒ route to live data.
-     *
-     * @deprecated Decision Router absorption: the same five-value routing decision this prompt
-     * produces is now produced, when possible, by the combined Persistent Knowledge / File
-     * Search Stage 1 call itself — see {@link
-     * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveObjectKeysWithRouting} and
-     * {@code docs/ai/decision-router-absorption.md}. Persistent Knowledge / File Search is now
-     * the sole Stage 1 semantic-resolution implementation (no feature flag, no legacy Stage 1
-     * fallback) — but the combined call's own {@code routing} field can still be absent
-     * (invalid/unparseable, or Stage 1 does not apply at all for this connection: no active pack,
-     * no tenant concept catalog), and in that case {@link #getLlmDecision} is still the routing
-     * fallback — only ever called from {@link #ask} when {@code businessModel.routingDecision()}
-     * is empty. Not removed and not to be extended with new functionality. This is a Decision
-     * Router / routing concern, distinct from and unaffected by Stage 1 concept-selection's own
-     * legacy-path removal.
-     */
-    @Deprecated
-    static final String DECISION_SYSTEM_PROMPT = """
-            You are the SEI Nexus orchestration engine. Decide the best answer mode.
-            Return JSON only:
-            {
-              "type": "ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP",
-              "intentType": "OPERATIONAL_INVESTIGATION|ANALYTICAL|INFORMATIONAL|FOLLOW_UP",
-              "requiresExecution": true,
-              "requiresMemory": true,
-              "requiresClarification": false,
-              "clarification_question": ""
-            }
-
-            Routing rules (in priority order):
-            1. Use QUERY_LIVE_DATA if the question needs fresh data from the database — including
-               EVERY follow-up question in an existing conversation, whether it asks for different
-               metrics, different filters, different entities, more detail than before, or simply
-               to explain/justify the previous answer. This router does not decide whether prior
-               evidence already answers a follow-up — the reasoning engine decides that from the
-               actual evidence. When a question is a follow-up to an investigation, route it here.
-            2. Use ANSWER_FROM_MEMORY if document memory can answer without live data.
-            3. Use HYBRID_DOC_AND_DATA for complex questions needing both memory and live data.
-            4. Use KNOWLEDGE_GAP if no knowledge or data sources are available at all.
-            5. Use ASK_CLARIFICATION ONLY if the question is completely ambiguous AND there is no prior conversation context.
-            6. A LITERAL CANDIDATES section means an unfamiliar term in the question already has
-               stored candidate values — the SQL planner will choose the exact value and the runtime
-               will validate it. Such a question is NOT ambiguous: use QUERY_LIVE_DATA. Do NOT use
-               ASK_CLARIFICATION for a term that has literal candidates; clarification for those
-               terms belongs to the SQL planner only when none of the offered values fits.
-            Key rule: when in doubt between investigating and answering from memory,
-            always choose QUERY_LIVE_DATA. It is always better to investigate than to
-            give an answer without evidence behind it.
-            RESOLUTIONS map the user's terms to this tenant's canonical names and values.
-            Prefer them over your own interpretation of those terms.
-            Literals filtered on columns with listed legal values MUST be copied exactly
-            from those lists or from the user's question — never invented.
-            """;
-
-    /**
      * Conversation Memory selection prompt (Chat integration, Phase 3). Deliberately a
-     * SEPARATE, independent system prompt from {@link #DECISION_SYSTEM_PROMPT} — an empirical
-     * prototype (live-tested, not merely designed) showed that folding memory-selection
-     * instructions into that prompt measurably regressed its existing ASK_CLARIFICATION vs
+     * SEPARATE, independent system prompt from routing — an empirical prototype (live-tested,
+     * not merely designed) showed that folding memory-selection instructions into the (now-
+     * removed) legacy Decision Router prompt measurably regressed its ASK_CLARIFICATION vs
      * QUERY_LIVE_DATA classification. This call's only job is selecting zero or more
      * already-remembered entity_keys; it never routes, classifies, plans SQL, or composes an
-     * answer. Package-private so tests can pin the contract, same convention as
-     * DECISION_SYSTEM_PROMPT.
+     * answer. Package-private so tests can pin the contract.
      */
     static final String MEMORY_SELECTION_SYSTEM_PROMPT = """
             You select which already-remembered items (if any) are needed to answer the current question.
@@ -1163,8 +1082,7 @@ public class ChatService {
             if (ctx.isEmpty()) return "";
             return "Conversation memory (already-known objects the model selected for this turn):\n" + ctx;
         } catch (Exception e) {
-            // Fail-safe: memory selection never fails the user's request. Same posture as
-            // getLlmDecision()'s own catch-and-fallback below.
+            // Fail-safe: memory selection never fails the user's request.
             log.warn("Conversation memory selection failed, continuing without it: {}", e.getMessage());
             return "";
         }
@@ -1235,32 +1153,6 @@ public class ChatService {
         } catch (Exception e) {
             log.warn("Conversation memory registration failed, continuing (result already succeeded): {}",
                     e.getMessage());
-        }
-    }
-
-    /**
-     * @deprecated Decision Router absorption: only called from {@link #ask} when {@code
-     * businessModel.routingDecision()} is empty — i.e. the legacy fallback path. See {@link
-     * #DECISION_SYSTEM_PROMPT}'s own deprecation note for the full explanation and retirement
-     * condition. Not removed, not extended.
-     */
-    @Deprecated
-    private Map<String, Object> getLlmDecision(String question, List<DocumentChunk> memChunks,
-            PromptContext promptContext, SemanticService.SemanticContext semantic, List<OperationalFinding> findings,
-            String anomalyCtx, List<NexusRun> history, boolean hasPrior, NexusAgent agent,
-            ResolvedQuestion resolved, String executionGrounding,
-            boolean conceptScoped, java.util.Set<String> objectKeyScope) {
-        try {
-            String ctx = buildContextSummary(question, memChunks, promptContext, semantic, findings, anomalyCtx,
-                    hasPrior, history, agent, resolved, executionGrounding, conceptScoped, objectKeyScope);
-            String prompt = "Question: " + question + "\n\nContext:\n" + ctx;
-            com.sei.nexus.ai.LlmCallTag.set("DECISION_ROUTER");
-            String resp = aiClient.chat(List.of(ChatMessage.user(prompt)), DECISION_SYSTEM_PROMPT);
-            return objectMapper.readValue(extractJson(resp),
-                    new TypeReference<Map<String, Object>>() {});
-        } catch (Exception e) {
-            log.warn("LLM decision failed, defaulting to ANSWER_FROM_MEMORY: {}", e.getMessage());
-            return Map.of("type", "ANSWER_FROM_MEMORY", "requiresExecution", false, "requiresMemory", true);
         }
     }
 

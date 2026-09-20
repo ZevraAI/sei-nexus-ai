@@ -157,9 +157,8 @@ class ChatServiceConversationMemoryTest {
         invoke("Show me today's open orders.", CONV);
 
         assertEquals(1, fakeAiClient.callCount.get());
-        assertNotEquals(ChatService.DECISION_SYSTEM_PROMPT, fakeAiClient.lastSystemPrompt,
-                "must use its own independent prompt, never the decision-router prompt");
-        assertEquals(ChatService.MEMORY_SELECTION_SYSTEM_PROMPT, fakeAiClient.lastSystemPrompt);
+        assertEquals(ChatService.MEMORY_SELECTION_SYSTEM_PROMPT, fakeAiClient.lastSystemPrompt,
+                "must use its own independent prompt");
     }
 
     // ── 4/5. correct single/multi-key selection ──────────────────────────────
@@ -261,19 +260,5 @@ class ChatServiceConversationMemoryTest {
 
         assertTrue(result.startsWith("Conversation memory"));
         assertFalse(result.contains("null"), "no field should render as the literal string 'null'");
-    }
-
-    // ── 11. getLlmDecision()'s own contract is untouched ─────────────────────
-
-    @Test
-    void decisionSystemPromptIsCompletelyUnchangedByThisFeature() {
-        // The empirically-tested regression was caused by extending DECISION_SYSTEM_PROMPT
-        // itself. This asserts the two prompts remain fully independent, byte for byte.
-        assertFalse(ChatService.DECISION_SYSTEM_PROMPT.contains("entity_keys"));
-        assertFalse(ChatService.DECISION_SYSTEM_PROMPT.contains("neededMemoryKeys"));
-        assertFalse(ChatService.DECISION_SYSTEM_PROMPT.contains("Conversation memory"));
-        assertTrue(ChatService.DECISION_SYSTEM_PROMPT.contains(
-                "\"type\": \"ANSWER_FROM_MEMORY|QUERY_LIVE_DATA|HYBRID_DOC_AND_DATA|ASK_CLARIFICATION|KNOWLEDGE_GAP\""),
-                "unchanged verbatim from before this phase");
     }
 }

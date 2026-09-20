@@ -43,10 +43,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * MANDATORY proof for Decision Router absorption (not merely an answer-shape assertion): when
- * the combined Persistent Knowledge / File Search Stage 1 call already produced a routing
- * decision, the separate Decision Router LLM call ({@code ChatService#getLlmDecision}, which
- * ultimately calls {@code AzureOpenAiClient#chat}) must NEVER be invoked for that request.
+ * Phase 9E — Stage 1 (Persistent Knowledge / File Search) is the SOLE semantic concept-and-
+ * routing mechanism for the conversational Chat path. The legacy Decision Router
+ * ({@code ChatService#getLlmDecision}, which called {@code AzureOpenAiClient#chat}) has been
+ * removed entirely — there is no second routing LLM call under any condition. This is a
+ * REGRESSION GUARD: if a fallback to a second routing LLM call is ever reintroduced (whether by
+ * resurrecting {@code getLlmDecision} or by adding a new one), {@link #chatCalls} in the second
+ * test below will be non-zero and the test fails.
  *
  * <p>Hand-rolled fakes throughout (this repo's convention — no Mockito, no Spring context, no
  * database, no network). {@link AgentBrain} is faked directly at its public {@code resolve}
@@ -60,13 +63,15 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
         TenantContext.clear();
     }
 
-    /** Counts every call to the one method the legacy Decision Router ultimately depends on. */
+    /** Counts every call to {@code AzureOpenAiClient#chat} — the method the now-removed legacy
+     *  Decision Router used to call. A non-zero count here after this phase would mean some
+     *  code path is once again routing through a second, Java-triggered LLM call. */
     static class CallCountingAiClient extends AzureOpenAiClient {
         final AtomicInteger chatCalls = new AtomicInteger();
         CallCountingAiClient() { super(new ObjectMapper(), null); }
         @Override public String chat(List<ChatMessage> messages, String systemPrompt) {
             chatCalls.incrementAndGet();
-            return "{}"; // never expected to be reached in the combined-routing test
+            return "{}"; // never expected to be reached — see the class javadoc
         }
     }
 
@@ -202,7 +207,7 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
     }
 
     @Test
-    void decisionRouterLlmCallIsNeverMadeWhenCombinedRoutingIsPresent() {
+    void noSecondLlmRoutingCallIsMadeWhenStage1RoutingIsPresent() {
         TenantContext.set("tenant_x");
         CallCountingAiClient aiClient = new CallCountingAiClient();
         AgentBrain agentBrain = new FakeAgentBrainWithRouting(
@@ -214,8 +219,7 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
 
         assertNotNull(response);
         assertEquals(0, aiClient.chatCalls.get(),
-                "the Decision Router's own LLM call (aiClient.chat) must NEVER fire when the "
-                        + "combined Persistent Knowledge call already produced a routing decision");
+                "no second routing LLM call may ever fire when Stage 1 already produced a routing decision");
     }
 
     static class FakeAgentBrainWithoutRouting extends AgentBrain {
@@ -224,9 +228,9 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
         public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
                                              List<String> domainKeys, String question,
                                              String conversationId, Boolean memoryAvailable) {
-            // Reproduces the legacy-fallback / Stage-1-inapplicable case: no routing decision at
-            // all — ChatService MUST still fall back to the legacy Decision Router for this
-            // request (BEFORE-architecture behavior, still required for a real legacy tenant).
+            // Reproduces the case Stage 1 cannot establish routing for (connection not onboarded
+            // onto Concept-Scoped Metadata Narrowing, or the model's own routing field was
+            // missing/invalid) — routingDecision() is empty.
             return new ResolvedBusinessModel(agentId, connectionKeys, question,
                     List.of(), Map.of(), Map.of(),
                     ResolvedQuestion.empty(question), Map.of(), false, Optional.empty());
@@ -234,7 +238,11 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
     }
 
     @Test
-    void decisionRouterLlmCallStillFiresWhenRoutingIsAbsentLegacyFallback() {
+    void noSecondLlmRoutingCallIsMadeWhenStage1RoutingIsAbsent_explicitReadinessOutcomeInstead() {
+        // REGRESSION GUARD (Phase 9E): this is the exact condition that used to fall back to the
+        // legacy Decision Router (ChatService#getLlmDecision, now removed). There must be no
+        // second routing LLM call, no Java-side routing inference, and no guessed agent — only
+        // an explicit, deterministic readiness outcome.
         TenantContext.set("tenant_x");
         CallCountingAiClient aiClient = new CallCountingAiClient();
         AgentBrain agentBrain = new FakeAgentBrainWithoutRouting();
@@ -244,9 +252,50 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
         ChatResponse response = chatService.ask(request, "user@test.com");
 
         assertNotNull(response);
-        assertEquals(1, aiClient.chatCalls.get(),
-                "when the combined call produced no routing decision (Stage 1 inapplicable, flag "
-                        + "off, or legacy fallback), the legacy Decision Router call must still run "
-                        + "exactly once — this is the BEFORE-architecture behavior, still required");
+        assertEquals(0, aiClient.chatCalls.get(),
+                "there is no legacy Decision Router fallback anymore — no second routing LLM call "
+                        + "may ever fire when Stage 1 could not establish routing");
+        assertEquals("ROUTING_UNAVAILABLE", response.decision().type(),
+                "Stage 1's inability to establish routing must produce an explicit, deterministic "
+                        + "readiness outcome, never a silently-guessed decision type");
+        assertTrue(response.answer().contains("Apply a Pack for this connection")
+                        || response.answer().toLowerCase().contains("setup"),
+                "the answer must explain the readiness gap plainly, not invent a semantic answer: "
+                        + response.answer());
+    }
+
+    static class FakeAgentBrainThatThrows extends AgentBrain {
+        FakeAgentBrainThatThrows() { super(null, null); }
+        @Override
+        public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
+                                             List<String> domainKeys, String question,
+                                             String conversationId, Boolean memoryAvailable) {
+            // Simulates required Persistent Knowledge infrastructure (Vector Store / File Search)
+            // failing outright — a condition distinct from "routing absent," which must never be
+            // silently absorbed into a routing-unavailable readiness outcome (see
+            // ConceptScopedMetadataResolver's own "two distinct degradation modes" javadoc).
+            throw new com.sei.nexus.common.NexusException(
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE,
+                    "Persistent Knowledge Stage 1 requires a provisioned Vector Store for this tenant.");
+        }
+    }
+
+    @Test
+    void stage1InfrastructureFailurePropagatesAsAnErrorNeverAsRoutingUnavailableOrADecisionRouterCall() {
+        // Distinguishes a genuine Stage 1 infrastructure failure (this test) from "Stage 1 ran but
+        // produced no routing decision" (the previous test) — the two must never be conflated.
+        TenantContext.set("tenant_x");
+        CallCountingAiClient aiClient = new CallCountingAiClient();
+        AgentBrain agentBrain = new FakeAgentBrainThatThrows();
+        ChatService chatService = newChatService(agentBrain, aiClient);
+
+        ChatRequest request = new ChatRequest(null, "conv-1", "Show me all purchase orders", null, null);
+
+        assertThrows(com.sei.nexus.common.NexusException.class,
+                () -> chatService.ask(request, "user@test.com"),
+                "a genuine Stage 1 infrastructure failure must propagate as an explicit error — "
+                        + "never silently degrade into a routing-unavailable readiness answer");
+        assertEquals(0, aiClient.chatCalls.get(),
+                "no second routing LLM call may ever fire on a Stage 1 infrastructure failure either");
     }
 }

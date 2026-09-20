@@ -163,8 +163,11 @@ public class AgentRunner {
                 // Telemetry hardening (Phase 0): this loop had no LlmCallTag — every ReAct
                 // iteration persisted as UNTAGGED/NULL call_type.
                 com.sei.nexus.ai.LlmCallTag.set("AGENT_RUNNER");
+                // Phase 9C — Responses API migration: transport-only. Same tool-calling
+                // contract (AgentMessage in, AgentToolResponse out), same model, same
+                // history/pruning/caching/iteration-limit logic below, unchanged.
                 AgentToolResponse response =
-                        openAi.chatWithTools(pruneHistory(messages, HISTORY_KEEP_PAIRS),
+                        openAi.respondWithTools(pruneHistory(messages, HISTORY_KEEP_PAIRS),
                                 systemPrompt, tools);
 
                 String answer = extractFinalAnswer(response);
@@ -325,8 +328,9 @@ public class AgentRunner {
             // Telemetry hardening (Phase 0): distinct tag from the main loop's "AGENT_RUNNER" so
             // the forced-salvage path (iteration budget exhausted) is separately measurable.
             com.sei.nexus.ai.LlmCallTag.set("AGENT_RUNNER_SALVAGE");
+            // Phase 9C — same transport-only migration as the main loop's call.
             AgentToolResponse response =
-                    openAi.chatWithTools(salvageMessages, systemPrompt, tools);
+                    openAi.respondWithTools(salvageMessages, systemPrompt, tools);
             String answer = extractFinalAnswer(response);
             return (answer != null && !answer.isBlank()) ? answer : null;
         } catch (Exception e) {

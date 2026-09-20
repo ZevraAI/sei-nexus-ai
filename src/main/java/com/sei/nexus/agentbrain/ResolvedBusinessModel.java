@@ -43,15 +43,15 @@ public record ResolvedBusinessModel(
         // tenant concept catalog, resolver unavailable, or narrowing inapplicable) — those
         // callers are unaffected and keep their exact prior behavior.
         boolean conceptScoped,
-        // Decision Router absorption (Persistent Knowledge combined concept+routing call):
-        // present only when the caller explicitly requested routing (AgentBrain#resolve's
-        // memoryAvailable-carrying overload) AND the File Search Stage 1 path actually produced
-        // one for at least one in-scope connection — see AgentBrain#conceptScopedModelWithRouting.
-        // Empty for every pre-existing caller/overload (autonomous agents, the legacy
-        // conversationId-free/-bearing overloads, the legacy catalog-in-prompt fallback), which
-        // must keep calling ChatService's own getLlmDecision() exactly as before. Java never
-        // constructs or infers this value itself — it is relayed verbatim from the LLM's own
-        // combined response.
+        // Stage 1 (Persistent Knowledge combined concept+routing call) is the sole semantic
+        // routing mechanism for the conversational Chat path (Phase 9E): present only when the
+        // caller explicitly requested routing (AgentBrain#resolve's memoryAvailable-carrying
+        // overload) AND the File Search Stage 1 path actually produced one for at least one
+        // in-scope connection — see AgentBrain#conceptScopedModelWithRouting. Empty for every
+        // other caller/overload (autonomous agents), or when Stage 1 could not establish routing
+        // for this request — in which case ChatService terminates the request with an explicit
+        // readiness outcome; there is no second routing LLM call. Java never constructs or infers
+        // this value itself — it is relayed verbatim from the LLM's own combined response.
         Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision,
         // Execution-authorization scope, kept SEPARATE from `objects` (Concept-Scoped Metadata
         // Narrowing's prompt-rendering selection). `objects`/`objectTargets`/`attributeTargets`
