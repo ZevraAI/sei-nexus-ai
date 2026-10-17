@@ -42,23 +42,29 @@ public class ExecutionContractBuilder {
         Map<String, ExecutionBindings.ExecutionTarget> attributeBindings = new LinkedHashMap<>();
         Set<ExecutionBindings.ApprovedAsset>           approvedAssets    = new LinkedHashSet<>();
 
-        // Prompt-rendering plane: exactly `model.objects()` — Concept-Scoped Metadata Narrowing's
-        // (possibly narrower) selection. Unchanged from before this method's execution-scope
-        // extension below; SemanticView continues to reflect only this set.
+        // Investigation-scope invariant (Phase 10B correction): Agent Brain owns the investigation
+        // scope, and Java must never expand it. `model.objects()`/`objectTargets()`/
+        // `attributeTargets()` — the SAME set SemanticView/prompt rendering uses — is now also the
+        // ONLY source of approvedAssets/objectBindings/attributeBindings. There is deliberately no
+        // second, broader binding pass here.
+        //
+        // `model.executionScope()` (the full, deterministic, domain/connection-scoped catalog,
+        // independent of which concepts Stage 1 selected for THIS question) is intentionally NOT
+        // consulted. Unioning it in was the exact violation Phase 10A/10B identified: it let any
+        // object in the tenant's full catalog execute even when Agent Brain (Stage 1) narrowed the
+        // investigation to a smaller concept set — e.g. a question resolving to `purchase_orders`
+        // alone could still execute SQL against `sales_orders`/`inventory`/etc. merely because
+        // those tables exist in the tenant's catalog, not because Agent Brain selected them.
+        //
+        // Tenant/connection physical authorization remains enforced independently and separately,
+        // as a deny-only ceiling — QueryGovernanceService.isTableAllowed (a connection-record
+        // allow-list) already runs downstream of this contract and can only further reject, never
+        // add to, what is bound here. That existing deny-only mechanism is untouched by this
+        // change and is what should be extended if a genuine "tenant may never touch table X at
+        // all, regardless of any investigation" rule is ever needed — it must never be a route
+        // back to expanding approvedAssets.
         bind(model.objects(), model.objectTargets(), model.attributeTargets(),
                 objectBindings, attributeBindings, approvedAssets);
-
-        // Execution-authorization plane: `model.executionScope()`, when present, is the full,
-        // deterministic, domain/connection-scoped object set — see ResolvedBusinessModel's own
-        // javadoc on this field. Bound into the SAME objectBindings/attributeBindings/
-        // approvedAssets (a pure union — Map.put/Set.add on identical keys is a no-op) so
-        // execution authorization is never narrower than this LLM-independent baseline,
-        // regardless of what Concept-Scoped Narrowing selected for THIS question's prompt.
-        // Absent (every pre-existing caller) ⇒ no-op, and approvedAssets is exactly what it was
-        // before this field existed — byte-identical backward compatibility.
-        model.executionScope().ifPresent(scope ->
-                bind(scope.objects(), scope.objectTargets(), scope.attributeTargets(),
-                        objectBindings, attributeBindings, approvedAssets));
 
         SemanticView      semanticView = new SemanticView(model.objects());
         ExecutionBindings bindings     = new ExecutionBindings(objectBindings, attributeBindings, approvedAssets);

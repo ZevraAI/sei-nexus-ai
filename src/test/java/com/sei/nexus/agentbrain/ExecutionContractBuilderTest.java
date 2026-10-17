@@ -86,83 +86,128 @@ class ExecutionContractBuilderTest {
                 "hash is over the agent and its approved surface, not the question or contractId");
     }
 
-    // ── Execution-authorization scope, kept separate from prompt content (the regression fix:
-    //     Concept-Scoped Metadata Narrowing must control prompt rendering only, never execution
-    //     authorization) ─────────────────────────────────────────────────────────────────────
+    // ── Investigation-scope invariant (Phase 10B correction): Agent Brain owns the investigation
+    //     scope; executionScope (the full domain/connection catalog) must NEVER be unioned into
+    //     approvedAssets/objectBindings. The two tests below replace
+    //     executionScopeExtendsApprovedAssetsBeyondTheNarrowedPromptSelection and
+    //     emptyNarrowedSelectionWithNonEmptyExecutionScopeStillApprovesTheExecutionScopeObjects,
+    //     which asserted the OLD (violating) union behavior — that behavior is intentionally
+    //     eliminated, not preserved. ─────────────────────────────────────────────────────────
 
     private static BusinessObject purchaseOrders() {
         return new BusinessObject("obj-po", "Purchase Orders", "orders",
                 List.of(new BusinessAttribute("col-po-id", "Id", AttributeRole.IDENTIFIER)), List.of());
     }
 
-    @Test
-    void executionScopeExtendsApprovedAssetsBeyondTheNarrowedPromptSelection() {
-        // "objects" (prompt content) contains ONLY inventory — e.g. what Concept-Scoped
-        // Narrowing selected for this question's rendering. "executionScope" is the full,
-        // connection-scoped catalog, which ALSO includes purchase_orders — an object the
-        // narrowed prompt selection never mentioned.
-        SemanticModel fullConnectionCatalog = new SemanticModel(
-                List.of(inventory(), purchaseOrders()),
-                Map.of("obj-inv", new PhysicalTable("conn-1", "retail_core", "inventory_balances"),
-                       "obj-po",  new PhysicalTable("conn-1", "retail_core", "purchase_orders")),
-                Map.of("col-onhand", new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "on_hand_qty"),
-                       "col-id",     new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "id"),
-                       "col-po-id",  new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id")));
-
-        ResolvedBusinessModel narrowedWithFullExecutionScope = new ResolvedBusinessModel(
-                "agent-1", List.of("conn-1"), "how much stock do we have?",
-                List.of(inventory()),
-                Map.of("obj-inv", new PhysicalTable("conn-1", "retail_core", "inventory_balances")),
-                Map.of("col-onhand", new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "on_hand_qty"),
-                       "col-id",     new PhysicalColumn("conn-1", "retail_core", "inventory_balances", "id")),
-                null, Map.of(), true, java.util.Optional.empty(),
-                java.util.Optional.of(fullConnectionCatalog));
-
-        ExecutionContract c = builder.compile(narrowedWithFullExecutionScope);
-
-        // Prompt content (SemanticView) stays exactly the narrowed selection — unchanged.
-        assertEquals(1, c.semanticView().businessObjects().size(),
-                "prompt rendering must still reflect only the narrowed (concept-scoped) selection");
-        assertEquals("Inventory Balance", c.semanticView().businessObjects().get(0).businessName());
-
-        // Execution authorization is NOT narrowed — purchase_orders, present only in
-        // executionScope (never in the narrowed prompt selection), is still approved.
-        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"),
-                "an object outside the narrowed prompt selection, but present in the full "
-                        + "connection-scoped executionScope, must remain executable");
-        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.INVENTORY_BALANCES"),
-                "the narrowed object itself remains approved too");
-        assertEquals("purchase_orders", c.executionBindings().objectBindings().get("obj-po").table(),
-                "objectBindings carries the union — GovernedSqlRuntime's 'Approved tables' listing "
-                        + "must be able to name this object too, not just the narrowed set");
+    private static BusinessObject salesOrders() {
+        return new BusinessObject("obj-so", "Sales Orders", "orders",
+                List.of(new BusinessAttribute("col-so-id", "Id", AttributeRole.IDENTIFIER)), List.of());
     }
 
+    /** The tenant's full domain/connection catalog: purchase_orders, sales_orders, inventory,
+     *  and customers — used across the tests below as "everything the tenant is authorized for,"
+     *  most of which Agent Brain did NOT select for a given investigation. */
+    private static SemanticModel fullTenantCatalog() {
+        return new SemanticModel(
+                List.of(purchaseOrders(), salesOrders(), inventoryBalances(), customers()),
+                Map.of("obj-po",   new PhysicalTable("conn-1", "retail_core", "purchase_orders"),
+                       "obj-so",   new PhysicalTable("conn-1", "retail_core", "sales_orders"),
+                       "obj-inv2", new PhysicalTable("conn-1", "retail_core", "inventory"),
+                       "obj-cust", new PhysicalTable("conn-1", "retail_core", "customers")),
+                Map.of("col-po-id", new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id"),
+                       "col-so-id", new PhysicalColumn("conn-1", "retail_core", "sales_orders", "id"),
+                       "col-inv2-id", new PhysicalColumn("conn-1", "retail_core", "inventory", "id"),
+                       "col-cust-id", new PhysicalColumn("conn-1", "retail_core", "customers", "id")));
+    }
+
+    private static BusinessObject inventoryBalances() {
+        return new BusinessObject("obj-inv2", "Inventory", "stock",
+                List.of(new BusinessAttribute("col-inv2-id", "Id", AttributeRole.IDENTIFIER)), List.of());
+    }
+
+    private static BusinessObject customers() {
+        return new BusinessObject("obj-cust", "Customers", "customers",
+                List.of(new BusinessAttribute("col-cust-id", "Id", AttributeRole.IDENTIFIER)), List.of());
+    }
+
+    /** Test 1 (single concept) + Test 3 (no semantic expansion) from the Phase 10 implementation
+     *  spec — this is the single most important test in this class: it proves Java does NOT
+     *  expand a single Agent-Brain-selected concept into the tenant's full catalog. */
     @Test
-    void emptyNarrowedSelectionWithNonEmptyExecutionScopeStillApprovesTheExecutionScopeObjects() {
-        // The exact regression scenario: Concept-Scoped Narrowing legitimately selected ZERO
-        // objects for this question's prompt (a real, honest "nothing relevant to render"
-        // outcome), but the connection has real, approved business data. Execution authorization
-        // must reflect that real data, not the empty narrowed selection.
-        SemanticModel fullConnectionCatalog = new SemanticModel(
+    void singleConceptInvestigationScopeIsNotExpandedByExecutionScope() {
+        ResolvedBusinessModel singleConceptModel = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "show me all open purchase orders",
                 List.of(purchaseOrders()),
                 Map.of("obj-po", new PhysicalTable("conn-1", "retail_core", "purchase_orders")),
-                Map.of("col-po-id", new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id")));
+                Map.of("col-po-id", new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id")),
+                null, Map.of(), true, java.util.Optional.empty(),
+                java.util.Optional.of(fullTenantCatalog()));
 
-        ResolvedBusinessModel emptyNarrowedModel = new ResolvedBusinessModel(
-                "agent-1", List.of("conn-1"), "show me all open purchase orders",
+        ExecutionContract c = builder.compile(singleConceptModel);
+
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"),
+                "the Agent-Brain-selected object must be approved");
+        assertFalse(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.SALES_ORDERS"),
+                "sales_orders must NOT be approved merely because it exists in the tenant catalog "
+                        + "— Agent Brain never selected it for this investigation");
+        assertFalse(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.INVENTORY"),
+                "inventory must NOT be approved either");
+        assertFalse(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.CUSTOMERS"),
+                "customers must NOT be approved either");
+        assertNull(c.executionBindings().objectBindings().get("obj-so"),
+                "objectBindings (and therefore describe_schema's own listing) must not carry "
+                        + "sales_orders either — not just approvedAssets");
+        assertEquals(1, c.executionBindings().approvedAssets().size(),
+                "approvedAssets must contain exactly the one Agent-Brain-selected object");
+    }
+
+    /** Test 2 (multiple concepts) — when Agent Brain selects two concepts, both their resolved
+     *  objects are approved, and still nothing else from the tenant catalog. */
+    @Test
+    void multipleConceptInvestigationScopeIncludesExactlyBothSelectedObjects() {
+        ResolvedBusinessModel twoConceptModel = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "compare purchase orders with sales orders",
+                List.of(purchaseOrders(), salesOrders()),
+                Map.of("obj-po", new PhysicalTable("conn-1", "retail_core", "purchase_orders"),
+                       "obj-so", new PhysicalTable("conn-1", "retail_core", "sales_orders")),
+                Map.of("col-po-id", new PhysicalColumn("conn-1", "retail_core", "purchase_orders", "id"),
+                       "col-so-id", new PhysicalColumn("conn-1", "retail_core", "sales_orders", "id")),
+                null, Map.of(), true, java.util.Optional.empty(),
+                java.util.Optional.of(fullTenantCatalog()));
+
+        ExecutionContract c = builder.compile(twoConceptModel);
+
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"));
+        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.SALES_ORDERS"));
+        assertFalse(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.INVENTORY"),
+                "inventory was never selected by Agent Brain — must remain unapproved");
+        assertFalse(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.CUSTOMERS"),
+                "customers was never selected by Agent Brain — must remain unapproved");
+        assertEquals(2, c.executionBindings().approvedAssets().size(),
+                "approvedAssets must contain exactly the two Agent-Brain-selected objects, nothing more");
+    }
+
+    /** Test 4 (ambiguous/empty concept selection) — when Agent Brain's concept resolution
+     *  legitimately produces an empty investigation scope, approvedAssets must be empty too,
+     *  regardless of what executionScope (the full tenant catalog) contains. This is the
+     *  inverse of the old "regression fix" test: an empty Agent-Brain decision must now
+     *  produce an empty executable surface, not a silent fallback to the full catalog. */
+    @Test
+    void emptyInvestigationScopeProducesEmptyApprovedAssetsRegardlessOfExecutionScope() {
+        ResolvedBusinessModel emptyModel = new ResolvedBusinessModel(
+                "agent-1", List.of("conn-1"), "show me all open orders",
                 List.of(), Map.of(), Map.of(),
                 null, Map.of(), true, java.util.Optional.empty(),
-                java.util.Optional.of(fullConnectionCatalog));
+                java.util.Optional.of(fullTenantCatalog()));
 
-        ExecutionContract c = builder.compile(emptyNarrowedModel);
+        ExecutionContract c = builder.compile(emptyModel);
 
         assertTrue(c.semanticView().businessObjects().isEmpty(),
-                "prompt content is legitimately empty — narrowing found nothing to render");
-        assertTrue(c.executionBindings().isApproved("conn-1", "RETAIL_CORE.PURCHASE_ORDERS"),
-                "THE FIX: execution authorization must not collapse to empty merely because "
-                        + "narrowing rendered nothing for this question's initial prompt");
-        assertFalse(c.executionBindings().approvedAssets().isEmpty(),
-                "approvedAssets must not be [] when the connection has real, approved business data");
+                "prompt content is legitimately empty — Agent Brain resolved nothing");
+        assertTrue(c.executionBindings().approvedAssets().isEmpty(),
+                "approvedAssets must be empty when Agent Brain's investigation scope is empty — "
+                        + "no falling back to the tenant's full catalog");
+        assertTrue(c.isEmpty(), "an empty investigation scope must produce an empty (non-executable) contract");
     }
 
     @Test
