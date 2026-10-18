@@ -19,6 +19,8 @@ Edit `src/`, set `ZG.meta.reviewed`, then run `python tools/build.py`, `python t
 Always: read the code before writing a claim; mark illustrative examples; never state an absolute the code
 does not enforce; keep "Known limits" honest. **Never publish the guide on the public docs site** (`zevra-docs`
 deploys publicly on every merge); it is private by design.
+It is also embedded in zevra-ui at `#/guide` (Admin menu, **Zevra platform admins only**), imported directly from
+`built/`, so after you rebuild the guide the app picks it up at the next UI build: there is no second copy.
 
 When you plan or finish an architectural change or feature, state which guide sections you updated, or say
 explicitly that none were affected and why.
