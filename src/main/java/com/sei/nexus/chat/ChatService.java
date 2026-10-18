@@ -1818,6 +1818,14 @@ public class ChatService {
               boilerplate purpose such as "This dataset lists all X with details." Never invent
               rows, values, columns, or entities. A dataset that exists but is not directly
               responsive to the question may be omitted entirely, or included with "display": false.
+              SUPPORTING EVIDENCE: a dataset gathered only to check how the data is stored or which
+              values exist (a verification step, such as the distinct values of a column) supports
+              the answer; it is not the answer. If you include it, title it for what it literally
+              contains (for example "Values found in the status column"), and make any "purpose"
+              state only what the rows show (which values appear, how many rows), never a conclusion
+              the rows cannot show by themselves. A value missing from such a list means no row has
+              it right now, not that it is invalid or unused. Never present it as the result of the
+              user's question.
             - "HIGHLIGHT": use ONLY when there is a specific, important observation that deserves
               separate visual emphasis AND that observation is NOT already contained in "answer".
               For example, if "answer" already says "Open purchase orders total 5, with Marcus
