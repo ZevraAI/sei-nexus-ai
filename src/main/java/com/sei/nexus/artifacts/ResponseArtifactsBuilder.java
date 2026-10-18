@@ -36,13 +36,11 @@ import java.util.regex.Pattern;
  * Zevra draws between reasoning (the model) and runtime (validated, computational facts about the
  * evidence).
  *
- * <p><b>Metrics are the one exception to that split</b> — see {@link #metrics}: the model's own
- * whole-answer headline figures (declared alongside {@code sections} in the JSON contract) are
- * preferred outright when present, since only the model has the holistic, across-the-whole-answer
- * view needed to judge something like "top buyer" or "total value" worth surfacing. The
- * pre-existing mechanical row-count/distinct-count computation remains, demoted to a fallback tier
- * used only when the model supplies no metrics — the same fallback pattern already established for
- * chart hints and labels.
+ * <p><b>Metrics are the one exception to that split</b> — see {@link #metrics}: they are the model's
+ * own whole-answer headline figures (declared alongside {@code sections} in the JSON contract),
+ * relayed verbatim. Java computes none of its own: a row count or column total taken from whichever
+ * dataset happened to be selected says nothing about what the user asked, so no model metrics
+ * means no tiles.
  */
 public final class ResponseArtifactsBuilder {
 
@@ -112,7 +110,7 @@ public final class ResponseArtifactsBuilder {
                 followUpQuestions,
                 resolvedSections != null ? resolvedSections : List.of(),
                 evidence(queryData, investigationDatasets),
-                metrics(queryData, investigationDatasets, llmSemantics),
+                metrics(llmSemantics),
                 trail(reasoningSteps),
                 agentContext);
     }
@@ -425,175 +423,16 @@ public final class ResponseArtifactsBuilder {
         return set.size();
     }
 
-    // ── Metrics — TWO tiers, in preference order:
-    //   1. LLM-authored, whole-answer headline figures (see ChatService.DATA_ANSWER_JSON_SYSTEM_
-    //      PROMPT's METRICS rules) — the model has visibility into the ENTIRE evidence set for
-    //      this answer, so it can propose a genuinely holistic figure (a top performer, a total,
-    //      an earliest/latest value) that a per-column shape heuristic could never infer. Used
-    //      outright, verbatim, whenever the model supplied a non-empty list — Java performs ZERO
-    //      interpretation of what a metric means or how its value is formatted, only a mechanical
-    //      non-blank existence check (already applied when parsing, see ChatService#
-    //      parseStructuredAnswer). A legitimately empty list from the model (it judged nothing
-    //      beyond the obvious count worth headlining) still falls through to tier 2 below — an
-    //      empty metrics tile row is worse than the honest mechanical fallback, so "the model
-    //      supplied nothing" and "the model supplied an empty list" are treated the same: fall
-    //      back rather than show nothing when a mechanical figure is available.
-    //   2. The pre-existing Java-side shape heuristic below (originally Chat.jsx's
-    //      deriveKeyMetrics(), moved server-side) — result count; a numeric column's total; a
-    //      categorical column's distinct-value count — kept EXACTLY as before, now demoted to the
-    //      fallback tier used only when the model supplied no metrics at all. ─────────────────
-    private static List<ResponseArtifacts.Metric> metrics(List<Map<String, Object>> queryData,
-            List<Map<String, Object>> investigationDatasets, StructuredAnswer llmSemantics) {
-        if (llmSemantics != null && llmSemantics.metrics() != null && !llmSemantics.metrics().isEmpty()) {
-            return llmSemantics.metrics().stream()
-                    .map(m -> new ResponseArtifacts.Metric(m.label(), m.value()))
-                    .toList();
-        }
-        return metrics(queryData, investigationDatasets);
-    }
-
-    private static final Pattern CATEGORY_COL = Pattern.compile(
-            "status|state|type|categ|supplier|owner|location|region|priority", Pattern.CASE_INSENSITIVE);
-
-    /**
-     * Finds, among {@code investigationDatasets} (see {@code ChatService#investigationDatasetsToMaps}),
-     * the one step whose rows are exactly {@code queryData} — a purely mechanical content match
-     * (both are independently derived, elsewhere, from the very same step's rows), used ONLY to
-     * look up that step's own optional LLM-authored labels (see ReasoningPlanner.SYSTEM_PROMPT's
-     * OPTIONAL HUMAN-READABLE LABELS guidance) for the metric tiles below. Returns an empty map
-     * (never null) when no match is found — every caller below falls back to the mechanical
-     * casing transform in that case, exactly as if no hint existed.
-     */
-    private static Map<String, Object> matchingDatasetHint(List<Map<String, Object>> queryData,
-            List<Map<String, Object>> investigationDatasets) {
-        if (investigationDatasets == null || queryData == null) return Map.of();
-        for (Map<String, Object> ds : investigationDatasets) {
-            if (queryData.equals(ds.get("rows"))) return ds;
-        }
-        return Map.of();
-    }
-
-    /**
-     * Purely mechanical, meaning-blind casing transform — snake_case/kebab-case/UPPER_SNAKE to
-     * "Title Case With Spaces". Identical in kind to the frontend's pre-existing {@code fmtLabel}/
-     * {@code colLabel} helpers (DataViz.jsx / Chat.jsx) — no lookup table, no awareness of what
-     * the words mean, just casing/punctuation. Used ONLY as the fallback when the model didn't
-     * supply its own plain-English label for this column (see the OPTIONAL HUMAN-READABLE LABELS
-     * guidance) — the LLM-authored label is always preferred when present.
-     */
-    private static String titleCase(String key) {
-        if (key == null || key.isBlank()) return key;
-        StringBuilder sb = new StringBuilder();
-        boolean capitalizeNext = true;
-        for (char c : key.toLowerCase(Locale.ROOT).toCharArray()) {
-            if (c == '_' || c == '-') {
-                sb.append(' ');
-                capitalizeNext = true;
-            } else if (capitalizeNext) {
-                sb.append(Character.toUpperCase(c));
-                capitalizeNext = false;
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Purely mechanical, meaning-blind English pluralization by standard spelling suffix rules —
-     * the same category of transform as {@link #titleCase}: no vocabulary, no lookup table, just
-     * spelling. Applied to the trailing snake_case/kebab-case word only (e.g. "order_status" →
-     * "order_statuses"), so a multi-word column name pluralizes the noun that actually needs it
-     * rather than mangling the whole key. Rules (checked in order): a word ending in
-     * s/x/z/ch/sh takes "es" ("status" → "statuses", "box" → "boxes"); a word ending in a
-     * consonant + "y" changes "y" to "ies" ("category" → "categories"); anything else takes a
-     * plain "s" ("product" → "products"). KNOWN, ACCEPTED LIMITATION: irregular English plurals
-     * (e.g. "person" → "people", "child" → "children") are NOT handled — a purely mechanical,
-     * meaning-blind suffix rule cannot distinguish them from a regular noun, and a dictionary of
-     * irregulars would itself be exactly the kind of lookup-table "intelligence" this file must
-     * avoid. Irregular columns render with the regular-suffix result instead (e.g. "persons",
-     * not "people") rather than silently falling back to the unpluralized singular.
-     */
-    private static String pluralize(String key) {
-        if (key == null || key.isBlank()) return key;
-        int splitAt = Math.max(key.lastIndexOf('_'), key.lastIndexOf('-'));
-        String prefix = splitAt >= 0 ? key.substring(0, splitAt + 1) : "";
-        String word = splitAt >= 0 ? key.substring(splitAt + 1) : key;
-        if (word.isBlank()) return key;
-        String lower = word.toLowerCase(Locale.ROOT);
-        String pluralWord;
-        if (lower.endsWith("s") || lower.endsWith("x") || lower.endsWith("z")
-                || lower.endsWith("ch") || lower.endsWith("sh")) {
-            pluralWord = word + "es";
-        } else if (lower.endsWith("y") && word.length() > 1
-                && "aeiou".indexOf(lower.charAt(lower.length() - 2)) < 0) {
-            pluralWord = word.substring(0, word.length() - 1) + "ies";
-        } else {
-            pluralWord = word + "s";
-        }
-        return prefix + pluralWord;
-    }
-
-    private static List<ResponseArtifacts.Metric> metrics(List<Map<String, Object>> queryData,
-            List<Map<String, Object>> investigationDatasets) {
-        if (queryData == null || queryData.isEmpty()) return List.of();
-        List<ResponseArtifacts.Metric> out = new ArrayList<>();
-        out.add(new ResponseArtifacts.Metric(
-                titleCase(queryData.size() == 1 ? "result" : "results"), String.valueOf(queryData.size())));
-
-        // Optional LLM-authored labels for whichever step produced this exact queryData (see
-        // matchingDatasetHint above) — verbatim relay only; Java performs no interpretation of
-        // what they mean, only a mechanical fallback when absent.
-        Map<String, Object> hint = matchingDatasetHint(queryData, investigationDatasets);
-        String hintChartType = strOrNull(hint.get("chartType"));
-        String hintMetricLabel = strOrNull(hint.get("metricLabel"));
-        String hintCategoryKey = strOrNull(hint.get("categoryKey"));
-        String hintCategoryLabel = strOrNull(hint.get("categoryLabel"));
-        List<String> hintValueKeys = stringList(hint.get("valueKeys"));
-        List<String> hintValueLabels = stringListPreserveBlanks(hint.get("valueLabels"));
-
-        Map<String, String> types = columnTypes(queryData);
-        String numCol = types.entrySet().stream()
-                .filter(e -> "numeric".equals(e.getValue())).map(Map.Entry::getKey).findFirst().orElse(null);
-        if (numCol != null) {
-            double total = queryData.stream().mapToDouble(r -> {
-                try {
-                    return Double.parseDouble(String.valueOf(r.get(numCol)));
-                } catch (Exception e) {
-                    return 0;
-                }
-            }).sum();
-            String value = total == Math.floor(total) && !Double.isInfinite(total)
-                    ? String.valueOf((long) total) : String.valueOf(total);
-            // Label preference, highest first: (1) an explicit metric_label declared for a
-            // "stats"-shaped single headline figure, (2) a value_labels entry aligned by index
-            // with value_keys, (3) the mechanical casing fallback — never the raw column alias.
-            String label;
-            if ("stats".equals(hintChartType) && hintMetricLabel != null && queryData.size() == 1) {
-                label = hintMetricLabel;
-            } else {
-                int idx = hintValueKeys.indexOf(numCol);
-                String fromHint = (idx >= 0 && idx < hintValueLabels.size()) ? hintValueLabels.get(idx) : null;
-                label = "Total " + ((fromHint != null && !fromHint.isBlank()) ? fromHint : titleCase(numCol));
-            }
-            out.add(new ResponseArtifacts.Metric(label, value));
-        }
-        String catCol = types.keySet().stream()
-                .filter(c -> !c.equals(numCol) && CATEGORY_COL.matcher(c).find()).findFirst().orElse(null);
-        if (catCol != null) {
-            int unique = uniqueCount(queryData, catCol);
-            if (unique > 1 && unique < queryData.size()) {
-                // The mechanical fallback (no LLM-authored category label available) renders
-                // "Distinct <column>" — since this metric counts how many DISTINCT values the
-                // column has, the column name reads better pluralized (e.g. "Distinct Statuses",
-                // not "Distinct Status"). An LLM-authored hintCategoryLabel is relayed verbatim,
-                // unpluralized — it's already the model's own phrasing, not this mechanical path.
-                String catLabel = (catCol.equals(hintCategoryKey) && hintCategoryLabel != null)
-                        ? hintCategoryLabel : titleCase(pluralize(catCol));
-                out.add(new ResponseArtifacts.Metric("Distinct " + catLabel, String.valueOf(unique)));
-            }
-        }
-        return out.size() > 3 ? out.subList(0, 3) : out;
+    // ── Metrics — the model's own whole-answer headline figures (see ChatService.DATA_ANSWER_JSON_
+    // SYSTEM_PROMPT's METRICS rules), relayed verbatim. Java adds none of its own: a row count or a
+    // column total computed from whichever dataset happened to be selected says nothing about what
+    // the user asked (it once read "1 Result" above an answer of "no such records", because the only
+    // rows were a list of values used to verify that). No model metrics means no tiles. ───────────
+    private static List<ResponseArtifacts.Metric> metrics(StructuredAnswer llmSemantics) {
+        if (llmSemantics == null || llmSemantics.metrics() == null) return List.of();
+        return llmSemantics.metrics().stream()
+                .map(m -> new ResponseArtifacts.Metric(m.label(), m.value()))
+                .toList();
     }
 
     // ── Trail — normalizes the two independently-shaped reasoningSteps sources (conversational:

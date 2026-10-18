@@ -74,7 +74,7 @@ class ResponseArtifactsBuilderTest {
     }
 
     @Test
-    void categoricalPlusNumericDatasetProducesBarChartHintAndMetrics() {
+    void categoricalPlusNumericDatasetProducesBarChartHintAndNoJavaBuiltMetrics() {
         List<Map<String, Object>> rows = List.of(
                 row("supplier", "Acme", "value", 100),
                 row("supplier", "Globex", "value", 200),
@@ -93,50 +93,7 @@ class ResponseArtifactsBuilderTest {
         assertEquals("supplier", chart.xKey());
         assertEquals(List.of("value"), chart.yKeys());
 
-        assertEquals(3, a.metrics().size());
-        // "Results" — Title Case, consistent with every other metric label (previously the only
-        // lowercase label in the strip; see ResponseArtifactsBuilder#titleCase applied here).
-        assertEquals("Results", a.metrics().get(0).label());
-        assertEquals("3", a.metrics().get(0).value());
-        // No LLM-declared metric/value label was available for this dataset (no matching
-        // investigationDatasets hint) — labels fall back to the mechanical, meaning-blind
-        // Title Case transform (see ResponseArtifactsBuilder#titleCase), never the raw column
-        // alias verbatim (the exact production defect this fallback change fixes).
-        assertEquals("Total Value", a.metrics().get(1).label());
-        assertEquals("350", a.metrics().get(1).value());
-        // "Distinct Suppliers" — this metric counts DISTINCT values, so the mechanical fallback
-        // now pluralizes the column name via standard suffix rules (see
-        // ResponseArtifactsBuilder#pluralize) before title-casing it, rather than the
-        // grammatically-off singular "Distinct Supplier".
-        assertEquals("Distinct Suppliers", a.metrics().get(2).label());
-        assertEquals("2", a.metrics().get(2).value());
-    }
-
-    // LLM-authored metric labels (OPTIONAL HUMAN-READABLE LABELS guidance): when the same rows
-    // also appear as an investigationDatasets entry carrying category_label/value_labels, those
-    // verbatim LLM-authored labels are preferred over the mechanical Title Case fallback — Java
-    // performs no lookup, no domain inference, only a mechanical existence/length check before
-    // relaying the model's own strings.
-    @Test
-    void llmAuthoredValueAndCategoryLabelsArePreferredOverMechanicalFallback() {
-        List<Map<String, Object>> rows = List.of(
-                row("status", "OPEN", "order_count", 7),
-                row("status", "PARTIALLY_RECEIVED", "order_count", 3));
-
-        Map<String, Object> ds = row(
-                "stepNo", 1, "description", "Breakdown", "rows", rows,
-                "chartType", "bar", "categoryKey", "status", "categoryLabel", "Order Status",
-                "valueKeys", List.of("order_count"), "valueLabels", List.of("Order Count"),
-                "metricLabel", null);
-
-        ResponseArtifacts a = ResponseArtifactsBuilder.build(
-                "Group orders by status", "Most orders are open.",
-                List.of(), rows, List.of(ds), List.of(), null, null);
-
-        var totalMetric = a.metrics().stream()
-                .filter(m -> m.label().startsWith("Total")).findFirst().orElseThrow();
-        assertEquals("Total Order Count", totalMetric.label(),
-                "the model's own value_labels entry must be used verbatim, not the raw 'order_count' alias");
+        assertTrue(a.metrics().isEmpty(), "Java builds no headline figures of its own");
     }
 
     @Test
@@ -531,13 +488,10 @@ class ResponseArtifactsBuilderTest {
     }
 
     // 9. Deterministic evidence — chart/data evidence remains runtime-derived from queryData
-    //    regardless of llmSemantics; the model has no influence over it at all. Metrics are the
-    //    one exception (see the "LLM-authored metrics" tests below) — but ONLY when the model
-    //    actually supplies a non-empty metrics list; a StructuredAnswer whose metrics() is empty
-    //    (e.g. this one, built via the pre-metrics 6-arg constructor) still falls through to the
-    //    exact same mechanical computation as llmSemantics == null.
+    //    regardless of llmSemantics; the model has no influence over it at all. Metrics come only
+    //    from the model: a StructuredAnswer with no metrics yields none, never a Java-built figure.
     @Test
-    void evidenceAlwaysRuntimeDerivedAndMetricsFallBackWhenLlmSuppliesNoMetrics() {
+    void evidenceAlwaysRuntimeDerivedAndMetricsComeOnlyFromTheModel() {
         List<Map<String, Object>> rows = List.of(
                 row("supplier", "Acme", "value", 100),
                 row("supplier", "Globex", "value", 200));
@@ -551,9 +505,8 @@ class ResponseArtifactsBuilderTest {
 
         assertEquals(withoutLlm.evidence(), withLlm.evidence(),
                 "evidence is computed from queryData only — identical regardless of llmSemantics");
-        assertEquals(withoutLlm.metrics(), withLlm.metrics(),
-                "an empty LLM metrics list falls back to the same mechanical computation as no llmSemantics at all");
-        assertFalse(withoutLlm.metrics().isEmpty(), "sanity: the mechanical fallback itself produced metrics here");
+        assertTrue(withLlm.metrics().isEmpty());
+        assertTrue(withoutLlm.metrics().isEmpty());
     }
 
     // 10. LLM-authored metrics take precedence outright over the mechanical row-count/distinct-
@@ -586,11 +539,10 @@ class ResponseArtifactsBuilderTest {
         assertTrue(a.metrics().stream().noneMatch(m -> "Results".equals(m.label())));
     }
 
-    // 11. The mechanical fallback still works exactly as before when llmSemantics is null
-    //     entirely (a response that never went through structured composition) — the LLM-metrics
-    //     addition never removes this safety net.
+    // 11. With no model semantics at all there are no headline figures: Java never fills the gap with a
+    //     row count (which once read "1 Result" above an answer of "no such records").
     @Test
-    void mechanicalMetricsFallbackStillWorksWhenLlmSemanticsIsAbsentEntirely() {
+    void noMetricsAreInventedWhenLlmSemanticsIsAbsentEntirely() {
         List<Map<String, Object>> rows = List.of(
                 row("status", "OPEN", "amount", 100),
                 row("status", "CLOSED", "amount", 200),
@@ -599,9 +551,7 @@ class ResponseArtifactsBuilderTest {
         ResponseArtifacts a = ResponseArtifactsBuilder.build(
                 "q", "answer", List.of(), rows, List.of(), List.of(), null, null);
 
-        assertFalse(a.metrics().isEmpty());
-        assertEquals("Results", a.metrics().get(0).label());
-        assertEquals("3", a.metrics().get(0).value());
+        assertTrue(a.metrics().isEmpty());
     }
 
     // 10. No additional LLM call — structural, not runtime-observable: build() takes an
