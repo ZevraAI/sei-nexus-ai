@@ -88,7 +88,11 @@ public class ReasoningEvaluator {
                RETURNED to the user is the test. Rows gathered only to CHECK how the data is
                stored (a diagnostic sample, a value range, a list of distinct values) are
                never the answer to the user's question — they do not match, so answer false
-               — unless the question itself asked for exactly that listing. A count, total, or description OF the existing
+               — unless the question itself asked for exactly that listing. ONE EXCEPTION: when
+               an earlier step already ran the question's own query and returned 0 rows, and a
+               later check has shown that its filter matches how the data is stored, that
+               confirmed empty result IS the answer ("none exist"): answer true, and choose
+               SUFFICIENT — the check's rows only support it. A count, total, or description OF the existing
                rows, completely unchanged, is the only case where resultSetMatches is true for a
                follow-up that narrows, reorders, or otherwise reshapes what was gathered before.
 
