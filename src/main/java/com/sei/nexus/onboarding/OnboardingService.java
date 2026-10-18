@@ -758,7 +758,6 @@ public class OnboardingService {
         try {
             // Agent children first (FK order)
             jdbc.update("DELETE FROM nexus_agent_kpi      WHERE agent_key = 'data-analyst'");
-            jdbc.update("DELETE FROM nexus_agent_playbook WHERE agent_key = 'data-analyst'");
             jdbc.update("DELETE FROM nexus_agent_version  WHERE agent_key = 'data-analyst'");
             deletedAgents = jdbc.update("DELETE FROM nexus_agent WHERE agent_key = 'data-analyst'");
         } catch (Exception e) {

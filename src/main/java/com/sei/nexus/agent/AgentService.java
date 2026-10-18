@@ -130,43 +130,6 @@ public class AgentService {
     }
 
     /**
-     * Adds a playbook to the given agent.
-     */
-    public AgentPlaybook addPlaybook(String agentKey, Map<String, Object> req) {
-        agentRepository.findByKey(agentKey)
-            .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
-                "Agent not found: " + agentKey));
-
-        String name = required(req, "name");
-        String playbookKey = req.containsKey("playbookKey") && req.get("playbookKey") != null
-            ? req.get("playbookKey").toString()
-            : Keys.uniqueKey("pb-" + agentKey + "-" + Keys.key(name));
-
-        Double confidenceThreshold = req.get("confidenceThreshold") != null
-            ? ((Number) req.get("confidenceThreshold")).doubleValue() : null;
-        Integer maxSteps = req.get("maxInvestigationSteps") != null
-            ? ((Number) req.get("maxInvestigationSteps")).intValue() : null;
-
-        Instant now = Instant.now();
-        AgentPlaybook playbook = new AgentPlaybook(
-            playbookKey,
-            agentKey,
-            name,
-            (String) req.get("triggerConditions"),
-            (String) req.get("investigationSteps"),
-            (String) req.get("escalationRules"),
-            confidenceThreshold,
-            (String) req.get("preferredEvidenceOrder"),
-            maxSteps,
-            "ACTIVE",
-            now,
-            now);
-
-        agentRepository.savePlaybook(playbook);
-        return playbook;
-    }
-
-    /**
      * Adds a KPI to the given agent. Validates measurementSql if provided.
      */
     public AgentKpi addKpi(String agentKey, Map<String, Object> req) {

@@ -130,7 +130,8 @@ public class AgentRunner {
                     null, System.currentTimeMillis() - resolveStart));
 
             // 2. Build system prompt (grounded only in approved business objects).
-            String systemPrompt = buildSystemPrompt(agent, grounding);
+            String systemPrompt = buildSystemPrompt(agent, grounding,
+                    repository.findPlaybooks(agent.id(), agent.tenantSchema()));
 
             // 3. Build tool definitions
             List<Map<String, Object>> tools =
@@ -401,14 +402,40 @@ public class AgentRunner {
      * information_schema (ADR-0003 A12).
      */
     static String buildSystemPrompt(ZevraAgent agent, String grounding) {
+        return buildSystemPrompt(agent, grounding, List.of());
+    }
+
+    static String buildSystemPrompt(ZevraAgent agent, String grounding, List<ZevraPlaybook> playbooks) {
         StringBuilder sb = new StringBuilder();
         sb.append(agent.persona()).append(' ').append(agent.goal()).append("\n\n");
         sb.append(grounding).append('\n');
+        sb.append(renderPlaybooks(playbooks));
         sb.append("CRITICAL: You may ONLY query the business objects listed above, using their exact "
                 + "physical table names. Do NOT invent tables or business objects. If the data the user "
                 + "asks about is not among these business objects, say so plainly via final_answer instead "
                 + "of guessing. SELECT only. Query data, then call final_answer with findings. Be factual.");
         return sb.toString();
+    }
+
+    /**
+     * The agent's playbooks, shown to the model so IT decides whether one applies to this request
+     * (nothing in Java matches on keywords). Empty when the agent has none.
+     */
+    static String renderPlaybooks(List<ZevraPlaybook> playbooks) {
+        if (playbooks == null || playbooks.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder("\nPLAYBOOKS - your organisation's approved ways of investigating. "
+                + "If the request matches a playbook's \"Use when\", follow its steps in order (you may add "
+                + "steps the data requires); if none matches, ignore them all. Tool and data limits above "
+                + "always win over a playbook. If you used one, name it in your final answer.\n");
+        int n = 1;
+        for (ZevraPlaybook p : playbooks) {
+            sb.append('\n').append(n++).append(". ").append(p.name()).append('\n')
+              .append("   Use when: ").append(p.whenToUse()).append('\n')
+              .append("   Steps: ").append(p.steps()).append('\n');
+            if (p.evidenceOrder() != null) sb.append("   Evidence order: ").append(p.evidenceOrder()).append('\n');
+            if (p.escalation() != null) sb.append("   Escalate / flag when: ").append(p.escalation()).append('\n');
+        }
+        return sb.append('\n').toString();
     }
 
     private Map<String, Object> step(String type, Map<String, Object> input,

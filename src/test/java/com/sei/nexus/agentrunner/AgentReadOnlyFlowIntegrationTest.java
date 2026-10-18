@@ -161,6 +161,9 @@ class AgentReadOnlyFlowIntegrationTest {
         InMemoryRepository() { super(null); }
 
         @Override public void insertSession(ZevraSession s) { this.session = s; }
+        @Override public java.util.List<ZevraPlaybook> findPlaybooks(String agentId, String tenantSchema) {
+            return java.util.List.of();
+        }
 
         @Override public void completeSession(String sessionId, String status, String stepsJson,
                                               String finalOutput, String errorMessage, int iterations) {

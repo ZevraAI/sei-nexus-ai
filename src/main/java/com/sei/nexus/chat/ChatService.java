@@ -3,7 +3,6 @@ package com.sei.nexus.chat;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sei.nexus.agent.AgentPlaybook;
 import com.sei.nexus.artifacts.ResponseArtifacts;
 import com.sei.nexus.artifacts.ResponseArtifactsBuilder;
 import com.sei.nexus.agent.AgentRepository;
@@ -160,7 +159,7 @@ public class ChatService {
     // no context injection. true: an isolated, dedicated memory-selection call (not a change to
     // ReasoningEngine/ReasoningPlanner) selects already-remembered entity_keys and folds their
     // authoritative objects into the SQL planner's context, exactly like the existing
-    // learningContextBuilder/playbook injection.
+    // learningContextBuilder injection.
     @org.springframework.beans.factory.annotation.Value("${zevra.chat.conversation-memory.enabled:false}")
     private boolean chatMemoryEnabled;
 
@@ -659,11 +658,6 @@ public class ChatService {
                     // Build schema context string for the iterative planner.
                     // enrichedQuestion (with attachment content) is passed separately so
                     // the planner can extract WHERE IN values from uploaded files.
-                    String playbookCtx = "";
-                    if (agent != null) {
-                        List<AgentPlaybook> playbooks = agentRepository.findPlaybooksByAgent(agent.agentKey());
-                        if (!playbooks.isEmpty()) playbookCtx = "Playbook: " + playbooks.get(0).investigationSteps();
-                    }
                     // Zevra Cognitive Runtime baseline — measurement only: buildContextSummary
                     // makes no LLM call itself (confirmed by the investigation report), so this
                     // wall-clock figure is purely PostgreSQL retrieval (already-completed calls
@@ -679,7 +673,6 @@ public class ChatService {
                     long buildContextMs = (System.nanoTime() - buildContextStartNanos) / 1_000_000;
                     log.info("RETRIEVAL_TIMING stage=buildContextSummary wallClockMs={} note=noLlmCallInsideThisMethod",
                             buildContextMs);
-                    if (!playbookCtx.isBlank()) schemaCtx = schemaCtx + "\nPlaybook:\n" + playbookCtx;
 
                     // ── Phase 3: inject known conversation corrections into the planner context ──
                     // Promoted learned-mapping vocabulary is deliberately NOT injected here anymore —

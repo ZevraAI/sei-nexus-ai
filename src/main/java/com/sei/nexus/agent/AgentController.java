@@ -82,50 +82,6 @@ public class AgentController {
     }
 
     // -------------------------------------------------------------------------
-    // Playbooks
-    // -------------------------------------------------------------------------
-
-    /**
-     * GET /agents/{agentKey}/playbooks
-     */
-    @GetMapping("/{agentKey}/playbooks")
-    public ResponseEntity<List<AgentPlaybook>> listPlaybooks(@PathVariable String agentKey) {
-        return ResponseEntity.ok(agentRepository.findPlaybooksByAgent(agentKey));
-    }
-
-    /**
-     * POST /agents/{agentKey}/playbooks
-     */
-    @PostMapping("/{agentKey}/playbooks")
-    public ResponseEntity<AgentPlaybook> addPlaybook(@PathVariable String agentKey,
-                                                      @RequestBody Map<String, Object> body) {
-        AgentPlaybook playbook = agentService.addPlaybook(agentKey, body);
-        return ResponseEntity.status(HttpStatus.OK).body(playbook);
-    }
-
-    /**
-     * DELETE /agents/{agentKey}/playbooks/{playbookKey}
-     * Archives a playbook by setting its status to ARCHIVED.
-     */
-    @DeleteMapping("/{agentKey}/playbooks/{playbookKey}")
-    public ResponseEntity<Void> archivePlaybook(@PathVariable String agentKey,
-                                                 @PathVariable String playbookKey) {
-        // Soft-delete by saving with ARCHIVED status — reuse upsert with changed status
-        agentRepository.findPlaybooksByAgent(agentKey).stream()
-            .filter(p -> p.playbookKey().equals(playbookKey))
-            .findFirst()
-            .ifPresent(p -> {
-                AgentPlaybook archived = new AgentPlaybook(
-                    p.playbookKey(), p.agentKey(), p.name(), p.triggerConditions(),
-                    p.investigationSteps(), p.escalationRules(), p.confidenceThreshold(),
-                    p.preferredEvidenceOrder(), p.maxInvestigationSteps(),
-                    "ARCHIVED", p.createdAt(), java.time.Instant.now());
-                agentRepository.savePlaybook(archived);
-            });
-        return ResponseEntity.noContent().build();
-    }
-
-    // -------------------------------------------------------------------------
     // KPIs
     // -------------------------------------------------------------------------
 

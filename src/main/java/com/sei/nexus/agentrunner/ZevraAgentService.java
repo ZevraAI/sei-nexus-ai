@@ -68,6 +68,64 @@ public class ZevraAgentService {
         repository.archiveAgent(id, tenantSchema);
     }
 
+    // ── Playbooks ─────────────────────────────────────────────────────────────
+
+    public List<ZevraPlaybook> listPlaybooks(String agentId, String tenantSchema) {
+        getAgent(agentId, tenantSchema);
+        return repository.findPlaybooks(agentId, tenantSchema);
+    }
+
+    public ZevraPlaybook addPlaybook(String agentId, String tenantSchema, String name, String whenToUse,
+                                     String steps, String evidenceOrder, String escalation,
+                                     String createdBy) {
+        getAgent(agentId, tenantSchema);
+        ZevraPlaybook p = validated(null, agentId, tenantSchema, name, whenToUse, steps,
+                evidenceOrder, escalation, createdBy);
+        repository.insertPlaybook(p);
+        return repository.findPlaybooks(agentId, tenantSchema).stream()
+                .filter(x -> x.id().equals(p.id())).findFirst().orElse(p);
+    }
+
+    public ZevraPlaybook updatePlaybook(String agentId, String playbookId, String tenantSchema,
+                                        String name, String whenToUse, String steps,
+                                        String evidenceOrder, String escalation) {
+        ZevraPlaybook existing = listPlaybooks(agentId, tenantSchema).stream()
+                .filter(x -> x.id().equals(playbookId)).findFirst()
+                .orElseThrow(() -> new NexusException(HttpStatus.NOT_FOUND,
+                        "Playbook not found: " + playbookId));
+        ZevraPlaybook p = validated(playbookId, agentId, tenantSchema,
+                name != null ? name : existing.name(),
+                whenToUse != null ? whenToUse : existing.whenToUse(),
+                steps != null ? steps : existing.steps(),
+                evidenceOrder != null ? evidenceOrder : existing.evidenceOrder(),
+                escalation != null ? escalation : existing.escalation(),
+                existing.createdBy());
+        repository.updatePlaybook(p);
+        return p;
+    }
+
+    public void archivePlaybook(String agentId, String playbookId, String tenantSchema) {
+        getAgent(agentId, tenantSchema);
+        repository.archivePlaybook(playbookId, agentId, tenantSchema);
+    }
+
+    static ZevraPlaybook validated(String id, String agentId, String tenantSchema, String name,
+                                   String whenToUse, String steps, String evidenceOrder,
+                                   String escalation, String createdBy) {
+        if (name == null || name.isBlank())
+            throw new NexusException(HttpStatus.BAD_REQUEST, "A playbook needs a name.");
+        if (whenToUse == null || whenToUse.isBlank())
+            throw new NexusException(HttpStatus.BAD_REQUEST,
+                    "A playbook needs 'whenToUse': the kind of question it applies to.");
+        if (steps == null || steps.isBlank())
+            throw new NexusException(HttpStatus.BAD_REQUEST, "A playbook needs its investigation steps.");
+        return new ZevraPlaybook(id != null ? id : Keys.uniqueKey("pb"), agentId, tenantSchema,
+                name.trim(), whenToUse.trim(), steps.trim(), blankToNull(evidenceOrder),
+                blankToNull(escalation), "ACTIVE", createdBy, null, null);
+    }
+
+    private static String blankToNull(String s) { return s == null || s.isBlank() ? null : s.trim(); }
+
     // ── Execution ─────────────────────────────────────────────────────────────
 
     public ZevraSession chat(String agentId, String tenantSchema, String message, String userEmail) {

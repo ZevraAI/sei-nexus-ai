@@ -78,34 +78,6 @@ public class AgentRepository {
              WHERE agent_key = ? AND version_no = ?
             """;
 
-    private static final String UPSERT_PLAYBOOK = """
-            INSERT INTO nexus_agent_playbook
-                (playbook_key, agent_key, name, trigger_conditions, investigation_steps,
-                 escalation_rules, confidence_threshold, preferred_evidence_order,
-                 max_investigation_steps, status, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT (playbook_key) DO UPDATE SET
-                agent_key                = EXCLUDED.agent_key,
-                name                     = EXCLUDED.name,
-                trigger_conditions       = EXCLUDED.trigger_conditions,
-                investigation_steps      = EXCLUDED.investigation_steps,
-                escalation_rules         = EXCLUDED.escalation_rules,
-                confidence_threshold     = EXCLUDED.confidence_threshold,
-                preferred_evidence_order = EXCLUDED.preferred_evidence_order,
-                max_investigation_steps  = EXCLUDED.max_investigation_steps,
-                status                   = EXCLUDED.status,
-                updated_at               = NOW()
-            """;
-
-    private static final String FIND_PLAYBOOKS_BY_AGENT = """
-            SELECT playbook_key, agent_key, name, trigger_conditions, investigation_steps,
-                   escalation_rules, confidence_threshold, preferred_evidence_order,
-                   max_investigation_steps, status, created_at, updated_at
-              FROM nexus_agent_playbook
-             WHERE agent_key = ? AND status = 'ACTIVE'
-             ORDER BY name
-            """;
-
     private static final String UPSERT_KPI = """
             INSERT INTO nexus_agent_kpi
                 (kpi_key, agent_key, domain_key, kpi_name, kpi_description,
@@ -192,23 +164,6 @@ public class AgentRepository {
     }
 
     // -------------------------------------------------------------------------
-    // AgentPlaybook
-    // -------------------------------------------------------------------------
-
-    public void savePlaybook(AgentPlaybook p) {
-        jdbc.update(UPSERT_PLAYBOOK,
-            p.playbookKey(), p.agentKey(), p.name(), p.triggerConditions(),
-            p.investigationSteps(), p.escalationRules(), p.confidenceThreshold(),
-            p.preferredEvidenceOrder(), p.maxInvestigationSteps(), p.status(),
-            toTimestamp(p.createdAt() != null ? p.createdAt() : Instant.now()),
-            toTimestamp(p.updatedAt() != null ? p.updatedAt() : Instant.now()));
-    }
-
-    public List<AgentPlaybook> findPlaybooksByAgent(String agentKey) {
-        return jdbc.query(FIND_PLAYBOOKS_BY_AGENT, playbookMapper(), agentKey);
-    }
-
-    // -------------------------------------------------------------------------
     // AgentKpi
     // -------------------------------------------------------------------------
 
@@ -251,28 +206,6 @@ public class AgentRepository {
             rs.getInt("version_no"),
             rs.getString("snapshot"),
             toInstant(rs, "created_at"));
-    }
-
-    private RowMapper<AgentPlaybook> playbookMapper() {
-        return (rs, rowNum) -> {
-            Double confidenceThreshold = rs.getDouble("confidence_threshold");
-            if (rs.wasNull()) confidenceThreshold = null;
-            Integer maxSteps = rs.getInt("max_investigation_steps");
-            if (rs.wasNull()) maxSteps = null;
-            return new AgentPlaybook(
-                rs.getString("playbook_key"),
-                rs.getString("agent_key"),
-                rs.getString("name"),
-                rs.getString("trigger_conditions"),
-                rs.getString("investigation_steps"),
-                rs.getString("escalation_rules"),
-                confidenceThreshold,
-                rs.getString("preferred_evidence_order"),
-                maxSteps,
-                rs.getString("status"),
-                toInstant(rs, "created_at"),
-                toInstant(rs, "updated_at"));
-        };
     }
 
     private RowMapper<AgentKpi> kpiMapper() {

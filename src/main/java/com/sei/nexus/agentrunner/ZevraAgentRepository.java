@@ -97,6 +97,30 @@ public class ZevraAgentRepository {
              WHERE id=? AND tenant_schema=?
             """;
 
+    // ── Playbook SQL ──────────────────────────────────────────────────────────
+
+    private static final String PLAYBOOK_COLS =
+            "id, agent_id, tenant_schema, name, when_to_use, steps, evidence_order, escalation, "
+          + "status, created_by, created_at, updated_at";
+
+    private static final String INSERT_PLAYBOOK = """
+            INSERT INTO nexus_zevra_agent_playbook
+              (id, agent_id, tenant_schema, name, when_to_use, steps, evidence_order, escalation,
+               status, created_by, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,'ACTIVE',?,NOW(),NOW())
+            """;
+
+    private static final String UPDATE_PLAYBOOK = """
+            UPDATE nexus_zevra_agent_playbook
+               SET name=?, when_to_use=?, steps=?, evidence_order=?, escalation=?, updated_at=NOW()
+             WHERE id=? AND agent_id=? AND tenant_schema=? AND status='ACTIVE'
+            """;
+
+    private static final String ARCHIVE_PLAYBOOK = """
+            UPDATE nexus_zevra_agent_playbook SET status='ARCHIVED', updated_at=NOW()
+             WHERE id=? AND agent_id=? AND tenant_schema=?
+            """;
+
     // ── RowMappers ────────────────────────────────────────────────────────────
 
     private static final RowMapper<ZevraAgent> AGENT_RM = (rs, i) -> {
@@ -120,6 +144,13 @@ public class ZevraAgentRepository {
                 toInstant(rs.getTimestamp("updated_at"))
         );
     };
+
+    private static final RowMapper<ZevraPlaybook> PLAYBOOK_RM = (rs, i) -> new ZevraPlaybook(
+            rs.getString("id"), rs.getString("agent_id"), rs.getString("tenant_schema"),
+            rs.getString("name"), rs.getString("when_to_use"), rs.getString("steps"),
+            rs.getString("evidence_order"), rs.getString("escalation"), rs.getString("status"),
+            rs.getString("created_by"), toInstant(rs.getTimestamp("created_at")),
+            toInstant(rs.getTimestamp("updated_at")));
 
     private static final RowMapper<ZevraSession> SESSION_RM = (rs, i) ->
             new ZevraSession(
@@ -173,6 +204,33 @@ public class ZevraAgentRepository {
     public boolean slugExists(String slug, String tenantSchema) {
         Integer count = jdbc.queryForObject(SLUG_EXISTS, Integer.class, tenantSchema, slug);
         return count != null && count > 0;
+    }
+
+    // ── Playbook ops ──────────────────────────────────────────────────────────
+
+    public void insertPlaybook(ZevraPlaybook p) {
+        jdbc.update(INSERT_PLAYBOOK, p.id(), p.agentId(), p.tenantSchema(), p.name(), p.whenToUse(),
+                p.steps(), p.evidenceOrder(), p.escalation(), p.createdBy());
+    }
+
+    public void updatePlaybook(ZevraPlaybook p) {
+        int rows = jdbc.update(UPDATE_PLAYBOOK, p.name(), p.whenToUse(), p.steps(), p.evidenceOrder(),
+                p.escalation(), p.id(), p.agentId(), p.tenantSchema());
+        if (rows == 0)
+            throw new NexusException(HttpStatus.NOT_FOUND, "Playbook not found: " + p.id());
+    }
+
+    public void archivePlaybook(String id, String agentId, String tenantSchema) {
+        int rows = jdbc.update(ARCHIVE_PLAYBOOK, id, agentId, tenantSchema);
+        if (rows == 0)
+            throw new NexusException(HttpStatus.NOT_FOUND, "Playbook not found: " + id);
+    }
+
+    /** ACTIVE playbooks of one agent, in a stable order. */
+    public List<ZevraPlaybook> findPlaybooks(String agentId, String tenantSchema) {
+        return jdbc.query("SELECT " + PLAYBOOK_COLS + " FROM nexus_zevra_agent_playbook "
+                + "WHERE agent_id=? AND tenant_schema=? AND status='ACTIVE' ORDER BY name, id",
+                PLAYBOOK_RM, agentId, tenantSchema);
     }
 
     // ── Session ops ───────────────────────────────────────────────────────────

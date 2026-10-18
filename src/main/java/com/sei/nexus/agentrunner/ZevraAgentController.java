@@ -69,6 +69,36 @@ public class ZevraAgentController {
         return ResponseEntity.noContent().build();
     }
 
+    // ── Playbooks ─────────────────────────────────────────────────────────────
+
+    @GetMapping("/{id}/playbooks")
+    public ResponseEntity<List<ZevraPlaybook>> playbooks(@PathVariable String id) {
+        return ResponseEntity.ok(service.listPlaybooks(id, tenantSchema()));
+    }
+
+    @PostMapping("/{id}/playbooks")
+    public ResponseEntity<ZevraPlaybook> addPlaybook(@PathVariable String id,
+                                                     @RequestBody Map<String, Object> body) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.addPlaybook(
+                id, tenantSchema(), str(body, "name"), str(body, "whenToUse"), str(body, "steps"),
+                str(body, "evidenceOrder"), str(body, "escalation"), currentUser().email()));
+    }
+
+    @PutMapping("/{id}/playbooks/{playbookId}")
+    public ResponseEntity<ZevraPlaybook> updatePlaybook(@PathVariable String id,
+                                                        @PathVariable String playbookId,
+                                                        @RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(service.updatePlaybook(id, playbookId, tenantSchema(),
+                str(body, "name"), str(body, "whenToUse"), str(body, "steps"),
+                str(body, "evidenceOrder"), str(body, "escalation")));
+    }
+
+    @DeleteMapping("/{id}/playbooks/{playbookId}")
+    public ResponseEntity<Void> archivePlaybook(@PathVariable String id, @PathVariable String playbookId) {
+        service.archivePlaybook(id, playbookId, tenantSchema());
+        return ResponseEntity.noContent().build();
+    }
+
     // ── Chat ──────────────────────────────────────────────────────────────────
 
     @PostMapping("/{id}/chat")
