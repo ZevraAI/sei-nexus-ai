@@ -102,11 +102,8 @@ public class AgentBrain {
 
     /**
      * Same as {@link #resolve(String, List, List, String)}, additionally threading a {@code
-     * conversationId} through to {@link ConceptScopedMetadataResolver}'s Stage 1 so the File
-     * Search path (when enabled) can chain to the tenant's own prior turn in this conversation —
-     * see {@link ConceptScopedMetadataResolver#resolveObjectKeys(String, String, String)}. Purely
-     * additive: {@code null} (or a null {@link #conceptResolver}) reproduces the 4-arg overload's
-     * behavior exactly.
+     * conversationId} through to {@link ConceptScopedMetadataResolver}'s Stage 1 so a follow-up
+     * question can be resolved against the previous turn — see {@link ConceptScopedMetadataResolver}.
      */
     public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
                                          List<String> domainKeys, String question, String conversationId) {
@@ -115,12 +112,10 @@ public class AgentBrain {
 
     /**
      * Same as {@link #resolve(String, List, List, String, String)}, additionally requesting the
-     * Decision Router absorption: when {@code memoryAvailable} is non-null, the combined
-     * Persistent Knowledge / File Search LLM call is asked to also produce a routing decision
-     * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}), returned on
-     * {@link ResolvedBusinessModel#routingDecision()}. Passing {@code null} (the 5-arg overload)
-     * requests no routing at all — the exact prior call graph — so every existing caller
-     * (autonomous agents, any test) is entirely unaffected.
+     * Decision Router absorption: Stage 1 always produces a routing decision
+     * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}); it is returned on
+     * {@link ResolvedBusinessModel#routingDecision()} only when {@code memoryAvailable} is non-null
+     * (autonomous agents pass {@code null} and get no routing).
      *
      * @param memoryAvailable the one Java-computed runtime fact the LLM cannot obtain itself —
      *                        whether document memory was found relevant for this question. Only
@@ -136,28 +131,15 @@ public class AgentBrain {
                 ? ResolvedQuestion.empty(question == null ? "" : question)
                 : resolver.resolve(question, domainKeys);
 
-        Optional<SemanticModel> conceptScoped;
-        Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision;
-        List<String> resolvedConceptKeys;
-        // Concept-Level Disjunctive Ambiguity design: present only via the routing overload (the
-        // live ChatService call graph — see conceptScopedModelWithRouting's own javadoc). Left
-        // Optional.empty() for the memoryAvailable == null overload (conceptScopedModel), a dead
-        // path for ChatService's own live traffic — deliberately not extended, matching the
-        // "smallest insertion point, do not touch the dead path" discipline this change follows.
-        Optional<String> conceptAmbiguityClarification = Optional.empty();
-        if (memoryAvailable == null) {
-            ConceptScopedResolution r = conceptScopedModel(connectionKeys, question, conversationId);
-            conceptScoped = r.model();
-            routingDecision = Optional.empty();
-            resolvedConceptKeys = r.conceptKeys();
-        } else {
-            ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, question, conversationId, memoryAvailable);
-            conceptScoped = r.model();
-            routingDecision = r.routing();
-            resolvedConceptKeys = r.conceptKeys();
-            conceptAmbiguityClarification = r.conceptAmbiguityClarification();
-        }
-        SemanticModel model = conceptScoped.orElseGet(() -> assembleByFallback(connectionKeys, domainKeys));
+        // One Stage 1 path for every caller. memoryAvailable is null for callers with no document
+        // memory (autonomous agents) — the model is told "false" in that case.
+        ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, question, conversationId,
+                Boolean.TRUE.equals(memoryAvailable));
+        Optional<SemanticModel> conceptScoped = r.model();
+        Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision =
+                memoryAvailable == null ? Optional.empty() : r.routing();
+        List<String> resolvedConceptKeys = r.conceptKeys();
+        Optional<String> conceptAmbiguityClarification = r.conceptAmbiguityClarification();        SemanticModel model = conceptScoped.orElseGet(() -> assembleByFallback(connectionKeys, domainKeys));
 
         // Execution-authorization scope (kept separate from `model`/prompt rendering — see
         // ResolvedBusinessModel#executionScope). Concept-Scoped Metadata Narrowing exists to
@@ -218,11 +200,11 @@ public class AgentBrain {
      *
      * <ul>
      *   <li><b>Concept-scoped narrowing applies</b> (any scope — domain-free or domain-bearing):
-     *       {@link #conceptScopedModel} resolves the physical surface. {@code assembleByDomains}
+     *       {@link #conceptScopedModelWithRouting} resolves the physical surface. {@code assembleByDomains}
      *       is never called in this case.</li>
      *   <li><b>Concept-scoped narrowing does not apply</b> (no resolver wired, no connections, no
      *       active Pack on any in-scope connection, no tenant concept catalog yet, or any
-     *       failure — see {@link #conceptScopedModel}'s own fallback discipline): falls through
+     *       failure — see {@link #conceptScopedModelWithRouting}'s own fallback discipline): falls through
      *       to exactly the pre-existing behavior —
      *       <ul>
      *         <li><b>No business domains</b> (autonomous agents): the scope is the agent's
@@ -239,9 +221,9 @@ public class AgentBrain {
      *   </li>
      * </ul>
      */
-    /** The exact pre-concept-scoping assembly — reached whenever {@link #conceptScopedModel}
+    /** The exact pre-concept-scoping assembly — reached whenever {@link #conceptScopedModelWithRouting}
      *  is empty (see this method's own javadoc, retained above the method it now backs). {@link
-     *  #resolve} calls {@link #conceptScopedModel} directly and falls back to this method so it
+     *  #resolve} calls {@link #conceptScopedModelWithRouting} directly and falls back to this method so it
      *  can also record, alongside the model, whether concept-scoping actually produced it (see
      *  {@link ResolvedBusinessModel#conceptScoped()}). */
     private SemanticModel assembleByFallback(List<String> connectionKeys, List<String> domainKeys) {
@@ -256,56 +238,6 @@ public class AgentBrain {
         return narrowed.objects().isEmpty() ? byDomain : narrowed;
     }
 
-    /**
-     * Concept-Scoped Metadata Narrowing (upstream Agent Brain context reduction): when EVERY
-     * connection in scope has an active Industry Pack with a non-empty tenant concept catalog,
-     * a compact Stage 1 concept-selection LLM call decides which concepts are relevant to the
-     * question, and Stage 2 resolves that selection to exactly the physical objects bound to it
-     * — see {@link ConceptScopedMetadataResolver}. Absent for any reason (no resolver wired, no
-     * connections, no active pack on ANY of them, no tenant concept catalog yet, or any failure)
-     * ⇒ {@link Optional#empty()}, and the caller falls back to the full, unnarrowed assembly —
-     * never a partial narrowing across a mixed set of connections in this version.
-     *
-     * <p>This is a deliberate, additive divergence from this class's own "ranking never narrows
-     * the approved surface" principle (see this class's javadoc) — that principle governs the
-     * keyword-ranking step below, which still never narrows. Concept-scoped narrowing is a
-     * different, explicit mechanism: it only activates for a connection whose tenant has already
-     * gone through Pack application + LLM concept classification, and even then the LLM (never
-     * Java) decides what is relevant — the same non-negotiable ownership rule Apply Pack's own
-     * classification path already enforces.
-     */
-    private ConceptScopedResolution conceptScopedModel(List<String> connectionKeys, String question, String conversationId) {
-        if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
-            return new ConceptScopedResolution(Optional.empty(), List.of());
-        }
-        List<String> allObjectKeys = new ArrayList<>();
-        List<String> allConceptKeys = new ArrayList<>();
-        for (String connectionKey : connectionKeys) {
-            Optional<List<String>> objectKeys = conceptResolver.resolveObjectKeys(connectionKey, question, conversationId);
-            if (objectKeys.isEmpty()) return new ConceptScopedResolution(Optional.empty(), List.of());
-            allObjectKeys.addAll(objectKeys.get());
-            // Concept-Key Semantic Anchor design: a second, separate call for the exact concept_key(s)
-            // Stage 1 selected — never rederived from objectKeys, never inferred. Its own fallback
-            // discipline (Optional.empty() on anything that isn't a clean Stage 1 result) means a
-            // resolver that doesn't support this yet (or fails) simply contributes no concept keys,
-            // without affecting the objectKeys-driven narrowing decision above in any way.
-            conceptResolver.resolveConceptKeys(connectionKey, question, conversationId)
-                    .ifPresent(allConceptKeys::addAll);
-        }
-        List<String> distinctConceptKeys = allConceptKeys.stream().distinct().toList();
-        if (allObjectKeys.isEmpty()) {
-            // Every in-scope connection is concept-classified, and the LLM found none of the
-            // available concepts relevant — a legitimate, honest "nothing applies" outcome.
-            return new ConceptScopedResolution(
-                    Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), distinctConceptKeys);
-        }
-        return new ConceptScopedResolution(Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), distinctConceptKeys);
-    }
-
-    /** {@link #conceptScopedModel}'s result, additionally carrying the exact concept_key(s) Stage 1
-     *  selected (Concept-Key Semantic Anchor design) — see {@link ResolvedBusinessModel#resolvedConceptKeys()}. */
-    private record ConceptScopedResolution(Optional<SemanticModel> model, List<String> conceptKeys) {}
-
     /** Combined semantic model + routing decision, additionally carrying the exact concept_key(s)
      *  Stage 1 selected (Concept-Key Semantic Anchor design) — see {@link #conceptScopedModelWithRouting}
      *  and {@link ResolvedBusinessModel#resolvedConceptKeys()} — and the Concept-Level Disjunctive
@@ -317,7 +249,7 @@ public class AgentBrain {
                                             Optional<String> conceptAmbiguityClarification) {}
 
     /**
-     * Same as {@link #conceptScopedModel}, additionally requesting the Decision Router
+     * Same as {@link #conceptScopedModelWithRouting}, additionally requesting the Decision Router
      * absorption's routing decision from the combined Persistent Knowledge call per connection
      * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}).
      *

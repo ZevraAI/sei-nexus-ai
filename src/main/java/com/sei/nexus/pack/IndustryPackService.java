@@ -56,11 +56,11 @@ public class IndustryPackService {
     // simply cannot be found here — tenant isolation falls out of the existing architecture,
     // it is not reimplemented.
     private final ConnectionRepository       connectionRepository;
-    // Postgres → Vector Store Concept Knowledge synchronization: Pack apply/remove are the two
+    // Postgres → concept index synchronization: Pack apply/remove are the two
     // mutation paths proven (by prior investigation) to directly change the fields the Concept
     // Knowledge projection reads (concept_key/pack_key/connection_key) — every other mutation
     // path is deliberately left unwired for this feature. Triggered fire-and-forget, async, AFTER
-    // the Postgres changes below have already succeeded — a Vector Store failure must never roll
+    // the Postgres changes below have already succeeded — an index failure must never roll
     // back a successful Postgres commit (see ConceptKnowledgeSynchronizationService's own javadoc).
     private final ConceptKnowledgeSynchronizationService conceptKnowledgeSynchronizationService;
     // Make Apply Pack Perform LLM Concept Classification: reuses the EXACT same batched
@@ -328,8 +328,8 @@ public class IndustryPackService {
                 packKey, connectionKey, entitiesAssociated, classification.classified(),
                 classification.unresolved(), vocabAdded, Math.round(coverage * 100));
 
-        // Fire-and-forget, AFTER every Postgres change above has already succeeded — a Vector
-        // Store failure here must never roll back the pack assignment/classification/vocabulary
+        // Fire-and-forget, AFTER every Postgres change above has already succeeded — an index
+        // failure here must never roll back the pack assignment/classification/vocabulary
         // that was just committed.
         conceptKnowledgeSynchronizationService.triggerAsync();
 

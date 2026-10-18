@@ -1,7 +1,6 @@
 package com.sei.nexus.tenant;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.common.NexusException;
 import org.flywaydb.core.Flyway;
 import org.slf4j.Logger;
@@ -55,7 +54,6 @@ public class TenantProvisioningService {
     private final DataSource        rawDataSource;   // unwrapped — bypasses tenant routing
     private final ObjectMapper      mapper;
     private final HttpClient        httpClient;
-    private final AzureOpenAiClient aiClient;
 
     @Value("${nexus.security.jwt-secret}")
     private String jwtSecret;
@@ -74,12 +72,10 @@ public class TenantProvisioningService {
 
     public TenantProvisioningService(TenantRepository tenantRepository,
                                       DataSource rawDataSource,
-                                      ObjectMapper mapper,
-                                      AzureOpenAiClient aiClient) {
+                                      ObjectMapper mapper) {
         this.tenantRepository = tenantRepository;
         this.rawDataSource    = rawDataSource;
         this.mapper           = mapper;
-        this.aiClient         = aiClient;
         this.httpClient       = HttpClient.newHttpClient();
     }
 
@@ -148,8 +144,7 @@ public class TenantProvisioningService {
         // 1. Write tenant record
         Tenant tenant = new Tenant(
                 UUID.randomUUID(), slug, name, schemaName, plan,
-                "ACTIVE", contactEmail, maxUsers, Instant.now(), Instant.now(),
-                null, null, null, null);   // ai_knowledge_* — provisioned separately, step 6b below
+                "ACTIVE", contactEmail, maxUsers, Instant.now(), Instant.now());
         tenantRepository.save(tenant);
 
         // 2. Create PostgreSQL schema
@@ -201,80 +196,7 @@ public class TenantProvisioningService {
                     slug, adminEmail, ex.getMessage());
         }
 
-        // 6b. Provision the tenant's persistent AI knowledge store (Phase 1: empty
-        //     Vector Store, no documents). Non-fatal, same pattern as the Supabase
-        //     invite above: the tenant is already fully created and operational
-        //     regardless of whether this succeeds. Deliberately called AFTER every
-        //     DB-transaction-bearing step above has finished — an external HTTP call
-        //     must never sit inside a schema-creation/migration transaction boundary.
-        //     Failure is recorded, not thrown; see provisionAiKnowledgeStore().
-        provisionAiKnowledgeStore(slug);
-
         return tenantRepository.findBySlug(slug).orElse(tenant);
-    }
-
-    // ── AI knowledge store provisioning (Phase 1) ────────────────────────────────
-
-    /**
-     * Provisions the tenant's persistent AI knowledge store: one empty OpenAI
-     * Vector Store, created once, whose id is persisted on the tenant registry row.
-     *
-     * <p><strong>Idempotent:</strong> if the tenant already has a vector store id,
-     * this is a no-op — safe to call again on onboarding retry or as a manual
-     * recovery step after a prior failure.
-     *
-     * <p><strong>Partial failure:</strong> two independent operations happen here —
-     * an OpenAI HTTP call and a DB write — with no way to make them atomic across a
-     * network boundary. Both failure modes are handled explicitly, never assumed away:
-     * <ul>
-     *   <li>OpenAI call fails: nothing is persisted; {@code ai_knowledge_status} is
-     *       set to {@code FAILED} with the reason, {@code vector_store_id} stays
-     *       {@code null}. A later call to this method retries the whole thing.</li>
-     *   <li>OpenAI call succeeds but the subsequent DB update fails (or the process
-     *       crashes between the two): the created store is orphaned in OpenAI —
-     *       real but unreferenced by any tenant row. This is an accepted trade-off
-     *       for Phase 1 (documented, not silently ignored): a later retry creates a
-     *       {@code second} store rather than discovering the orphan, since nothing
-     *       links "this OpenAI store" back to "that failed attempt" without a
-     *       two-phase commit this phase deliberately does not introduce. An orphaned,
-     *       empty, unnamed-to-any-tenant Vector Store carries no tenant data and no
-     *       ongoing cost beyond storage, so this is safe to leave for manual cleanup
-     *       rather than solve here.</li>
-     * </ul>
-     *
-     * <p>Never called for existing tenants automatically — only reachable from
-     * {@link #provision} (new tenant onboarding) or a future explicit manual retry.
-     *
-     * @param slug the tenant's slug
-     */
-    public void provisionAiKnowledgeStore(String slug) {
-        Tenant tenant = requireTenant(slug);
-
-        if (tenant.aiKnowledgeVectorStoreId() != null && !tenant.aiKnowledgeVectorStoreId().isBlank()) {
-            log.debug("Tenant '{}' already has an AI knowledge store ({}) — skipping provisioning",
-                    slug, tenant.aiKnowledgeVectorStoreId());
-            return;
-        }
-
-        String storeName = vectorStoreName(tenant.schemaName());
-        try {
-            String vectorStoreId = aiClient.createVectorStore(storeName);
-            tenantRepository.updateAiKnowledgeReady(slug, vectorStoreId);
-            log.info("Tenant '{}' AI knowledge store provisioned: {}", slug, vectorStoreId);
-        } catch (Exception ex) {
-            String reason = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
-            log.warn("Tenant '{}' AI knowledge store provisioning failed: {}", slug, reason);
-            tenantRepository.updateAiKnowledgeFailed(slug, truncate(reason, 500));
-        }
-    }
-
-    /** Deterministic, non-sensitive vector store name — derived from schema, never tenant name/email. */
-    private String vectorStoreName(String schemaName) {
-        return "zevra-tenant-" + schemaName;
-    }
-
-    private String truncate(String value, int maxLen) {
-        return value.length() > maxLen ? value.substring(0, maxLen) : value;
     }
 
     // ── Reinvite ──────────────────────────────────────────────────────────────

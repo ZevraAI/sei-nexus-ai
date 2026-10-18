@@ -306,7 +306,7 @@ public class SemanticController {
      * a concept at the same time it's promoted — the classification is validated against {@link
      * ConceptKnowledgeMaterializationService#listConceptCatalog()} first, since an unknown
      * concept_key would silently make the learning unprojectable forever. Promotion alone (no
-     * conceptKey) still leaves the mapping excluded from Vector Store projection until an admin
+     * conceptKey) still leaves the mapping excluded from concept index projection until an admin
      * classifies it separately via {@link #assignConcept}, exactly as before this endpoint accepted
      * a body at all.
      */
@@ -332,7 +332,7 @@ public class SemanticController {
         }
 
         // Fire-and-forget, same pattern as the existing Pack apply/remove triggers — the HTTP
-        // response never waits on the OpenAI Vector Store round-trip.
+        // response never waits on the embedding round-trip.
         conceptKnowledgeSynchronizationService.triggerAsync();
 
         return ResponseEntity.ok(Map.of(
@@ -377,7 +377,7 @@ public class SemanticController {
      * Demotes a promoted mapping — {@link LearnedMappingRepository#markDemoted}, distinct from the
      * hard {@link #deleteLearning} below: the row and its history stay in Postgres, only
      * {@code promoted} flips off. Triggers a sync so the next convergence removes it from its
-     * concept's Vector Store projection (it no longer matches {@code findPromotedByConceptKey}).
+     * concept's concept index projection (it no longer matches {@code findPromotedByConceptKey}).
      */
     @PostMapping("/learnings/{mappingKey}/demote")
     public ResponseEntity<Map<String, Object>> demoteLearning(@PathVariable String mappingKey) {

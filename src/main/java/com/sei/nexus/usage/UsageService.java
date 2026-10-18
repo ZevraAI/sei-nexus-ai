@@ -15,25 +15,71 @@ public class UsageService {
 
     private static final Logger log = LoggerFactory.getLogger(UsageService.class);
 
-    // Model pricing (USD per token). Update as OpenAI changes rates.
-    private static final Map<String, double[]> PRICING = Map.of(
-            "gpt-4o",                  new double[]{ 2.50  / 1_000_000.0, 10.00 / 1_000_000.0 },
-            "gpt-4o-mini",             new double[]{ 0.15  / 1_000_000.0,  0.60 / 1_000_000.0 },
-            "gpt-4-turbo",             new double[]{ 10.00 / 1_000_000.0, 30.00 / 1_000_000.0 },
-            "gpt-4",                   new double[]{ 30.00 / 1_000_000.0, 60.00 / 1_000_000.0 },
+    /**
+     * One model's USD-per-token rates: normal input, cache-hit input, and output. The cache-hit
+     * rate is per model because it is NOT a flat half price: the gpt-4.1 family discounts cached
+     * input by 75%, the gpt-4o family by 50%, and older models not at all. (A single flat 50%
+     * applied to every model, with unlisted models silently priced as gpt-4o, made the usage
+     * dashboard overstate gpt-4.1 spend by roughly 30% — see
+     * docs/investigations/2026-10-18-llm-cost-analysis.md, finding F1.)
+     */
+    record Rates(double input, double cachedInput, double output) {
+        static Rates perMillion(double input, double cachedInput, double output) {
+            return new Rates(input / 1_000_000.0, cachedInput / 1_000_000.0, output / 1_000_000.0);
+        }
+    }
+
+    // Model pricing (USD per 1M tokens → per token). OpenAI list prices; update as they change.
+    private static final Map<String, Rates> PRICING = Map.ofEntries(
+            Map.entry("gpt-4.1",                 Rates.perMillion( 2.00,  0.50,  8.00)),
+            Map.entry("gpt-4.1-mini",            Rates.perMillion( 0.40,  0.10,  1.60)),
+            Map.entry("gpt-4.1-nano",            Rates.perMillion( 0.10,  0.025, 0.40)),
+            Map.entry("gpt-4o",                  Rates.perMillion( 2.50,  1.25, 10.00)),
+            Map.entry("gpt-4o-mini",             Rates.perMillion( 0.15,  0.075, 0.60)),
+            // Older models: no cached-input discount.
+            Map.entry("gpt-4-turbo",             Rates.perMillion(10.00, 10.00, 30.00)),
+            Map.entry("gpt-4",                   Rates.perMillion(30.00, 30.00, 60.00)),
             // Cost baseline instrumentation: embed() previously had no entry here at all, so any
             // embedding call that DID get recorded would have silently fallen through to gpt-4o's
-            // rate below (16x too expensive for this model). Embeddings have no output/completion
-            // tokens — the second element is unused (embed()'s recordUsage() call always passes 0
-            // completion tokens) but kept non-zero-shaped for consistency with every other entry.
-            "text-embedding-ada-002",  new double[]{ 0.10  / 1_000_000.0,  0.10 / 1_000_000.0 }
+            // rate (16x too expensive for this model). Embeddings have no output/completion
+            // tokens (embed()'s recordUsage() call always passes 0 completion tokens).
+            Map.entry("text-embedding-ada-002",  Rates.perMillion( 0.10,  0.10,  0.10))
     );
 
-    // Cost baseline instrumentation: OpenAI prices a cache-hit prompt token at half the model's
-    // normal input rate (confirmed current published rate for gpt-4o-family models as of this
-    // baseline). Applied uniformly since every priced model above follows that same 50% discount;
-    // revisit if a future model's cached rate diverges from a flat half-price.
-    private static final double CACHED_INPUT_DISCOUNT = 0.5;
+    /** Rates for a model name that is not listed — the pre-existing fallback, kept so an
+     *  unrecognised model is never priced at zero (an under-count hides spend). */
+    private static final Rates FALLBACK_RATES = PRICING.get("gpt-4o");
+
+    /**
+     * Resolves a model identifier to its rates: an exact match, else the LONGEST listed name that
+     * the identifier starts with (so a dated snapshot such as {@code gpt-4.1-2025-04-14} prices as
+     * {@code gpt-4.1}, and {@code gpt-4.1-mini-2025-04-14} as {@code gpt-4.1-mini} rather than
+     * {@code gpt-4.1}), else {@link #FALLBACK_RATES}. Pure string handling of a model identifier —
+     * it never looks at user text.
+     */
+    static Rates ratesFor(String model) {
+        if (model == null) return FALLBACK_RATES;
+        Rates exact = PRICING.get(model);
+        if (exact != null) return exact;
+        String best = null;
+        for (String known : PRICING.keySet()) {
+            if (model.startsWith(known) && (best == null || known.length() > best.length())) best = known;
+        }
+        return best != null ? PRICING.get(best) : FALLBACK_RATES;
+    }
+
+    /**
+     * Estimated USD cost of one call. {@code cachedTokens} is assumed to be already counted within
+     * {@code promptTokens} (how OpenAI reports {@code cached_tokens}) and is clamped to
+     * {@code [0, promptTokens]}. Public and static so that the same figure that is persisted can be
+     * logged on every {@code LLM_METRIC} line.
+     */
+    public static double estimateCostUsd(String model, int promptTokens, int cachedTokens, int completionTokens) {
+        Rates r = ratesFor(model);
+        int cached   = Math.min(Math.max(cachedTokens, 0), Math.max(promptTokens, 0));
+        int uncached = Math.max(promptTokens, 0) - cached;
+        return uncached * r.input() + cached * r.cachedInput() + Math.max(completionTokens, 0) * r.output();
+    }
 
     private final UsageRepository repo;
 
@@ -82,12 +128,8 @@ public class UsageService {
             String schema    = TenantContext.getSchema();
             String type      = (callType != null && !callType.isBlank()) ? callType : null;
 
-            double[] price      = PRICING.getOrDefault(model, PRICING.get("gpt-4o"));
             int      cached     = Math.min(Math.max(cachedTokens, 0), promptTokens);
-            int      uncached   = promptTokens - cached;
-            double   costUsd    = uncached * price[0]
-                                 + cached   * price[0] * CACHED_INPUT_DISCOUNT
-                                 + completionTokens * price[1];
+            double   costUsd    = estimateCostUsd(model, promptTokens, cached, completionTokens);
 
             repo.insert(schema, userEmail, feature, agentName,
                         model, promptTokens, completionTokens, costUsd, cached, type);

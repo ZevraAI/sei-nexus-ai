@@ -8,9 +8,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Pins the conversational result-set reuse correctness contract in {@link
- * ReasoningEvaluator}'s {@code SYSTEM_PROMPT} — same convention as {@code
- * ConceptScopedMetadataResolverFileSearchTest#fileSearchSystemPromptNeverMentionsInvestigationHints}:
- * a prompt-text regression guard, not a live-model test. Guards against the prompt drifting back
+ * ReasoningEvaluator}'s {@code SYSTEM_PROMPT} — a prompt-text
+ * regression guard, not a live-model test. Guards against the prompt drifting back
  * to conflating "answerable from existing evidence" with "existing evidence is the correct
  * result set" — the exact defect {@link FollowUpFilterChangeReuseTest} exercises end-to-end with
  * scripted evaluator behavior.
@@ -134,11 +133,44 @@ class ReasoningEvaluatorPromptTest {
         assertTrue(prompt.contains("\"resultSetMatches\": true"));
         assertTrue(prompt.contains("\"decision\": \"SUFFICIENT | NEED_MORE_DATA | DEAD_END\""));
         assertTrue(prompt.contains("\"rationale\": \"one sentence explaining your decision\""));
-        // Exactly three JSON fields in the declared response shape.
+        // The semantic-answerability rule added no field. The zero-row rule later added exactly
+        // one — zeroRowResultConfirmed, the model's own narrow self-report that Java clamps on
+        // (see ReasoningEvaluatorZeroRowClampTest) — so the declared shape is now exactly 4.
+        assertTrue(prompt.contains("\"zeroRowResultConfirmed\": null"));
         int braceOpen = prompt.indexOf("Return JSON only:");
         int braceClose = prompt.indexOf("}", braceOpen);
         String responseShape = prompt.substring(braceOpen, braceClose + 1);
-        assertEquals(3, responseShape.split("\":").length - 1,
-                "the declared JSON response shape must still have exactly 3 fields");
+        assertEquals(4, responseShape.split("\":").length - 1,
+                "the declared JSON response shape must have exactly 4 fields");
+    }
+
+    @Test
+    void aBreakdownByAnEntityIsHeldToTheSameReadableIdentificationStandard() throws Exception {
+        String prompt = systemPrompt().replaceAll("\\s+", " ");
+        assertTrue(prompt.contains("break results down by, group by, or list them per an entity"),
+                "grouping or listing BY an entity is identifying that entity: an opaque key is not enough");
+        assertTrue(prompt.contains("break results down by an entity and the evidence gathered contains only an opaque identifier"),
+                "NEED_MORE_DATA case (d) must cover the breakdown case too");
+    }
+
+    @Test
+    void aResultThatSilentlyCoversOnlyPartOfTheDataIsNotSufficient() throws Exception {
+        String n = systemPrompt().replaceAll("\\s+", " ");
+        assertTrue(n.contains("COMPLETENESS."));
+        assertTrue(n.contains("Read the SQL: if it narrowed the data in a way the question did not ask for"));
+        assertTrue(n.contains("keeps only one of several values of a type or category column"));
+        assertTrue(n.contains("so the evidence is not yet sufficient (NEED_MORE_DATA)"));
+        assertTrue(n.contains("Narrowing the question itself asked for is fine."),
+                "a restriction the user actually asked for must not be treated as a gap");
+    }
+
+    @Test
+    void opacityIsJudgedFromTheSampleValuesAndTheShapeIsDescribedConcretely() throws Exception {
+        String n = systemPrompt().replaceAll("\\s+", " ");
+        assertTrue(n.contains("Judge opacity from the sample values in the result summary"));
+        assertTrue(n.contains("a generated unique id (a UUID, a long surrogate number) is opaque"));
+        assertTrue(n.contains("while a name, title or familiar code is not"));
+        // it must still not ask for a conventional column to be invented
+        assertTrue(n.contains("Do not assume a conventional column name exists or invent one"));
     }
 }

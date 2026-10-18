@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Phase 9E — Stage 1 (Persistent Knowledge / File Search) is the SOLE semantic concept-and-
+ * Phase 9E — Stage 1 (concept retrieval + one LLM call) is the SOLE semantic concept-and-
  * routing mechanism for the conversational Chat path. The legacy Decision Router
  * ({@code ChatService#getLlmDecision}, which called {@code AzureOpenAiClient#chat}) has been
  * removed entirely — there is no second routing LLM call under any condition. This is a
@@ -270,13 +270,13 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
         public ResolvedBusinessModel resolve(String agentId, List<String> connectionKeys,
                                              List<String> domainKeys, String question,
                                              String conversationId, Boolean memoryAvailable) {
-            // Simulates required Persistent Knowledge infrastructure (Vector Store / File Search)
+            // Simulates required Stage 1 infrastructure (the concept index / embedding call)
             // failing outright — a condition distinct from "routing absent," which must never be
             // silently absorbed into a routing-unavailable readiness outcome (see
             // ConceptScopedMetadataResolver's own "two distinct degradation modes" javadoc).
             throw new com.sei.nexus.common.NexusException(
                     org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE,
-                    "Persistent Knowledge Stage 1 requires a provisioned Vector Store for this tenant.");
+                    "Stage 1 requires a built concept index for this tenant.");
         }
     }
 

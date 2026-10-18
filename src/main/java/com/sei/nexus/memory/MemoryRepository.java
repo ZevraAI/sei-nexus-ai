@@ -1,5 +1,6 @@
 package com.sei.nexus.memory;
 
+import com.sei.nexus.common.PgVector;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -95,7 +96,7 @@ public class MemoryRepository {
      * Saves a chunk with the embedding stored as a pgvector literal using the ::vector cast.
      */
     public void saveChunk(DocumentChunk chunk) {
-        String vectorStr = toVectorString(chunk.embedding());
+        String vectorStr = PgVector.toLiteral(chunk.embedding());
         // The ::vector cast is appended directly in the SQL string; the parameter
         // supplies the bracketed float list which Postgres parses as a vector.
         jdbc.update("""
@@ -109,7 +110,7 @@ public class MemoryRepository {
 
     /** Retrieves top-K chunks across ALL indexed documents (no domain filter). */
     public List<DocumentChunk> retrieveAllChunks(float[] embedding, int topK) {
-        String vectorStr = toVectorString(embedding);
+        String vectorStr = PgVector.toLiteral(embedding);
         return jdbc.query(con -> {
             var ps = con.prepareStatement("""
                     SELECT c.chunk_key,
@@ -151,7 +152,7 @@ public class MemoryRepository {
     public List<DocumentChunk> retrieveChunks(float[] embedding,
                                                List<String> domainKeys,
                                                int topK) {
-        String vectorStr = toVectorString(embedding);
+        String vectorStr = PgVector.toLiteral(embedding);
         String[] domainArray = domainKeys.toArray(new String[0]);
 
         return jdbc.query(con -> {
@@ -208,19 +209,5 @@ public class MemoryRepository {
     private Instant toInstant(ResultSet rs, String col) throws SQLException {
         Timestamp ts = rs.getTimestamp(col);
         return ts != null ? ts.toInstant() : null;
-    }
-
-    /**
-     * Converts a float array to the bracketed string format expected by pgvector,
-     * e.g. [0.1,0.2,0.3].
-     */
-    private String toVectorString(float[] embedding) {
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < embedding.length; i++) {
-            if (i > 0) sb.append(",");
-            sb.append(embedding[i]);
-        }
-        sb.append("]");
-        return sb.toString();
     }
 }

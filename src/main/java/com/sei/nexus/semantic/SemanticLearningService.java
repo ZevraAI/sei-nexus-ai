@@ -97,7 +97,7 @@ public class SemanticLearningService {
     /**
      * Concept-scoped learned-knowledge evidence for Agent Brain: promoted mappings whose
      * concept_key exactly matches one of the given, already-resolved concept keys (see {@code
-     * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveConceptKeys} / {@code
+     * com.sei.nexus.agentbrain.ConceptScopedMetadataResolver#resolveObjectKeysWithRouting} / {@code
      * ResolvedBusinessModel.resolvedConceptKeys()}). A thin, deterministic delegation to {@link
      * LearnedMappingRepository#findPromotedByConceptKeys} — exposed here rather than adding a new
      * {@code ChatService} constructor dependency, since {@code ChatService} already holds this

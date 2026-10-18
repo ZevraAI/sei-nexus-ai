@@ -29,6 +29,8 @@ public final class EvidenceStore {
     /** This step's own result — never influenced by what happens in a later step. */
     public static final String OUTCOME_QUERY_SUCCEEDED   = "QUERY_SUCCEEDED";
     public static final String OUTCOME_METADATA_RETRIEVED = "METADATA_RETRIEVED";
+    /** The planner took no action while no evidence existed — nothing was queried at all. */
+    public static final String OUTCOME_NO_QUERY_EXECUTED  = "NO_QUERY_EXECUTED";
 
     public record StepEvidence(
             int                          stepNo,
@@ -181,7 +183,8 @@ public final class EvidenceStore {
         StringBuilder sb = new StringBuilder();
         for (StepEvidence s : steps) {
             sb.append("--- Step ").append(s.stepNo()).append(": ").append(s.description()).append('\n');
-            sb.append("SQL: ").append(truncate(s.sql(), 300)).append('\n');
+            // 800, not 300: the reader must see the whole WHERE / JOIN to judge whether the query narrowed the data.
+            sb.append("SQL: ").append(truncate(s.sql(), 800)).append('\n');
             sb.append("Result: ").append(s.rowSummary()).append('\n');
             // This step's own outcome — always present, never affected by what a later step
             // decides (see class javadoc: outcome vs. evaluatorDecision).
@@ -249,6 +252,14 @@ public final class EvidenceStore {
                 // summarized as it was before this branch existed.
                 String joined = vals.stream().map(v -> truncate(v, 80)).collect(Collectors.joining(", "));
                 valuesBlock.append("  ").append(col).append(" = ").append(joined).append('\n');
+            } else if (!vals.isEmpty()) {
+                // A column in a LARGER result that none of the branches above describes (not a
+                // measure, not low-cardinality): without this the reader would never see what its
+                // values look like, so it could not tell a readable label from a generated key.
+                // A few distinct examples are a plain observation about the data, never a judgment.
+                sb.append("  ").append(col).append(": ").append(dist.size()).append(" distinct, e.g. ")
+                  .append(vals.stream().distinct().limit(3).map(v -> truncate(v, 40))
+                          .collect(Collectors.joining(", "))).append('\n');
             }
         }
 

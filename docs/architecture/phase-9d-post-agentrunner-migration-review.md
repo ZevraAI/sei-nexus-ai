@@ -1,5 +1,7 @@
 # Phase 9D — Post-AgentRunner Responses Migration Review
 
+> **Note (2026-10-18).** Stage 1 no longer uses File Search; it was replaced by retrieval from a pgvector concept index, and the single Stage 1 row in the table below reflects that. Prose elsewhere in this review that mentions File Search describes the position at the time it was written.
+
 Investigation only. No production or test code was modified to produce this report.
 
 ## 1. Executive Summary
@@ -35,8 +37,7 @@ two or three underlying transport primitives (`executeWithRetry`, `recordUsage`/
 
 | Caller | Method | API | Model | Tag | Interactive/Background | Conversational | Tool Calling | Status |
 |---|---|---|---|---|---|---|---|---|
-| `ConceptScopedMetadataResolver.selectConceptsViaPersistentKnowledge` | `chatWithFileSearch` | Responses + File Search | `chatModel` (gpt-4o) | `STAGE1_FILE_SEARCH_CONCEPT_SELECTION` | Interactive, sync | No (autonomous agent path) | No | Live — `AgentRunner`/autonomous-agent caller |
-| `ConceptScopedMetadataResolver.selectConceptsAndRoutingViaPersistentKnowledge` | `chatWithFileSearchForConceptAndRouting` | Responses + File Search, strict schema | `chatModel` | `STAGE1_FILE_SEARCH_CONCEPT_AND_ROUTING` | Interactive, sync | Yes (Chat path) | No | Live — `ChatService` caller |
+| `ConceptScopedMetadataResolver.selectConceptsAndRouting` | `respondForStage1` | Responses, strict schema, no tools (candidates retrieved from the pgvector concept index) | `stage1Model` (gpt-4.1) | `STAGE1_CONCEPT_AND_ROUTING` | Interactive, sync | Yes (Chat and agent paths) | No | Live — single Stage 1 path for both callers |
 | `ReasoningPlanner.nextStep` | `respondForPlanner` | Responses, strict schema | `plannerModel` (gpt-4.1) | `PLANNER` | Interactive, sync | Yes | No | Live |
 | `ReasoningEvaluator.evaluate` | `respondForEvaluator` | Responses, strict schema | `evaluatorModel` (gpt-4.1) | `EVALUATOR` | Interactive, sync | Yes | No | Live |
 | `ChatService.buildMemorySelectionContext` | `respondForMemorySelection` | Responses, strict schema | `memorySelectionModel` (gpt-4o-mini) | `MEMORY_SELECTION` | Interactive, sync | Yes | No | Live |

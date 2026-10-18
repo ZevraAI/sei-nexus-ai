@@ -67,9 +67,90 @@ class ExecutionOutcomeInterpreterTest {
         // `id`/`*_id` are excluded from the numeric sum/avg branch, and not low-cardinality
         // (2 distinct out of 2 rows) — but a small result (<= SMALL_RESULT_ROW_LIMIT) must still
         // surface their actual values via the Values: block, not drop them silently.
+        // 2 rows × 2 columns: the column-wise Values: block is unchanged, and the rows themselves
+        // are now ALSO rendered aligned (see the aligned-rows tests below).
         assertEquals(
-                "Total rows: 2\nColumns: id, product_id\nValues:\n  id = 1, 2\n  product_id = 100, 200\n",
+                "Total rows: 2\nColumns: id, product_id\nValues:\n  id = 1, 2\n  product_id = 100, 200\n"
+                        + "Rows (each line is ONE row; every value belongs to the column named beside it):\n"
+                        + "  1. id = 1; product_id = 100\n  2. id = 2; product_id = 200\n",
                 interp.summarizeRows(rows));
+    }
+
+    // ── aligned rows: the alignment is the information for 2+ rows × 2+ columns ─────────────────
+
+    @Test
+    void multiRowResultsRenderEachRowAlignedSoAValueCannotBeAttributedToTheWrongRecord() {
+        // Domain-neutral: three records, each with a name and two measures. Column-wise, the numbers
+        // are only sum/avg — nothing says WHICH record scored 2.1.
+        List<Map<String, Object>> rows = List.of(
+                row("name", "Alpha", "score", 2.1, "rate", 71.3),
+                row("name", "Beta", "score", 4.0, "rate", 91.1),
+                row("name", "Gamma", "score", 3.1, "rate", 81.2));
+
+        String out = interp.summarizeRows(rows);
+
+        assertTrue(out.contains("  1. name = Alpha; score = 2.1; rate = 71.3\n"), out);
+        assertTrue(out.contains("  2. name = Beta; score = 4.0; rate = 91.1\n"), out);
+        assertTrue(out.contains("  3. name = Gamma; score = 3.1; rate = 81.2\n"), out);
+        assertTrue(out.contains("every value belongs to the column named beside it"), out);
+    }
+
+    @Test
+    void aSingleRowOrASingleColumnIsLeftExactlyAsBefore() {
+        assertFalse(interp.summarizeRows(List.of(row("name", "Alpha", "score", 2.1))).contains("Rows ("),
+                "one row has nothing to misalign");
+        assertFalse(interp.summarizeRows(List.of(row("kind", "A"), row("kind", "B"))).contains("Rows ("),
+                "one column has nothing to misalign");
+    }
+
+    @Test
+    void nullAndBlankValuesAreOmittedFromTheAlignedLines() {
+        List<Map<String, Object>> rows = List.of(
+                row("name", "Alpha", "note", null, "score", 1),
+                row("name", "Beta", "note", "", "score", 2));
+
+        String out = interp.summarizeRows(rows);
+
+        assertTrue(out.contains("  1. name = Alpha; score = 1\n"), out);
+        assertTrue(out.contains("  2. name = Beta; score = 2\n"), out);
+        assertFalse(out.contains("note = "), out);
+    }
+
+    @Test
+    void aLargeResultGetsNoAlignedBlockSoItsConcisenessIsUnchanged() {
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < 11; i++) rows.add(row("name", "n" + i, "score", i));
+
+        assertFalse(interp.summarizeRows(rows).contains("Rows ("), "11 rows is above the small-result limit");
+    }
+
+    @Test
+    void theAlignedBlockIsBoundedAndSaysSoWhenItCutsRows() {
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        String wide = "x".repeat(70);
+        for (int i = 0; i < 10; i++) {
+            Map<String, Object> r = new java.util.LinkedHashMap<>();
+            for (int c = 0; c < 20; c++) r.put("column_" + c, wide + i);
+            rows.add(r);
+        }
+
+        String out = interp.summarizeRows(rows);
+
+        int start = out.indexOf("Rows (");
+        assertTrue(start >= 0);
+        assertTrue(out.length() - start <= 6_000 + 200, "the aligned block stays within its character budget");
+        assertTrue(out.contains("more row(s) not shown here"), "cut rows are counted, never silently dropped");
+    }
+
+    @Test
+    void valuesAreTruncatedPerCellAndTheOutputIsDeterministic() {
+        List<Map<String, Object>> rows = List.of(
+                row("name", "a".repeat(200), "score", 1), row("name", "b", "score", 2));
+
+        String out = interp.summarizeRows(rows);
+
+        assertTrue(out.contains("name = " + "a".repeat(80) + "…"), out);
+        assertEquals(out, interp.summarizeRows(rows), "identical rows always produce an identical summary");
     }
 
     @Test
@@ -143,5 +224,25 @@ class ExecutionOutcomeInterpreterTest {
         String out = interp.summarizeRows(rows);
         assertTrue(out.contains("patient_name = J. Rivera"), out);
         assertTrue(out.contains("diagnosis_code = R51"), out);
+    }
+
+    @Test
+    void aLargeResultShowsSampleValuesForAColumnNothingElseDescribes() {
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            rows.add(row("ref_key", String.format("80000000-0000-0000-0000-%012d", i), "total", 10 + i));
+        }
+
+        String out = interp.summarizeRows(rows);
+
+        assertTrue(out.contains("ref_key: 12 distinct, e.g. 80000000-0000-0000-0000-000000000000, "), out);
+        assertTrue(out.contains("total: sum="));
+        assertFalse(out.contains("Rows ("), "still no aligned block above the small-result limit");
+    }
+
+    @Test
+    void noSampleLineIsAddedForSmallResults() {
+        String out = interp.summarizeRows(List.of(row("name", "A", "qty", 1), row("name", "B", "qty", 2)));
+        assertFalse(out.contains("distinct, e.g."));
     }
 }

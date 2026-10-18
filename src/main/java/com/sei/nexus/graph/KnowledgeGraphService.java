@@ -92,6 +92,9 @@ public class KnowledgeGraphService {
                     .distinct()
                     .collect(Collectors.toList());
 
+            // Kept so a selected object's declared one-hop neighbours can be NAMED (never
+            // described) in the "related, not selected" section below.
+            final List<GraphNode> domainNodes = allNodes;
             if (objectKeyScope != null) {
                 allNodes = allNodes.stream()
                         .filter(n -> objectKeyScope.contains(n.primaryObjectKey()))
@@ -147,6 +150,46 @@ public class KnowledgeGraphService {
                     sb.append("\n  JOIN: ").append(e.joinGuidance());
                 }
                 sb.append("\n");
+            }
+            // Related-but-not-selected objects (only when scoped). Concept selection is an LLM
+            // retrieval step and can miss an object a question needs — most often the object that
+            // OWNS an identifier the user quoted, when only the object holding the details was
+            // selected. The ratified boundary keeps unselected entities out of the prompt; this
+            // section relaxes it minimally and factually: only the declared ONE-HOP neighbours of
+            // objects that WERE selected, shown by name + the declared JOIN, never with columns,
+            // and explicitly marked not selected. Its size follows the number of declared
+            // relationships, not the size of the tenant. The planner (the LLM) decides whether a
+            // neighbour is needed; requesting its metadata is what makes it queryable.
+            if (objectKeyScope != null) {
+                Map<String, GraphNode> domainIndex = domainNodes.stream()
+                        .collect(Collectors.toMap(GraphNode::id, n -> n, (a, b) -> a));
+                StringBuilder related = new StringBuilder();
+                for (GraphEdge e : allEdges) {
+                    boolean srcIn = nodeIndex.containsKey(e.source());
+                    boolean tgtIn = nodeIndex.containsKey(e.target());
+                    if (srcIn == tgtIn) continue;                       // both selected (rendered above) or neither
+                    GraphNode src = srcIn ? nodeIndex.get(e.source()) : domainIndex.get(e.source());
+                    GraphNode tgt = tgtIn ? nodeIndex.get(e.target()) : domainIndex.get(e.target());
+                    if (src == null || tgt == null) continue;
+                    // The marker goes on whichever end is the unselected one.
+                    related.append("• ").append(src.label())
+                           .append(srcIn ? "" : " [not selected; table: " + tableName(src.primaryObjectKey()) + "]")
+                           .append(" -[").append(e.relationshipType())
+                           .append(" ").append(e.cardinality() != null ? e.cardinality() : "")
+                           .append("]→ ").append(tgt.label())
+                           .append(tgtIn ? "" : " [not selected; table: " + tableName(tgt.primaryObjectKey()) + "]");
+                    if (e.joinGuidance() != null && !e.joinGuidance().isBlank()) {
+                        related.append("\n  JOIN: ").append(e.joinGuidance());
+                    }
+                    related.append("\n");
+                }
+                if (related.length() > 0) {
+                    sb.append("--- Related objects NOT selected for this question ---\n");
+                    sb.append("These have a declared relationship to a selected object but their columns are not listed. ")
+                      .append("If one is needed (for example to look a record up by an identifier it holds, or to JOIN), ")
+                      .append("request its metadata by its table name — that makes it available to query.\n");
+                    sb.append(related);
+                }
             }
             sb.append("=== END KNOWLEDGE GRAPH ===\n");
             return sb.toString();

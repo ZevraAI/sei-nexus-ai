@@ -59,18 +59,20 @@ class AgentBrainTest {
         List<String> seenConnectionKeys = new java.util.ArrayList<>();
         String seenQuestion;
         String seenConversationId;
-        FakeConceptResolver() { super(null, null, null, null); }
-        @Override public java.util.Optional<List<String>> resolveObjectKeys(String connectionKey, String question, String conversationId) {
+        FakeConceptResolver() { super(null, null, null, null, null, null); }
+        @Override public CombinedResolution resolveObjectKeysWithRouting(String connectionKey, String question,
+                                                                         String conversationId, boolean memoryAvailable) {
             seenConnectionKeys.add(connectionKey);
             seenQuestion = question;
             seenConversationId = conversationId;
-            return resultByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
-        }
-        @Override public java.util.Optional<List<String>> resolveConceptKeys(String connectionKey, String question, String conversationId) {
-            return conceptKeysByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
+            java.util.Optional<List<String>> objectKeys =
+                    resultByConnection.getOrDefault(connectionKey, java.util.Optional.empty());
+            if (objectKeys.isEmpty()) return CombinedResolution.EMPTY;
+            return new CombinedResolution(objectKeys, java.util.Optional.empty(),
+                    conceptKeysByConnection.getOrDefault(connectionKey, java.util.Optional.empty()),
+                    java.util.Optional.empty());
         }
     }
-
     /** A fake resolver — records whether AgentBrain consulted the Semantic Foundation. */
     static class FakeResolver extends BusinessLanguageResolver {
         ResolvedQuestion result;
@@ -754,7 +756,7 @@ class AgentBrainTest {
     static class FakeRoutingConceptResolver extends ConceptScopedMetadataResolver {
         Map<String, ConceptScopedMetadataResolver.CombinedResolution> resultByConnection = new java.util.HashMap<>();
         List<String> seenConnectionKeys = new java.util.ArrayList<>();
-        FakeRoutingConceptResolver() { super(null, null, null, null); }
+        FakeRoutingConceptResolver() { super(null, null, null, null, null, null); }
         @Override
         public ConceptScopedMetadataResolver.CombinedResolution resolveObjectKeysWithRouting(
                 String connectionKey, String question, String conversationId, boolean memoryAvailable) {

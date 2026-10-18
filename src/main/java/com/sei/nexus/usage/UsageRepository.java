@@ -65,7 +65,7 @@ public class UsageRepository {
     /**
      * Finer-grained than {@link #summaryByFeature}: one row per {@code call_type} (e.g.
      * "PLANNER", "EVALUATOR", "ANSWER_COMPOSER", "MEMORY_SELECTION",
-     * "STAGE1_FILE_SEARCH_CONCEPT_AND_ROUTING") instead of the 5-value {@code feature} enum.
+     * "STAGE1_CONCEPT_AND_ROUTING") instead of the 5-value {@code feature} enum.
      * Rows whose call type was never captured (pre-V045 history, or a caller with no
      * {@code LlmCallTag}) are grouped under {@code call_type IS NULL}. No cost figures — same
      * "tenant admins see volume, not price" convention as {@link #summaryByFeature}.

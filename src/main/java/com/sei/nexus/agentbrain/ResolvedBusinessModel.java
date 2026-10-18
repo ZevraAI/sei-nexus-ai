@@ -35,7 +35,7 @@ public record ResolvedBusinessModel(
         Map<String, ColumnValueDomain> literalScope,
         // Concept-Scoped Metadata Narrowing — downstream context boundary: true only when
         // AgentBrain's Stage-1/Stage-2 concept-scoped resolution actually produced this model
-        // (see AgentBrain#conceptScopedModel). When true, objectTargets().keySet() is the
+        // (see AgentBrain#conceptScopedModelWithRouting). When true, objectTargets().keySet() is the
         // AUTHORITATIVE, Stage-2-resolved physical scope for this request — every downstream
         // context channel (not just the physical-schema block PromptAssembler already renders)
         // must restrict itself to these object keys rather than falling back to a broader,
@@ -46,7 +46,7 @@ public record ResolvedBusinessModel(
         // Stage 1 (Persistent Knowledge combined concept+routing call) is the sole semantic
         // routing mechanism for the conversational Chat path (Phase 9E): present only when the
         // caller explicitly requested routing (AgentBrain#resolve's memoryAvailable-carrying
-        // overload) AND the File Search Stage 1 path actually produced one for at least one
+        // overload) AND the Stage 1 path actually produced one for at least one
         // in-scope connection — see AgentBrain#conceptScopedModelWithRouting. Empty for every
         // other caller/overload (autonomous agents), or when Stage 1 could not establish routing
         // for this request — in which case ChatService terminates the request with an explicit
@@ -67,8 +67,8 @@ public record ResolvedBusinessModel(
         // existed.
         Optional<SemanticModel> executionScope,
         // Concept-Key Semantic Anchor design: the exact concept_key(s) Stage 1 selected for this
-        // request (see ConceptScopedMetadataResolver#resolveConceptKeys / AgentBrain's
-        // conceptScopedModel*), carried through verbatim — never rederived, normalized, or
+        // request (see ConceptScopedMetadataResolver#resolveObjectKeysWithRouting / AgentBrain's
+        // conceptScopedModelWithRouting), carried through verbatim — never rederived, normalized, or
         // filtered semantically here. This is DETERMINISTIC SCOPING IDENTITY ONLY: it exists so a
         // downstream, exact-key lookup (LearnedMappingRepository#findPromotedByConceptKeys) can
         // retrieve concept-scoped learned-knowledge evidence; it is never itself a semantic

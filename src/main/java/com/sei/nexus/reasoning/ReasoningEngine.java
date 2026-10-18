@@ -34,6 +34,8 @@ public class ReasoningEngine {
     private static final Logger log = LoggerFactory.getLogger(ReasoningEngine.class);
 
     static final int MAX_STEPS = 6;
+    /** How many database execution failures the planner may self-correct from in one investigation. */
+    static final int MAX_FAILED_REPLANS = 2;
 
     // ── dependencies ──────────────────────────────────────────────────────────
     private final ReasoningPlanner         planner;
@@ -142,6 +144,8 @@ public class ReasoningEngine {
         // accumulated evidence sufficient — see the loop-control comment below for why this
         // exists and what it replaces.
         int           postSufficiencyPlannerCalls = 0;
+        // Database execution failures seen so far in this investigation — bounds self-correction.
+        int           executionFailures = 0;
         // PRO-33 retry memory: (column, literal) pairs already rejected once —
         // the "re-prompted once" bound of PRO-32 §5.
         Set<String>            literalRejections = new HashSet<>();
@@ -195,6 +199,20 @@ public class ReasoningEngine {
                 break;
             }
 
+            // The planner took no action while there was no evidence at all: nothing was queried.
+            // Recorded as a plain FACT (with the planner's own stated reason) so composeAnswer can
+            // tell the user truthfully that no query ran — never as an empty query result, which
+            // would falsely claim the data was searched and found nothing. Java decides nothing
+            // here; the LLM words the answer from this observation.
+            if (plan.isNoQuery()) {
+                log.info("No query executed for run '{}': {}", runKey, plan.noQueryReason());
+                evidence.addOutcome(stepNo, plan.description(), "", "", plan.rationale(),
+                        EvidenceStore.OUTCOME_NO_QUERY_EXECUTED, plan.noQueryReason(), 0L);
+                saveStep(sessionKey, stepNo, plan, EvidenceStore.OUTCOME_NO_QUERY_EXECUTED,
+                        plan.noQueryReason(), evidence, List.of(), null);
+                break;
+            }
+
             // Semantic Reasoning Over Authoritative Value Domains: the planner declined to
             // generate SQL because the user's term cannot be defensibly resolved against an
             // authoritative legal-values column (see ReasoningPlanner's SYSTEM_PROMPT). Recorded
@@ -224,12 +242,33 @@ public class ReasoningEngine {
             // a rejection) and continues.
             if (plan.isMetadataRequest()) {
                 ReasoningPlanner.MetadataRequest req = plan.metadataRequest();
-                Optional<String> columns = metadataRequestHandler.resolveColumns(resolvedObjects, req.object());
+                Optional<ColumnMetadataRequestHandler.Resolution> resolution =
+                        metadataRequestHandler.resolve(resolvedObjects, req.object());
+                Optional<String> columns = resolution.map(ColumnMetadataRequestHandler.Resolution::columns);
                 String decision;
                 String detail;
                 if (columns.isPresent()) {
                     schemaCtx = schemaCtx + "\n\nRequested column metadata for \"" + req.object() + "\":\n"
                             + columns.get();
+                    // The planner (the LLM) asked for an object concept selection did not include.
+                    // Java has just validated that request by exact identity against the catalog of
+                    // the SAME approved connections — so the object is now part of this
+                    // investigation's scope, for this run only. Without this the planner is handed
+                    // a table's columns and then forbidden to query it (UNAPPROVED_OBJECTS), a dead
+                    // end that surfaced to users as "no records". The deny-only tenant allow-list
+                    // still applies downstream. The planner is told the fact, in its own context.
+                    boolean scopeExtended = false;
+                    if (resolution.get().outsideCurrentScope()) {
+                        if (contract != null) {
+                            contract = metadataRequestHandler.extend(contract, resolution.get());
+                            scopeExtended = true;
+                        }
+                        resolvedObjects = metadataRequestHandler.extend(resolvedObjects, resolution.get());
+                        if (scopeExtended) {
+                            schemaCtx = schemaCtx + "\nThis object is now approved for querying in this "
+                                    + "investigation, using the connection_key and identifiers shown above.";
+                        }
+                    }
                     decision = "METADATA_RETRIEVED";
                     // Mechanical count of this object's own rendered column bullets (PromptAssembler's
                     // fixed "    • `col`" format) — not a semantic reading of the columns, purely a
@@ -386,7 +425,15 @@ public class ReasoningEngine {
                 evidence.addOutcome(stepNo, plan.description(), plan.sql(), plan.connectionKey(),
                         plan.rationale(), "ERROR", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "ERROR", ro.message(), evidence, List.of(), null);
-                break;
+                // A database error (e.g. a type mismatch between a column and a literal) is a
+                // physical observation the planner can learn from — exactly like a gated or
+                // rejected step above — so it is shown to the planner as evidence and re-planned
+                // rather than ending the investigation. Bounded: after MAX_FAILED_REPLANS failures
+                // the loop stops and the failure is reported. Java decides nothing about the fix;
+                // the LLM reads the error and writes the corrected query.
+                if (++executionFailures > MAX_FAILED_REPLANS) break;
+                stepNo++;
+                continue;
             }
 
             // ── 4. Executed: evaluate the evidence and decide whether to continue ──

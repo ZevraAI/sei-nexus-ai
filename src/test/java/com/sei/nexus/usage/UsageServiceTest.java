@@ -101,6 +101,72 @@ class UsageServiceTest {
         assertEquals(expected, repo.rows.get(0).costUsd(), 1e-12);
     }
 
+    // ── pricing: per-model rates, per-model cached-input discount ───────────────────────────────
+
+    @Test
+    void gpt41IsPricedAtItsOwnRatesWithA75PercentCachedDiscountNotAsGpt4o() {
+        // gpt-4.1: $2.00/M input, $0.50/M cached input, $8.00/M output.
+        // 1000 prompt, 400 cached -> 600*2.00e-6 + 400*0.50e-6 + 50*8.00e-6
+        double expected = 600 * 2.00e-6 + 400 * 0.50e-6 + 50 * 8.00e-6;
+
+        assertEquals(expected, UsageService.estimateCostUsd("gpt-4.1", 1000, 400, 50), 1e-12);
+
+        CapturingRepository repo = new CapturingRepository();
+        TenantContext.set("tenant_try_retail");
+        new UsageService(repo).record("gpt-4.1", 1000, 50, 400, "PLANNER");
+        assertEquals(expected, repo.rows.get(0).costUsd(), 1e-12,
+                "the persisted cost is the same figure the estimator returns");
+        assertTrue(expected < UsageService.estimateCostUsd("gpt-4o", 1000, 400, 50),
+                "gpt-4.1 is cheaper than gpt-4o — it must no longer be priced as gpt-4o");
+    }
+
+    @Test
+    void gpt4oPricingIsByteForByteWhatItWasBeforeThePerModelTable() {
+        double legacy = 600 * (2.50 / 1_000_000.0) + 400 * (2.50 / 1_000_000.0) * 0.5 + 50 * (10.00 / 1_000_000.0);
+        assertEquals(legacy, UsageService.estimateCostUsd("gpt-4o", 1000, 400, 50), 1e-12);
+
+        double legacyMini = 600 * (0.15 / 1_000_000.0) + 400 * (0.15 / 1_000_000.0) * 0.5 + 50 * (0.60 / 1_000_000.0);
+        assertEquals(legacyMini, UsageService.estimateCostUsd("gpt-4o-mini", 1000, 400, 50), 1e-12);
+    }
+
+    @Test
+    void olderModelsGetNoCachedDiscount() {
+        assertEquals(UsageService.estimateCostUsd("gpt-4", 1000, 0, 100),
+                UsageService.estimateCostUsd("gpt-4", 1000, 1000, 100), 1e-12,
+                "cached tokens cost the same as uncached for a model with no cache discount");
+    }
+
+    @Test
+    void datedSnapshotsPriceAsTheirFamilyUsingTheLongestMatchingName() {
+        assertSame(UsageService.ratesFor("gpt-4.1"), UsageService.ratesFor("gpt-4.1-2025-04-14"));
+        assertSame(UsageService.ratesFor("gpt-4.1-mini"), UsageService.ratesFor("gpt-4.1-mini-2025-04-14"),
+                "a mini snapshot must not be priced as the full model");
+        assertSame(UsageService.ratesFor("gpt-4o-mini"), UsageService.ratesFor("gpt-4o-mini-2024-07-18"),
+                "gpt-4o-mini snapshots must not be priced as gpt-4o");
+        assertNotSame(UsageService.ratesFor("gpt-4.1"), UsageService.ratesFor("gpt-4.1-mini"));
+    }
+
+    @Test
+    void anUnlistedModelIsStillPricedNeverFreeAndNullIsHandled() {
+        assertSame(UsageService.ratesFor("gpt-4o"), UsageService.ratesFor("some-future-model"));
+        assertSame(UsageService.ratesFor("gpt-4o"), UsageService.ratesFor(null));
+        assertTrue(UsageService.estimateCostUsd("some-future-model", 1000, 0, 100) > 0);
+    }
+
+    @Test
+    void cachedTokensAreClampedAndNegativesNeverProduceNegativeCost() {
+        assertEquals(UsageService.estimateCostUsd("gpt-4.1", 1000, 1000, 10),
+                UsageService.estimateCostUsd("gpt-4.1", 1000, 5000, 10), 1e-12, "cached > prompt clamps to prompt");
+        assertEquals(UsageService.estimateCostUsd("gpt-4.1", 1000, 0, 10),
+                UsageService.estimateCostUsd("gpt-4.1", 1000, -50, 10), 1e-12, "negative cached clamps to zero");
+        assertTrue(UsageService.estimateCostUsd("gpt-4.1", -5, 0, -5) >= 0);
+    }
+
+    @Test
+    void embeddingPricingIsUnchanged() {
+        assertEquals(1000 * (0.10 / 1_000_000.0), UsageService.estimateCostUsd("text-embedding-ada-002", 1000, 0, 0), 1e-15);
+    }
+
     // ── tenant isolation ─────────────────────────────────────────────────────────────────────────
 
     @Test

@@ -41,7 +41,7 @@ class TeachingServiceTest {
 
     static class FakeConceptService extends ConceptKnowledgeMaterializationService {
         List<Map<String, String>> catalog = new ArrayList<>();
-        FakeConceptService() { super(null, null, null, null, null, null); }
+        FakeConceptService() { super(null, null, null, null, null); }
         @Override public List<Map<String, String>> listConceptCatalog() { return catalog; }
         void addConcept(String key, String name) {
             Map<String, String> row = new LinkedHashMap<>();

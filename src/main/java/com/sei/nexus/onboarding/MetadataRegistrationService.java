@@ -64,6 +64,10 @@ public class MetadataRegistrationService {
     // exactly like businessValues above (see the null-guard at resolveActivePackKey): tests that
     // don't care about pack assignment keep using the 4-arg constructor unchanged.
     private final IndustryPackRepository packRepository;
+    // Concept index: a newly registered object carries the concept_key Stage 1 retrieves by, so the
+    // index is brought up to date automatically once the registration has committed. Nullable like
+    // the collaborators above (the short constructors used by tests leave it unset).
+    private final com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService conceptIndexSync;
 
     @org.springframework.beans.factory.annotation.Autowired
     public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
@@ -71,13 +75,26 @@ public class MetadataRegistrationService {
                                         RelationshipDiscoveryService relationshipDiscovery,
                                         EntityCandidateService entityCandidates,
                                         com.sei.nexus.enterprise.BusinessValueRepository businessValues,
-                                        IndustryPackRepository packRepository) {
+                                        IndustryPackRepository packRepository,
+                                        com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService conceptIndexSync) {
         this.enterpriseMapService  = enterpriseMapService;
         this.semanticService       = semanticService;
         this.relationshipDiscovery = relationshipDiscovery;
         this.entityCandidates      = entityCandidates;
         this.businessValues        = businessValues;
         this.packRepository        = packRepository;
+        this.conceptIndexSync      = conceptIndexSync;
+    }
+
+    /** Pack-aware convenience (tests): no concept-index trigger. */
+    public MetadataRegistrationService(EnterpriseMapService enterpriseMapService,
+                                        SemanticService semanticService,
+                                        RelationshipDiscoveryService relationshipDiscovery,
+                                        EntityCandidateService entityCandidates,
+                                        com.sei.nexus.enterprise.BusinessValueRepository businessValues,
+                                        IndustryPackRepository packRepository) {
+        this(enterpriseMapService, semanticService, relationshipDiscovery, entityCandidates,
+                businessValues, packRepository, null);
     }
 
     /** Backward-compatible convenience (tests): no Business Value persistence (⇒ step 5 is a
@@ -298,6 +315,17 @@ public class MetadataRegistrationService {
             } finally {
                 log.info("onboarding.performance stage=relationships elapsedMs={}",
                         System.currentTimeMillis() - relStart);
+            }
+        }
+
+        // Fire-and-forget, AFTER the registration above has finished: keeps the concept index in step
+        // with the newly bound objects. A failure to schedule it never fails the registration — the
+        // nightly and startup reconciliations converge the index regardless.
+        if (conceptIndexSync != null && entitiesCreated > 0) {
+            try {
+                conceptIndexSync.triggerAsync();
+            } catch (Exception e) {
+                log.warn("Concept index sync could not be scheduled after registration (non-fatal): {}", e.getMessage());
             }
         }
 

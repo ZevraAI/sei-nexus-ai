@@ -77,12 +77,61 @@ public class ExecutionOutcomeInterpreter {
                 // conciseness is unaffected (identical output to before this change).
                 String joined = strVals.stream().map(v -> truncate(v, 80)).collect(Collectors.joining(", "));
                 valuesBlock.append("  ").append(col).append(" = ").append(joined).append("\n");
+            } else if (!strVals.isEmpty()) {
+                // Larger result, column not described above (not a measure, not low-cardinality):
+                // show what its values look like so the answer is not written blind to whether they
+                // are readable labels or generated keys. A plain observation about the data.
+                sb.append("  ").append(col).append(": ").append(dist.size()).append(" distinct, e.g. ")
+                  .append(strVals.stream().distinct().limit(3).map(v -> truncate(v, 40))
+                          .collect(Collectors.joining(", "))).append("\n");
             }
         }
         if (!valuesBlock.isEmpty()) {
             sb.append("Values:\n").append(valuesBlock);
         }
+        if (smallResult && rows.size() >= 2 && cols.size() >= 2) {
+            sb.append(renderAlignedRows(rows, cols));
+        }
         return sb.toString();
+    }
+
+    /** Upper bound (characters) on the aligned-rows block, so a wide small result cannot bloat the
+     *  composer prompt; rows beyond it are counted, not silently dropped. */
+    private static final int MAX_ALIGNED_ROWS_CHARS = 6_000;
+
+    /**
+     * The rows themselves, one per line, each value next to its own column name. The per-column
+     * statistics and "Values:" lists above are deliberately column-wise, which is exactly what makes
+     * them unsafe for a multi-row, multi-column result: a numeric column is reduced to sum/avg and a
+     * string column to an unordered value list, so a reader cannot tell WHICH row a value belongs
+     * to — and an answer-writing model then states the wrong record's figure (a live example: a
+     * supplier's rating and on-time rate quoted from a different supplier's row). With 2+ rows and
+     * 2+ columns the alignment is the information, so it is rendered explicitly. Pure shape-driven
+     * mechanics: nothing here looks at a column's name, meaning or domain. A single row, or a single
+     * column, has nothing to misalign and is left exactly as before.
+     */
+    private static String renderAlignedRows(List<Map<String, Object>> rows, Set<String> cols) {
+        StringBuilder out = new StringBuilder(
+                "Rows (each line is ONE row; every value belongs to the column named beside it):\n");
+        int shown = 0;
+        for (Map<String, Object> r : rows) {
+            String line = cols.stream()
+                    .map(c -> {
+                        Object v = r.get(c);
+                        String s = v == null ? "" : String.valueOf(v);
+                        return (s.isBlank() || s.equals("null")) ? null : c + " = " + truncate(s, 80);
+                    })
+                    .filter(java.util.Objects::nonNull)
+                    .collect(Collectors.joining("; "));
+            String entry = "  " + (shown + 1) + ". " + line + "\n";
+            if (out.length() + entry.length() > MAX_ALIGNED_ROWS_CHARS) break;
+            out.append(entry);
+            shown++;
+        }
+        if (shown < rows.size()) {
+            out.append("  … ").append(rows.size() - shown).append(" more row(s) not shown here\n");
+        }
+        return out.toString();
     }
 
     private static String truncate(String s, int max) {

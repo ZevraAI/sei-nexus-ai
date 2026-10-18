@@ -80,6 +80,55 @@ public class ExecutionContractBuilder {
     }
 
     /**
+     * Derives a NEW immutable contract from {@code base} that additionally covers {@code additions}
+     * — used when the planner (the LLM) explicitly requested an object's metadata and Java has
+     * already validated that request by exact identity against the authoritative catalog of the
+     * connections {@code base} approved (see {@code ColumnMetadataRequestHandler}). The LLM's
+     * request is the scoping decision; this method only performs the mechanical binding, with
+     * exactly the same {@link #bind} used by {@link #compile}, so an added object is approved on
+     * precisely the same terms as any other (schema-qualified identity, default-schema bare form,
+     * attribute bindings for the column-existence gate).
+     *
+     * <p>{@code base} is never mutated. Nothing is added beyond {@code additions}, and the result
+     * can only ever be as wide as the catalog of {@code base}'s own approved connections — it never
+     * reaches a connection {@code base} did not approve. The deny-only tenant/connection allow-list
+     * ({@code QueryGovernanceService.isTableAllowed}) still runs downstream and can only reject.
+     * Objects already present in {@code base} are left as-is (a no-op for the overlap).
+     */
+    public ExecutionContract extend(ExecutionContract base, com.sei.nexus.semanticmodel.SemanticModel additions) {
+        if (base == null || additions == null || additions.objects().isEmpty()) return base;
+
+        Map<String, ExecutionBindings.ExecutionTarget> objectBindings =
+                new LinkedHashMap<>(base.executionBindings().objectBindings());
+        Map<String, ExecutionBindings.ExecutionTarget> attributeBindings =
+                new LinkedHashMap<>(base.executionBindings().attributeBindings());
+        Set<ExecutionBindings.ApprovedAsset> approvedAssets =
+                new LinkedHashSet<>(base.executionBindings().approvedAssets());
+
+        Set<String> known = new LinkedHashSet<>();
+        List<BusinessObject> objects = new ArrayList<>(base.semanticView().businessObjects());
+        for (BusinessObject o : objects) known.add(o.objectKey());
+        List<BusinessObject> newObjects = new ArrayList<>();
+        for (BusinessObject o : additions.objects()) {
+            if (known.add(o.objectKey())) newObjects.add(o);
+        }
+        if (newObjects.isEmpty()) return base;
+        objects.addAll(newObjects);
+
+        bind(newObjects, additions.objectTargets(), additions.attributeTargets(),
+                objectBindings, attributeBindings, approvedAssets);
+
+        return new ExecutionContract(
+                base.contractId(),
+                base.createdAt(),
+                base.agentId(),
+                base.connectionKeys(),
+                computeSemanticHash(base.agentId(), approvedAssets),
+                new SemanticView(objects),
+                new ExecutionBindings(objectBindings, attributeBindings, approvedAssets));
+    }
+
+    /**
      * Binds one object set's physical identity into the given (mutable, accumulating) bindings —
      * shared by both the prompt-rendering plane and the execution-authorization plane in {@link
      * #compile}, so the two identical-shaped loops that existed before this method was extracted

@@ -22,9 +22,9 @@ import java.util.List;
  * <p><b>What this class no longer does.</b> It used to also inject promoted/eligible learned-
  * mapping vocabulary from {@code nexus_learned_mapping} into this same prompt — that responsibility
  * has been removed entirely (this class has no {@link LearnedMappingRepository} dependency at
- * all). Promoted learning vocabulary now reaches the LLM exclusively through native File Search
- * over the tenant's OpenAI Vector Store: an admin-classified promoted learning is folded into its
- * concept's Vector Store document by {@code ConceptKnowledgeMaterializationService} and kept
+ * all). Promoted learning vocabulary now reaches the LLM exclusively through the concept index
+ * over the tenant's concept index: an admin-classified promoted learning is folded into its
+ * concept's concept index document by {@code ConceptKnowledgeMaterializationService} and kept
  * converged there by {@code ConceptKnowledgeSynchronizationService}. Postgres remains authoritative
  * for the learning lifecycle, but Java no longer reads that table into any LLM prompt.
  */

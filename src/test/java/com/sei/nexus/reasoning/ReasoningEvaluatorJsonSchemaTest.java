@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReasoningEvaluatorJsonSchemaTest {
 
     @Test
-    void rootIsAPlainObjectWithExactlyTheThreeFieldsAllRequired() {
+    void rootIsAPlainObjectWithExactlyTheFourFieldsAllRequired() {
         Map<String, Object> schema = ReasoningEvaluator.evaluatorJsonSchema();
         assertEquals("object", schema.get("type"));
         assertFalse(schema.containsKey("anyOf"));
@@ -29,7 +29,7 @@ class ReasoningEvaluatorJsonSchemaTest {
         @SuppressWarnings("unchecked")
         List<String> required = (List<String>) schema.get("required");
 
-        Set<String> expected = Set.of("resultSetMatches", "decision", "rationale");
+        Set<String> expected = Set.of("resultSetMatches", "zeroRowResultConfirmed", "decision", "rationale");
         assertEquals(expected, properties.keySet());
         assertEquals(expected, Set.copyOf(required));
         assertEquals(Boolean.FALSE, schema.get("additionalProperties"));

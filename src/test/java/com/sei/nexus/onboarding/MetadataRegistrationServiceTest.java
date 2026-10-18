@@ -606,6 +606,50 @@ class MetadataRegistrationServiceTest {
         assertTrue(result.failures().stream().anyMatch(f -> f.startsWith("relationship discovery:")));
     }
 
+    // ── Concept index sync after object onboarding ───────────────────────────────
+
+    static class CountingSync extends com.sei.nexus.knowledge.ConceptKnowledgeSynchronizationService {
+        int triggers = 0;
+        RuntimeException failure;
+        CountingSync() { super(null, null, null); }
+        @Override public void triggerAsync() {
+            triggers++;
+            if (failure != null) throw failure;
+        }
+    }
+
+    @Test
+    void registeringObjectsTriggersOneConceptIndexSyncAfterTheBatch() {
+        CountingSync sync = new CountingSync();
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, null, sync);
+
+        service.register(request(storesEntity(), suppliersEntity()), "user@x.com");
+
+        assertEquals(1, sync.triggers, "one sync per batch, not one per object");
+    }
+
+    @Test
+    void aBatchThatRegistersNoEntityTriggersNoSync() {
+        CountingSync sync = new CountingSync();
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, null, sync);
+        Map<String, Object> unapproved = storesEntity();
+        unapproved.put("approved", false);
+
+        service.register(request(unapproved), "user@x.com");
+
+        assertEquals(0, sync.triggers);
+    }
+
+    @Test
+    void aSyncThatCannotBeScheduledNeverFailsTheRegistration() {
+        CountingSync sync = new CountingSync();
+        sync.failure = new IllegalStateException("executor rejected");
+        service = new MetadataRegistrationService(enterpriseMap, semantic, discovery, candidates, null, null, sync);
+
+        var result = service.register(request(storesEntity()), "user@x.com");
+
+        assertEquals(1, result.entitiesCreated());
+    }
     // ── Connection-Scoped Industry Pack Semantic Assignment ──────────────────────
 
     @Test

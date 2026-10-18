@@ -5,7 +5,7 @@ package com.sei.nexus.ai;
  *
  * <p>A thread-local correlation id, set by the calling service from an identifier it already
  * owns (an onboarding {@code jobId}, a chat {@code runKey}, etc. — never a newly-minted id: see
- * the baseline report's Section 7), so every {@code LLM_METRIC}/{@code FILE_SEARCH_METRIC} log
+ * the baseline report's Section 7), so every {@code LLM_METRIC} log
  * line emitted while handling one operation can be grepped/grouped together after the fact.
  * Purely observational — nothing reads this value to make a decision or alter behavior.
  *

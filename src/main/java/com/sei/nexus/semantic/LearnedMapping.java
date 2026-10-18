@@ -17,8 +17,8 @@ import java.time.Instant;
  * <p>source values: QUERY_SUCCESS | USER_CORRECTION | POSITIVE_FEEDBACK
  *
  * <p>{@code conceptKey}: null = promoted but not yet classified into a concept; required before
- * Vector Store projection. A promoted mapping is never automatically eligible for projection into
- * the tenant's OpenAI Vector Store — projection is keyed off a concept, and there is no reliable,
+ * concept index projection. A promoted mapping is never automatically eligible for projection into
+ * the tenant's concept index — projection is keyed off a concept, and there is no reliable,
  * safe way to infer which concept a learned business_term/sql_pattern belongs to from the SQL,
  * domain, or table names alone. This field is set exactly one way: an admin explicitly assigning
  * it (see {@link LearnedMappingRepository#assignConceptKey}) — never inferred.

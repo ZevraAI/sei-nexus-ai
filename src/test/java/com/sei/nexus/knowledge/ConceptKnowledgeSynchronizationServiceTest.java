@@ -1,19 +1,15 @@
 package com.sei.nexus.knowledge;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sei.nexus.ai.AzureOpenAiClient;
-import com.sei.nexus.onboarding.TenantSettingsRepository;
-import com.sei.nexus.pack.IndustryPack;
-import com.sei.nexus.pack.IndustryPackRepository;
-import com.sei.nexus.pack.PackEntity;
-import com.sei.nexus.pack.TenantPack;
-import com.sei.nexus.semantic.LearnedMapping;
-import com.sei.nexus.semantic.LearnedMappingRepository;
-import com.sei.nexus.semantic.SemanticService;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.FakeEmbeddingClient;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.FakeEmbeddingRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.FakeLearnedMappingRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.FakePackRepository;
+import com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.FakeSemanticService;
 import com.sei.nexus.tenant.Tenant;
 import com.sei.nexus.tenant.TenantContext;
 import com.sei.nexus.tenant.TenantRepository;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -23,535 +19,164 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.sei.nexus.knowledge.ConceptKnowledgeMaterializationServiceTest.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Hand-rolled fakes throughout — same convention as {@code
- * ConceptKnowledgeMaterializationServiceTest}, which this test complements rather than duplicates
- * (the underlying projection/upload logic is already covered there; this file covers the diff
- * engine — create/update/delete/no-op — plus tenant isolation and the concurrency guard).
+ * {@link ConceptKnowledgeSynchronizationService}: the one convergence of the concept index to what
+ * Postgres says it should be — create / update / delete / unchanged, the status report, and the
+ * all-tenants reconciliation. Hand-rolled fakes; no Mockito, no DB, no live OpenAI.
  */
 class ConceptKnowledgeSynchronizationServiceTest {
+
+    static class FakeTenantRepository extends TenantRepository {
+        final List<Tenant> tenants = new ArrayList<>();
+        FakeTenantRepository() { super(null); }
+        @Override public List<Tenant> findAll() { return tenants; }
+    }
+
+    private FakePackRepository packRepo;
+    private FakeSemanticService semantic;
+    private FakeEmbeddingClient ai;
+    private FakeLearnedMappingRepository learned;
+    private FakeEmbeddingRepository repo;
+    private FakeTenantRepository tenants;
+    private ConceptKnowledgeSynchronizationService sync;
+
+    @BeforeEach
+    void setUp() {
+        packRepo = packRepoWithTwoConcepts();
+        semantic = semanticServiceUsing("conn-1", "purchase-order", "sales-transaction");
+        ai = new FakeEmbeddingClient();
+        learned = new FakeLearnedMappingRepository();
+        repo = new FakeEmbeddingRepository();
+        tenants = new FakeTenantRepository();
+        var materialization = new ConceptKnowledgeMaterializationService(packRepo, semantic, ai, learned, repo);
+        sync = new ConceptKnowledgeSynchronizationService(tenants, materialization, repo);
+        TenantContext.set("tenant_acme");
+    }
 
     @AfterEach
     void clearTenantContext() {
         TenantContext.clear();
     }
 
-    // ── Fakes ─────────────────────────────────────────────────────────────────────────────────
-
-    static class FakeTenantRepository extends TenantRepository {
-        final Map<String, Tenant> bySchema = new LinkedHashMap<>();
-        FakeTenantRepository() { super(null); }
-        void seed(Tenant tenant) { bySchema.put(tenant.schemaName(), tenant); }
-        @Override public Optional<Tenant> findBySchemaName(String schemaName) {
-            return Optional.ofNullable(bySchema.get(schemaName));
-        }
-        @Override public List<Tenant> findAll() { return List.copyOf(bySchema.values()); }
+    private static Tenant tenant(String slug, String schema, String status) {
+        return new Tenant(UUID.randomUUID(), slug, slug + " Inc", schema, "STANDARD", status,
+                "admin@" + slug + ".example", 50, Instant.now(), Instant.now());
     }
 
-    static class FakePackRepository extends IndustryPackRepository {
-        List<TenantPack> appliedPacks = new ArrayList<>();
-        Map<String, IndustryPack> packsById = new LinkedHashMap<>();
-        FakePackRepository() { super(null, new ObjectMapper()); }
-        @Override public List<TenantPack> findAppliedPacks() { return appliedPacks; }
-        @Override public Optional<IndustryPack> findPackById(String packId) {
-            return Optional.ofNullable(packsById.get(packId));
-        }
-    }
-
-    static class FakeSemanticService extends SemanticService {
-        Map<String, List<String>> usedConceptKeysByConnection = new LinkedHashMap<>();
-        Map<String, List<com.sei.nexus.semantic.BusinessEntity>> changedEntitiesByConnection = new LinkedHashMap<>();
-        FakeSemanticService() { super(null, null, null); }
-        @Override public List<String> findDistinctConceptKeysForConnection(String connectionKey) {
-            return usedConceptKeysByConnection.getOrDefault(connectionKey, List.of());
-        }
-        @Override public List<com.sei.nexus.semantic.BusinessEntity> findEntitiesChangedAfterForConnection(
-                String connectionKey, Instant since) {
-            return changedEntitiesByConnection.getOrDefault(connectionKey, List.of());
-        }
-    }
-
-    static class FakeTenantSettingsRepository extends TenantSettingsRepository {
-        Map<String, String> store = new LinkedHashMap<>();
-        FakeTenantSettingsRepository() { super(null); }
-        @Override public Optional<String> get(String key) { return Optional.ofNullable(store.get(key)); }
-        @Override public void set(String key, String value) { store.put(key, value); }
-        @Override public void delete(String key) { store.remove(key); }
-    }
-
-    static class FakeAiClient extends AzureOpenAiClient {
-        final AtomicInteger uploadCalls = new AtomicInteger(0);
-        final List<String> uploadedFilenames = new ArrayList<>();
-        final List<Map<String, String>> attachedAttributes = new ArrayList<>();
-        final List<String> deletedFileIds = new ArrayList<>();
-        final List<String> detachedFileIds = new ArrayList<>();
-        List<AzureOpenAiClient.VectorStoreFileRef> existingFiles = new ArrayList<>();
-        /** When true, simulates every upload failing — the watermark-correctness tests' way of
-         *  forcing a PARTIAL/FAILED synchronize() outcome without a real OpenAI error. */
-        boolean uploadShouldFail = false;
-
-        FakeAiClient() { super(new ObjectMapper(), null); }
-
-        @Override public String uploadFile(byte[] content, String filename, String mimeType) {
-            if (uploadShouldFail) {
-                throw new RuntimeException("simulated upload failure");
-            }
-            uploadCalls.incrementAndGet();
-            uploadedFilenames.add(filename);
-            return "file_" + uploadCalls.get();
-        }
-
-        @Override public void attachFileToVectorStore(String vectorStoreId, String fileId, Map<String, String> attributes) {
-            attachedAttributes.add(attributes);
-        }
-
-        @Override public List<AzureOpenAiClient.VectorStoreFileRef> listVectorStoreFiles(String vectorStoreId) {
-            return existingFiles;
-        }
-
-        @Override public void deleteFile(String fileId) {
-            deletedFileIds.add(fileId);
-        }
-
-        @Override public void detachFileFromVectorStore(String vectorStoreId, String fileId) {
-            detachedFileIds.add(fileId);
-        }
-    }
-
-    static class FakeLearnedMappingRepository extends LearnedMappingRepository {
-        final Map<String, List<LearnedMapping>> byConceptKey = new LinkedHashMap<>();
-        FakeLearnedMappingRepository() { super(null); }
-        void seed(String conceptKey, LearnedMapping... mappings) {
-            byConceptKey.put(conceptKey, new ArrayList<>(List.of(mappings)));
-        }
-        @Override public List<LearnedMapping> findPromotedByConceptKey(String conceptKey) {
-            return byConceptKey.getOrDefault(conceptKey, List.of());
-        }
-        @Override public int countPromotedUnclassified() { return 0; }
-    }
-
-    private static Tenant tenantWithVectorStore(String slug, String schema, String vectorStoreId) {
-        return new Tenant(UUID.randomUUID(), slug, slug + " Inc", schema,
-                "STANDARD", "ACTIVE", "admin@" + slug + ".example", 50,
-                Instant.now(), Instant.now(), vectorStoreId, vectorStoreId != null ? "READY" : null, null, Instant.now());
-    }
-
-    private static PackEntity entity(String conceptKey, String name) {
-        return new PackEntity(name, List.of(name.toLowerCase()), List.of(), List.of(),
-                "description of " + name, "operational meaning of " + name, conceptKey, "ACTIVE");
-    }
-
-    private static FakePackRepository packRepoWithOneConcept(String connectionKey, String packKey, String conceptKey, String name) {
-        FakePackRepository packRepo = new FakePackRepository();
-        IndustryPack pack = new IndustryPack(packKey, "retail", "Retail", "1.0", "desc",
-                List.of(entity(conceptKey, name)),
-                List.of(), List.of(), List.of(), List.of(), null, null, null, null, List.of(), null, null);
-        packRepo.packsById.put(packKey, pack);
-        packRepo.appliedPacks.add(new TenantPack(packKey, connectionKey, "1.0", "Retail", "ACTIVE",
-                Map.of(), 1.0, Instant.now(), "test"));
-        return packRepo;
-    }
-
-    /** One tenant/connection/pack/concept wired end to end, with all fakes exposed for assertions. */
-    private static final class Harness {
-        final FakeTenantRepository tenantRepo = new FakeTenantRepository();
-        final FakePackRepository packRepo;
-        final FakeSemanticService semanticService;
-        final FakeAiClient aiClient = new FakeAiClient();
-        final FakeTenantSettingsRepository settings = new FakeTenantSettingsRepository();
-        final FakeLearnedMappingRepository learnedMappingRepository = new FakeLearnedMappingRepository();
-        final ConceptKnowledgeMaterializationService materializer;
-        final ConceptKnowledgeSynchronizationService sync;
-
-        Harness(String schema, String slug, String vectorStoreId,
-                String connectionKey, String packKey, String conceptKey, String name) {
-            packRepo = packRepoWithOneConcept(connectionKey, packKey, conceptKey, name);
-            semanticService = new FakeSemanticService();
-            semanticService.usedConceptKeysByConnection.put(connectionKey, List.of(conceptKey));
-            materializer = new ConceptKnowledgeMaterializationService(
-                    tenantRepo, packRepo, semanticService, aiClient, new ObjectMapper(), learnedMappingRepository);
-            sync = new ConceptKnowledgeSynchronizationService(
-                    tenantRepo, aiClient, materializer, settings, learnedMappingRepository);
-            tenantRepo.seed(tenantWithVectorStore(slug, schema, vectorStoreId));
-        }
-    }
-
-    // ── Create ────────────────────────────────────────────────────────────────────────────────
+    // ── synchronize ───────────────────────────────────────────────────────────────────────────
 
     @Test
-    void newAuthoritativeConceptIsCreatedWhenVectorStoreHasNoMatchingFile() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
+    void theFirstSyncEmbedsAndStoresEveryConcept() {
+        var result = sync.synchronize();
 
         assertEquals(ConceptKnowledgeSynchronizationService.Status.IN_SYNC, result.status());
-        assertEquals(1, result.createdCount());
-        assertEquals(0, result.updatedCount());
-        assertEquals(0, result.deletedCount());
-        assertEquals(1, h.aiClient.uploadCalls.get());
+        assertEquals(2, result.createdCount());
+        assertEquals(2, repo.rows.size());
+        assertEquals(2, ai.embeddedTexts.size());
     }
 
-    // ── No-op (content hash matches) ─────────────────────────────────────────────────────────
-
     @Test
-    void unchangedConceptIsSkippedNotReUploadedWhenContentHashMatches() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
+    void aSecondSyncOfUnchangedConceptsCostsNoEmbeddingCall() {
+        sync.synchronize();
+        ai.embeddedTexts.clear();
 
-        ConceptKnowledgeMaterializationService.ConceptUnit unit = h.materializer.collectConceptUnits().get(0);
-        String hash = h.materializer.contentHash(unit);
-        h.aiClient.existingFiles.add(new AzureOpenAiClient.VectorStoreFileRef("file_existing", Map.of(
-                "concept_uid", unit.uid(), "knowledge_type", "business-concept", "content_hash", hash)));
+        var result = sync.synchronize();
 
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
-
-        assertEquals(0, result.createdCount());
-        assertEquals(0, result.updatedCount());
-        assertEquals(0, result.deletedCount());
-        assertEquals(1, result.unchangedCount());
-        assertEquals(0, h.aiClient.uploadCalls.get(), "an unchanged concept must never be re-uploaded");
+        assertEquals(2, result.unchangedCount());
+        assertEquals(0, result.createdCount() + result.updatedCount() + result.deletedCount());
+        assertTrue(ai.embeddedTexts.isEmpty(), "unchanged concepts are not re-embedded");
     }
 
-    // ── Update (content hash differs) ────────────────────────────────────────────────────────
-
     @Test
-    void changedConceptContentTriggersDeleteThenReupload() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
+    void aPromotedLearningReEmbedsOnlyTheConceptItBelongsTo() {
+        sync.synchronize();
+        ai.embeddedTexts.clear();
+        learned.seed("purchase-order", learnedMapping("k", "late po", "expected < now()", 0.9));
 
-        ConceptKnowledgeMaterializationService.ConceptUnit unit = h.materializer.collectConceptUnits().get(0);
-        h.aiClient.existingFiles.add(new AzureOpenAiClient.VectorStoreFileRef("file_stale", Map.of(
-                "concept_uid", unit.uid(), "knowledge_type", "business-concept",
-                "content_hash", "stale-hash-from-before-the-description-changed")));
+        var result = sync.synchronize();
 
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
-
-        assertEquals(0, result.createdCount());
         assertEquals(1, result.updatedCount());
-        assertEquals(0, result.deletedCount());
-        assertEquals(1, h.aiClient.uploadCalls.get(), "the changed concept must be re-uploaded");
-        assertEquals(List.of("file_stale"), h.aiClient.detachedFileIds,
-                "the stale file must be DETACHED from the vector store — deleteFile alone does not "
-                        + "remove it from listVectorStoreFiles (confirmed against the real OpenAI API "
-                        + "during this feature's own real-tenant validation)");
-        assertEquals(List.of("file_stale"), h.aiClient.deletedFileIds,
-                "the stale file's underlying File object must also be deleted — no duplicate copies");
-    }
-
-    // ── Delete (concept no longer authoritative) ─────────────────────────────────────────────
-
-    @Test
-    void conceptNoLongerInAuthoritativeProjectionIsDeletedFromVectorStore() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-
-        // Existing file for a concept that no longer appears in the authoritative projection
-        // (e.g. its Pack was removed) — must never remain searchable.
-        h.aiClient.existingFiles.add(new AzureOpenAiClient.VectorStoreFileRef("file_stale_pack", Map.of(
-                "concept_uid", "conn-1::old-pack::inventory-balance",
-                "knowledge_type", "business-concept", "content_hash", "whatever")));
-        // Plus the one concept that IS still authoritative, already correctly present.
-        ConceptKnowledgeMaterializationService.ConceptUnit unit = h.materializer.collectConceptUnits().get(0);
-        h.aiClient.existingFiles.add(new AzureOpenAiClient.VectorStoreFileRef("file_current", Map.of(
-                "concept_uid", unit.uid(), "knowledge_type", "business-concept",
-                "content_hash", h.materializer.contentHash(unit))));
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
-
-        assertEquals(0, result.createdCount());
-        assertEquals(0, result.updatedCount());
-        assertEquals(1, result.deletedCount());
         assertEquals(1, result.unchangedCount());
-        assertEquals(List.of("file_stale_pack"), h.aiClient.detachedFileIds,
-                "detach must happen for a deleted concept too — not just delete");
-        assertEquals(List.of("file_stale_pack"), h.aiClient.deletedFileIds);
+        assertEquals(1, ai.embeddedTexts.size());
+        assertTrue(ai.embeddedTexts.get(0).contains("late po"));
+        assertTrue(repo.rows.get("conn-1::retail-v1::purchase-order").docText().contains("late po"));
     }
 
-    // ── Non-Zevra-managed files are never touched ────────────────────────────────────────────
-
     @Test
-    void filesWithoutTheBusinessConceptKnowledgeTypeAreNeverDeletedOrConsidered() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        h.aiClient.existingFiles.add(new AzureOpenAiClient.VectorStoreFileRef("file_unrelated",
-                Map.of("concept_uid", "conn-1::retail-v1::purchase-order"))); // no knowledge_type attribute at all
+    void aStaleProjectionVersionIsTreatedAsChanged() {
+        sync.synchronize();
+        var row = repo.rows.get("conn-1::retail-v1::purchase-order");
+        repo.rows.put(row.conceptUid(), new FakeEmbeddingRepository.Row(row.conceptUid(), row.connectionKey(),
+                row.packKey(), row.conceptKey(), row.contentHash(), "1", row.docText(), row.embedding()));
+        ai.embeddedTexts.clear();
 
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
+        var result = sync.synchronize();
 
-        assertEquals(1, result.createdCount(), "the unmanaged file must not count as already-present");
-        assertTrue(h.aiClient.deletedFileIds.isEmpty(), "an unmanaged file must never be deleted by this service");
+        assertEquals(1, result.updatedCount());
+        assertEquals(1, ai.embeddedTexts.size());
     }
 
-    // ── Tenant isolation ──────────────────────────────────────────────────────────────────────
-
     @Test
-    void synchronizingOneTenantNeverConsultsOrAffectsAnotherTenantsAuthoritativeData() {
-        Harness h = new Harness("tenant_a", "tenant-a", "vs_a", "conn-a", "retail-v1", "purchase-order", "Purchase Order");
-        // A second tenant's row exists in the shared FakeTenantRepository, but this harness's
-        // packRepo/semanticService are scoped only to conn-a — proving that whichever tenant's
-        // schema is in TenantContext is the only one whose data the diff ever consults.
-        h.tenantRepo.seed(tenantWithVectorStore("tenant-b", "tenant_b", "vs_b"));
+    void aConceptNoLongerInThePostgresCatalogIsDeletedFromTheIndex() {
+        sync.synchronize();
+        semantic.usedConceptKeysByConnection.put("conn-1", List.of("purchase-order"));
 
-        TenantContext.set("tenant_a");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
+        var result = sync.synchronize();
 
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.IN_SYNC, result.status());
-        assertEquals(1, result.createdCount(), "only tenant A's own concept was ever authoritative");
+        assertEquals(1, result.deletedCount());
+        assertEquals(List.of("conn-1::retail-v1::purchase-order"), List.copyOf(repo.rows.keySet()));
     }
 
-    // ── Concurrency guard ─────────────────────────────────────────────────────────────────────
-
     @Test
-    void aSecondConcurrentSynchronizeCallForTheSameTenantIsSkippedNotDuplicated() throws Exception {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
+    void aFailedEmbeddingIsReportedPartialWritesNothingForThatConceptAndDoesNotAdvanceTheWatermark() {
+        ai.failure = new IllegalStateException("embedding service down");
 
-        TenantContext.set("tenant_acme");
-        // Simulate an in-flight sync by directly marking the guard (mirrors what the real
-        // synchronize() call does internally at its very first step).
-        java.lang.reflect.Field field = ConceptKnowledgeSynchronizationService.class.getDeclaredField("inProgress");
-        field.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        java.util.Set<String> inProgress = (java.util.Set<String>) field.get(h.sync);
-        inProgress.add("tenant_acme");
-
-        try {
-            ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-            assertEquals(ConceptKnowledgeSynchronizationService.Status.SYNCING, result.status());
-            assertEquals(0, h.aiClient.uploadCalls.get(), "a concurrent duplicate call must never upload anything");
-        } finally {
-            TenantContext.clear();
-        }
-    }
-
-    // ── Missing tenant context fails closed ──────────────────────────────────────────────────
-
-    @Test
-    void missingTenantContextFailsClosedRatherThanSynchronizingAgainstPublic() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-
-        TenantContext.clear(); // deliberately no context
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
+        var result = sync.synchronize();
 
         assertEquals(ConceptKnowledgeSynchronizationService.Status.FAILED, result.status());
-        assertEquals(0, h.aiClient.uploadCalls.get());
-        assertEquals(0, h.aiClient.deletedFileIds.size());
-    }
-
-    // ── Content-hash determinism ──────────────────────────────────────────────────────────────
-
-    @Test
-    void sameContentAlwaysProducesTheSameHashAndChangedContentProducesADifferentOne() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        ConceptKnowledgeMaterializationService.ConceptUnit unit = h.materializer.collectConceptUnits().get(0);
-
-        String hash1 = h.materializer.contentHash(unit);
-        String hash2 = h.materializer.contentHash(unit);
-        assertEquals(hash1, hash2, "hashing the same unit twice must be deterministic");
-
-        ConceptKnowledgeMaterializationService.ConceptUnit changed = new ConceptKnowledgeMaterializationService.ConceptUnit(
-                unit.connectionKey(), unit.packKey(),
-                new ConceptKnowledgeMaterializationService.ConceptEntry(
-                        unit.entry().conceptKey(), unit.entry().name(), unit.entry().aliases(),
-                        "a materially different description", unit.entry().operationalMeaning()),
-                unit.learnedKnowledge());
-        String hash3 = h.materializer.contentHash(changed);
-        assertNotEquals(hash1, hash3, "changed description must produce a different hash");
+        assertEquals(2, result.failedCount());
+        assertTrue(repo.rows.isEmpty());
     }
 
     @Test
-    void learnedKnowledgeChangesTheHashTooEvenWhenConceptMetadataIsIdentical() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        ConceptKnowledgeMaterializationService.ConceptUnit withoutLearning = h.materializer.collectConceptUnits().get(0);
-        String hashWithout = h.materializer.contentHash(withoutLearning);
-
-        h.learnedMappingRepository.seed("purchase-order", new LearnedMapping(
-                "lmap-1", "PLATFORM", "open", "status = 'open'", "run-1", "QUERY_SUCCESS",
-                0.9, 5, Instant.now(), true, Instant.now(), Instant.now(), "purchase-order"));
-        ConceptKnowledgeMaterializationService.ConceptUnit withLearning = h.materializer.collectConceptUnits().get(0);
-        String hashWith = h.materializer.contentHash(withLearning);
-
-        assertNotEquals(hashWithout, hashWith,
-                "folding in promoted/classified learned knowledge must change the hash");
-    }
-
-    // ── Sync watermark: status() derivation ─────────────────────────────────────────────────────
-
-    private static com.sei.nexus.semantic.BusinessEntity changedEntity(String entityKey, String conceptKey,
-                                                                         String name, Instant createdAt, Instant updatedAt) {
-        return new com.sei.nexus.semantic.BusinessEntity(entityKey, "PLATFORM", name, "desc", "obj-1",
-                "meaning", null, "ACTIVE", "test", createdAt, updatedAt, null, null, "retail-v1", conceptKey);
-    }
-
-    @Test
-    void neverSyncedTenantWithMaterializableConceptsShowsPendingWithRealNamesNotFalseInSync() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        // Mirrors real Postgres behavior: with no watermark yet, status() queries from
-        // Instant.EPOCH, and this concept's own created_at (any real timestamp) is trivially
-        // "after" EPOCH — so it must appear in pendingChanges by its real name, never collapsed
-        // into an unnamed placeholder count.
-        h.semanticService.changedEntitiesByConnection.put("conn-1", List.of(
-                changedEntity("e1", "purchase-order", "Purchase Order", Instant.now(), Instant.now())));
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.StatusReport report = h.sync.status();
+    void withoutATenantContextNothingRuns() {
         TenantContext.clear();
 
-        assertNotEquals(ConceptKnowledgeSynchronizationService.Status.IN_SYNC, report.status(),
-                "a tenant that has never completed a successful sync must never read as IN_SYNC");
-        assertNull(report.lastSuccessfulSync());
-        assertEquals(1, report.pendingChanges().size());
-        assertEquals("Purchase Order", report.pendingChanges().get(0).name(),
-                "the never-synced case must list the real concept name, not a synthetic placeholder");
+        var result = sync.synchronize();
+
+        assertEquals(ConceptKnowledgeSynchronizationService.Status.FAILED, result.status());
+        assertTrue(ai.embeddedTexts.isEmpty());
+    }
+
+    // ── reconciliation ────────────────────────────────────────────────────────────────────────
+
+    @Test
+    void reconciliationSyncsEveryActiveTenantAndSkipsInactiveAndTheSharedPublicSchema() {
+        tenants.tenants.add(tenant("acme", "tenant_acme", "ACTIVE"));
+        tenants.tenants.add(tenant("gone", "tenant_gone", "SUSPENDED"));
+        tenants.tenants.add(tenant("default", "public", "ACTIVE"));
+        TenantContext.clear();
+
+        sync.reconcileAllTenants();
+
+        assertEquals(2, repo.rows.size(), "only the one ACTIVE, non-public tenant was synchronized");
+        assertFalse(TenantContext.isSet(), "the context is cleared after each tenant");
     }
 
     @Test
-    void noMetadataChangesAfterWatermarkYieldsInSync() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        h.settings.set("concept_sync_last_successful_at", Instant.now().toString());
-        // No entries in changedEntitiesByConnection ⇒ nothing changed since the watermark.
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.StatusReport report = h.sync.status();
+    void theStartupReconciliationRunsWithNoTenantContextOnTheCallingThread() throws Exception {
+        // Regression: it was once @Async on the tenant-propagating executor, which refuses a task
+        // submitted with no tenant context — so on a real startup it was silently dropped.
+        tenants.tenants.add(tenant("acme", "tenant_acme", "ACTIVE"));
         TenantContext.clear();
 
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.IN_SYNC, report.status());
-        assertEquals(0, report.pendingChangeCount());
-        assertTrue(report.pendingChanges().isEmpty());
-    }
+        sync.reconcileOnStartup();
 
-    @Test
-    void newMetadataAfterWatermarkYieldsChangesPending() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        Instant watermark = Instant.now().minusSeconds(3600);
-        h.settings.set("concept_sync_last_successful_at", watermark.toString());
-        Instant createdAfter = watermark.plusSeconds(60);
-        h.semanticService.changedEntitiesByConnection.put("conn-1", List.of(
-                changedEntity("e1", "purchase-order", "Purchase Order", createdAfter, createdAfter)));
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.StatusReport report = h.sync.status();
-        TenantContext.clear();
-
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.CHANGES_PENDING, report.status());
-        assertEquals(1, report.pendingChangeCount());
-        assertEquals("Purchase Order", report.pendingChanges().get(0).name());
-    }
-
-    @Test
-    void updatedMetadataAfterWatermarkYieldsChangesPending() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        Instant watermark = Instant.now().minusSeconds(3600);
-        h.settings.set("concept_sync_last_successful_at", watermark.toString());
-        Instant createdBefore = watermark.minusSeconds(600);
-        Instant updatedAfter  = watermark.plusSeconds(60);
-        h.semanticService.changedEntitiesByConnection.put("conn-1", List.of(
-                changedEntity("e1", "purchase-order", "Purchase Order", createdBefore, updatedAfter)));
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.StatusReport report = h.sync.status();
-        TenantContext.clear();
-
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.CHANGES_PENDING, report.status());
-        assertEquals(1, report.pendingChangeCount());
-    }
-
-    @Test
-    void multipleChangedMetadataRecordsAreAllDisplayed() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        Instant watermark = Instant.now().minusSeconds(3600);
-        h.settings.set("concept_sync_last_successful_at", watermark.toString());
-        Instant after = watermark.plusSeconds(60);
-        h.semanticService.changedEntitiesByConnection.put("conn-1", List.of(
-                changedEntity("e1", "purchase-order", "Purchase Order", after, after),
-                changedEntity("e2", "invoice", "Invoice", after, after)));
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.StatusReport report = h.sync.status();
-        TenantContext.clear();
-
-        assertEquals(2, report.pendingChangeCount());
-        assertEquals(2, report.pendingChanges().size());
-    }
-
-    @Test
-    void successfulSynchronizationAdvancesTheWatermark() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        assertTrue(h.settings.get("concept_sync_last_successful_at").isEmpty());
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        TenantContext.clear();
-
-        assertEquals(0, result.failedCount());
-        assertTrue(h.settings.get("concept_sync_last_successful_at").isPresent(),
-                "a fully-clean synchronize() run must advance the watermark");
-    }
-
-    @Test
-    void partialFailureDoesNotAdvanceTheWatermarkOrFalselyReportInSync() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        h.aiClient.uploadShouldFail = true; // forces the one create to fail
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult result = h.sync.synchronize();
-        ConceptKnowledgeSynchronizationService.StatusReport statusAfter = h.sync.status();
-        TenantContext.clear();
-
-        assertEquals(1, result.failedCount());
-        assertTrue(h.settings.get("concept_sync_last_successful_at").isEmpty(),
-                "the watermark must NOT advance when 1 of the concepts in this run failed");
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.FAILED, statusAfter.status(),
-                "status() must keep surfacing FAILED, never a false IN_SYNC, after a partial run");
-    }
-
-    @Test
-    void retryAfterPartialFailureEventuallyAdvancesTheWatermarkAndClearsPending() {
-        Harness h = new Harness("tenant_acme", "acme", "vs_acme", "conn-1", "retail-v1", "purchase-order", "Purchase Order");
-        h.aiClient.uploadShouldFail = true;
-
-        TenantContext.set("tenant_acme");
-        ConceptKnowledgeSynchronizationService.SyncResult first = h.sync.synchronize();
-        assertEquals(1, first.failedCount());
-        assertTrue(h.settings.get("concept_sync_last_successful_at").isEmpty());
-
-        h.aiClient.uploadShouldFail = false; // retry succeeds
-        ConceptKnowledgeSynchronizationService.SyncResult retry = h.sync.synchronize();
-        TenantContext.clear();
-
-        assertEquals(0, retry.failedCount());
-        assertTrue(h.settings.get("concept_sync_last_successful_at").isPresent(),
-                "a subsequent fully-clean retry must advance the watermark");
-    }
-
-    // ── Tenant isolation for status()/watermark ─────────────────────────────────────────────────
-
-    @Test
-    void tenantACannotSeeTenantBsPendingMetadataOrWatermark() {
-        Harness h = new Harness("tenant_a", "tenant-a", "vs_a", "conn-a", "retail-v1", "purchase-order", "Purchase Order");
-        h.tenantRepo.seed(tenantWithVectorStore("tenant-b", "tenant_b", "vs_b"));
-        // Tenant A's own watermark is set; tenant A's own semanticService (this Harness's fake,
-        // standing in for tenant A's search_path-scoped repository in production) has no changed
-        // entities queued for conn-a — proving "in sync" is derived purely from tenant A's own
-        // state, never from another tenant's data (there is no tenant-id parameter anywhere in
-        // this call chain for a "wrong" tenant's data to leak through even accidentally).
-        h.settings.set("concept_sync_last_successful_at", Instant.now().toString());
-
-        TenantContext.set("tenant_a");
-        ConceptKnowledgeSynchronizationService.StatusReport reportA = h.sync.status();
-        TenantContext.clear();
-
-        assertEquals(ConceptKnowledgeSynchronizationService.Status.IN_SYNC, reportA.status());
-        assertTrue(reportA.pendingChanges().isEmpty());
-    }
-}
+        long deadline = System.currentTimeMillis() + 5000;
+        while (repo.rows.size() < 2 && System.currentTimeMillis() < deadline) Thread.sleep(25);
+        assertEquals(2, repo.rows.size());
+    }}

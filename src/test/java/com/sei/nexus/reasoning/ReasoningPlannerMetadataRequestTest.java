@@ -101,9 +101,12 @@ class ReasoningPlannerMetadataRequestTest {
 
         ReasoningPlanner.StepPlan plan = planner.nextStep("q", "schema context", evidence);
 
-        // No object, no sql, no clarification — an incomplete response resolves to "done",
-        // exactly like the existing "neither sql nor clarification" case; Java never guesses one.
-        assertNull(plan);
+        // No object, no sql, no clarification — an incomplete response is never a metadata request
+        // and never a guessed step; with no evidence it is the explicit "no query ran" fact.
+        assertNotNull(plan);
+        assertFalse(plan.isMetadataRequest());
+        assertNull(plan.sql());
+        assertTrue(plan.isNoQuery());
     }
 
     @Test

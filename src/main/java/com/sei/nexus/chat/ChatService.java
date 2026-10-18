@@ -41,6 +41,7 @@ import com.sei.nexus.agentbrain.ExecutionBindings;
 import com.sei.nexus.agentbrain.ExecutionContract;
 import com.sei.nexus.agentbrain.ExecutionContractBuilder;
 import com.sei.nexus.agentbrain.PromptAssembler;
+import com.sei.nexus.response.AnswerFaithfulness;
 import com.sei.nexus.response.ExecutionOutcomeInterpreter;
 import com.sei.nexus.response.NaturalLanguageComposer;
 import com.sei.nexus.response.StructuredAnswer;
@@ -428,9 +429,8 @@ public class ChatService {
             List<String> connKeys = toConnKeyList(agent);
 
             // Decision Router absorption: document memory availability is the one runtime fact
-            // the combined Persistent Knowledge / File Search call cannot obtain itself (document
-            // memory is a structurally separate subsystem from the tenant's persistent-knowledge
-            // Vector Store — not retrievable via file_search) — so it must be computed BEFORE
+            // the Stage 1 concept + routing call cannot obtain itself (document
+            // memory is a structurally separate subsystem from the tenant's concept index — not retrievable by Stage 1's concept retrieval) — so it must be computed BEFORE
             // AgentBrain.resolve() runs Stage 1, not after. This is the one reordering this
             // absorption required; STEP 6's own SSE phase markers below are otherwise unchanged
             // and simply reuse this already-computed value instead of re-fetching it.
@@ -531,7 +531,7 @@ public class ChatService {
                         agent, routingConfidence, false, List.of(), List.of(), List.of(), List.of(), List.of());
             }
 
-            // STEP 10: Routing decision. Stage 1 (Persistent Knowledge / File Search) is the
+            // STEP 10: Routing decision. Stage 1 (concept retrieval + one LLM call) is the
             // SOLE semantic concept-and-routing mechanism for the conversational Chat path
             // (Phase 9E). Its combined call's routing decision is relayed VERBATIM here — Java
             // parses and consumes it, never overrides or second-guesses it. There is no second
@@ -578,8 +578,8 @@ public class ChatService {
             List<ResponseArtifacts.Section> resolvedSections = List.of();
             List<Map<String, Object>> reasoningSteps   = new ArrayList<>();
             // May now always be empty: LearningContextBuilder no longer injects Postgres-mapping
-            // vocabulary (that reaches the LLM exclusively via File Search over the tenant's
-            // Vector Store), and nothing else in this method attributes learnings today. Left in
+            // vocabulary (that reaches the LLM exclusively via the concept index over the tenant's
+            // concept index), and nothing else in this method attributes learnings today. Left in
             // place pending a future File-Search-driven attribution mechanism.
             List<String>              learningsApplied  = new ArrayList<>();
             String resultSnapshot = null;
@@ -683,7 +683,7 @@ public class ChatService {
 
                     // ── Phase 3: inject known conversation corrections into the planner context ──
                     // Promoted learned-mapping vocabulary is deliberately NOT injected here anymore —
-                    // it reaches the LLM exclusively via native File Search over the tenant's Vector
+                    // it reaches the LLM exclusively via the concept index over the tenant's
                     // Store (see ConceptKnowledgeMaterializationService/
                     // ConceptKnowledgeSynchronizationService). agentDomainKey is still needed below
                     // for learnFromRun/captureLiteralBinding, independent of this injection.
@@ -1227,6 +1227,7 @@ public class ChatService {
             boolean anyBlocked          = false;
             boolean anyClarification    = false;
             boolean anyValidationFailed = false;
+            boolean anyNoQuery          = false;
 
             if (anyRows) {
                 ctx.append(buildInvestigationDatasetsBlock(investigationDatasets, outcomeInterpreter));
@@ -1237,6 +1238,9 @@ public class ChatService {
                     // Already rendered above, per-dataset, with explicit boundaries — skip here
                     // to avoid rendering the same step's rows twice.
                     continue;
+                } else if (r.containsKey("noQuery")) {
+                    ctx.append("No query was run. Reason: ").append(r.get("reason")).append("\n");
+                    anyNoQuery = true;
                 } else if (r.containsKey("error")) {
                     ctx.append("Query error: ").append(r.get("error")).append("\n");
                     anyError = true;
@@ -1272,12 +1276,12 @@ public class ChatService {
             String prompt = "Question: " + question + attachmentNote + "\n\nQuery results:\n" + ctx;
 
             String systemPrompt = resultSystemPrompt(anyRows, anyError, anyBlocked, anyClarification,
-                    anyValidationFailed, attachmentSummary != null && !attachmentSummary.isBlank());
+                    anyValidationFailed, anyNoQuery, attachmentSummary != null && !attachmentSummary.isBlank());
 
             // Presentation policy (system prompt) and evidence context are chat's; only the
             // model call + failure handling are delegated to the shared composer.
             String fallback = resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification,
-                    anyValidationFailed);
+                    anyValidationFailed, anyNoQuery);
 
             if (!anyRows) {
                 // No evidence to decompose — TEXT mode, exactly as before this change.
@@ -1296,7 +1300,20 @@ public class ChatService {
             String json = nlComposer.compose(
                     NaturalLanguageComposer.CompositionRequest.strictJson(prompt, DATA_ANSWER_JSON_SYSTEM_PROMPT,
                             "data_answer", dataAnswerJsonSchema(), fallback));
-            return parseStructuredAnswer(json, objectMapper, fallback);
+            StructuredAnswer first = parseStructuredAnswer(json, objectMapper, fallback);
+
+            // Faithfulness check: a prompt rule cannot reliably stop an answer-writing model from
+            // mis-summarising rows ("three" when the evidence shows five). A second, narrow LLM
+            // judgment compares the answer to the evidence; only on a finding is the answer composed
+            // once more, with that finding stated as an observation. Bounded (one check, one
+            // re-composition) and fail-open (see AnswerFaithfulness). Java orchestrates; it never
+            // edits or judges the answer itself.
+            return AnswerFaithfulness.ensure(nlComposer, objectMapper, question, ctx.toString(),
+                    first.answer(), first, note -> parseStructuredAnswer(
+                            nlComposer.compose(NaturalLanguageComposer.CompositionRequest.strictJson(
+                                    prompt + note, DATA_ANSWER_JSON_SYSTEM_PROMPT,
+                                    "data_answer", dataAnswerJsonSchema(), fallback)),
+                            objectMapper, fallback));
     }
 
     /**
@@ -1995,12 +2012,47 @@ public class ChatService {
     static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
                                       boolean anyClarification, boolean anyValidationFailed,
                                       boolean hasAttachment) {
+        return resultSystemPrompt(anyRows, anyError, anyBlocked, anyClarification,
+                anyValidationFailed, false, hasAttachment);
+    }
+
+    /**
+     * Adds the {@code anyNoQuery} outcome: the planner took no action while no evidence existed, so
+     * NO query ran. Told apart from a clean zero-row result — the zero-row prompt asserts "the
+     * query executed successfully", which is false here — so the composed answer never claims the
+     * data was searched and found empty. Checked after every outcome in which something did run
+     * or was explicitly declined/blocked, and before the zero-row default.
+     */
+    static String resultSystemPrompt(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                      boolean anyClarification, boolean anyValidationFailed,
+                                      boolean anyNoQuery, boolean hasAttachment) {
         if (anyRows) return DATA_ANSWER_SYSTEM_PROMPT;
         if (anyError) return failedQuerySystemPrompt();
         if (anyClarification) return clarificationSystemPrompt();
         if (anyValidationFailed) return validationFailedSystemPrompt();
         if (anyBlocked) return blockedQuerySystemPrompt();
+        if (anyNoQuery) return noQueryExecutedSystemPrompt();
         return zeroRowSystemPrompt(hasAttachment);
+    }
+
+    /**
+     * The system prompt when NO query was run (the planner took no action and said why). This is
+     * not an empty result and not a failure: there is simply no data to report. The wording of the
+     * answer is the model's call; this prompt only fixes the facts it must not misstate.
+     */
+    static String noQueryExecutedSystemPrompt() {
+        return """
+                You are Zevra, an enterprise operational intelligence AI.
+                No database query was run for this question, so you have NO data to report. The
+                reason is given after "No query was run. Reason:" in the context above.
+                Do NOT say or imply that records were searched, that nothing matched, or that the
+                data is empty, missing or does not exist — nothing was looked up.
+                In plain language, using only that reason, tell the user honestly that you could not
+                answer it as asked and why. If the reason shows what the question needs or what is
+                available, say so. Then invite them to rephrase, or to say precisely what they want
+                to see. Do not expose SQL, identifiers or internal implementation details.
+                Keep the response to 1-3 sentences.
+                """;
     }
 
     /**
@@ -2046,12 +2098,74 @@ public class ChatService {
      *  and the same "never a policy denial" distinction as {@link #resultSystemPrompt}. */
     static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked,
                                          boolean anyClarification, boolean anyValidationFailed) {
+        return resultFallbackMessage(anyRows, anyError, anyBlocked, anyClarification,
+                anyValidationFailed, false);
+    }
+
+    /** Adds the {@code anyNoQuery} outcome — see {@link #resultSystemPrompt}: nothing was queried,
+     *  so the fallback must not claim an investigation ran and returned no data. */
+    static String resultFallbackMessage(boolean anyRows, boolean anyError, boolean anyBlocked,
+                                         boolean anyClarification, boolean anyValidationFailed,
+                                         boolean anyNoQuery) {
         if (anyRows) return "Investigation completed. Results are shown in the table below.";
         if (anyError) return "The query could not be executed.";
         if (anyClarification) return "One of the terms in your question doesn't match an available value — could you clarify?";
         if (anyValidationFailed) return "The investigation could not be completed due to an internal technical limitation.";
         if (anyBlocked) return "The request was blocked by data governance policy.";
+        if (anyNoQuery) return "I couldn't run a query for that question as asked. Could you rephrase it or say what you'd like to see?";
         return "Investigation completed. No data returned.";
+    }
+
+    /**
+     * What the planner is told when NO business object reached its prompt. Two genuinely different
+     * situations must never be conflated, because the planner (an LLM) reasons from this text:
+     * <ul>
+     *   <li>{@code conceptScoped == false}: nothing is connected/mapped for this agent — the
+     *       original "no live data sources" statement is true.</li>
+     *   <li>{@code conceptScoped == true}: data sources ARE connected and concept selection simply
+     *       selected nothing for this question. Saying "no data sources configured" here is false
+     *       and makes the planner conclude the data does not exist. The text states the real
+     *       situation and lists the business concepts the tenant has, as a fact, so the planner can
+     *       decide for itself whether to ask the user a clarifying question or explain why it
+     *       cannot proceed. Java decides nothing here.</li>
+     * </ul>
+     * Package-private static seam: a pure function of its inputs.
+     */
+    static String emptyScopeGrounding(boolean conceptScoped, boolean hasMemory, List<String> conceptMenu) {
+        StringBuilder sb = new StringBuilder("=== TABLE SCHEMA ===\n");
+        if (conceptScoped) {
+            sb.append("Data sources ARE connected, but no business object was selected for this ")
+              .append("question: concept selection found no business concept relevant to it, so no ")
+              .append("table is listed here. This does NOT mean the data does not exist.\n");
+            if (conceptMenu != null && !conceptMenu.isEmpty()) {
+                sb.append("Business concepts this tenant has: ").append(String.join(", ", conceptMenu)).append(".\n");
+            }
+            sb.append("Do NOT generate SQL against a table that is not listed. If the question is too ")
+              .append("vague to map to any of those concepts, ask a clarifying question; if it asks ")
+              .append("about something outside them, say plainly that no query was run and why.\n\n");
+            return sb.toString();
+        }
+        sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
+        sb.append(hasMemory
+                ? "Memory documents ARE available — use ANSWER_FROM_MEMORY.\n\n"
+                : "No memory documents either — use KNOWLEDGE_GAP.\n\n");
+        return sb.toString();
+    }
+
+    /** The tenant's business concept keys across the agent's connections — a plain factual lookup
+     *  (best-effort: any failure yields an empty list, never an error). */
+    private List<String> availableConceptMenu(NexusAgent agent) {
+        if (agent == null || agent.connectionKeys() == null || agent.connectionKeys().isBlank()) return List.of();
+        try {
+            java.util.Set<String> keys = new java.util.LinkedHashSet<>();
+            for (String conn : agent.connectionKeys().split(",")) {
+                if (!conn.isBlank()) keys.addAll(semanticService.findDistinctConceptKeysForConnection(conn.trim()));
+            }
+            return List.copyOf(keys);
+        } catch (Exception e) {
+            log.warn("Could not list available business concepts for the empty-scope context: {}", e.getMessage());
+            return List.of();
+        }
     }
 
     private String buildContextSummary(String question, List<DocumentChunk> memChunks,
@@ -2205,13 +2319,7 @@ public class ChatService {
                     new PromptAssembler.RenderOptions(true, true, true, maxEntityContextChars)))
               .append('\n');
         } else {
-            sb.append("=== TABLE SCHEMA ===\n");
-            sb.append("NO LIVE DATA SOURCES CONFIGURED. Do NOT generate SQL or use QUERY_LIVE_DATA.\n");
-            if (hasMemory) {
-                sb.append("Memory documents ARE available — use ANSWER_FROM_MEMORY.\n\n");
-            } else {
-                sb.append("No memory documents either — use KNOWLEDGE_GAP.\n\n");
-            }
+            sb.append(emptyScopeGrounding(conceptScoped, hasMemory, availableConceptMenu(agent)));
         }
         sectionChars.put("tableSchema", sb.length() - mark); mark = sb.length();
 
@@ -2448,6 +2556,11 @@ public class ChatService {
             } else if ("ERROR".equals(s.outcome())) {
                 results.add(Map.of("step", s.stepNo(), "error",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step failed"));
+            } else if (EvidenceStore.OUTCOME_NO_QUERY_EXECUTED.equals(s.outcome())) {
+                // The planner took no action with no evidence: nothing was queried. Carried as its
+                // own fact so composeAnswer never describes this as an empty query result.
+                results.add(Map.of("step", s.stepNo(), "noQuery", true, "reason",
+                        s.evaluatorRationale() != null ? s.evaluatorRationale() : "No query was run."));
             } else if ("CLARIFICATION_NEEDED".equals(s.outcome())) {
                 // Semantic Reasoning Over Authoritative Value Domains: the planner declined to
                 // generate SQL for a term it could not defensibly resolve — distinct from a

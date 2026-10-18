@@ -263,17 +263,11 @@ public class SemanticService {
         return repository.findEntitiesByConnectionAndConcepts(connectionKey, conceptKeys);
     }
 
-    /** Thin pass-through — AI Knowledge sync watermark: see {@link
-     *  SemanticRepository#findEntitiesChangedAfterForConnection}. */
-    public List<BusinessEntity> findEntitiesChangedAfterForConnection(String connectionKey, java.time.Instant since) {
-        return repository.findEntitiesChangedAfterForConnection(connectionKey, since);
-    }
-
     /**
      * Downstream Context Boundary for Concept-Scoped Metadata Narrowing: the same rendered
      * {@link SemanticContext} shape as {@link #semanticContextWithBindings}, but sourced ONLY
      * from the Business Entities bound to {@code objectKeys} — an already Stage-2-resolved
-     * physical scope (see {@code AgentBrain#conceptScopedModel} /
+     * physical scope (see {@code AgentBrain#conceptScopedModelWithRouting} /
      * {@code ResolvedBusinessModel#conceptScoped()}) — instead of every ACTIVE entity in a
      * domain. This is the fix for the leak traced in the "show me all open orders" investigation:
      * once Stage 1 selects a concept and Stage 2 resolves it to physical objects, every

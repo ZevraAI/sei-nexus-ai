@@ -21,9 +21,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Observability for the conversational evidence-reuse decision — {@code
  * CONVERSATION_EVIDENCE_REUSE}. Proves the log line reports whether Turn N reused the prior
  * turn's result set or triggered a new Planner-driven execution, without ever logging the
- * question text, the evaluator's rationale, or any row/business data (same discipline as {@code
- * AzureOpenAiClientFileSearchMetricTest}'s {@code FILE_SEARCH_METRIC} — facts only, never
- * content). Real Logback {@link ListAppender}, no Mockito, no network.
+ * question text, the evaluator's rationale, or any row/business data (facts only, never content). Real Logback {@link ListAppender}, no Mockito, no network.
  */
 class ReasoningEngineEvidenceReuseObservabilityTest {
 

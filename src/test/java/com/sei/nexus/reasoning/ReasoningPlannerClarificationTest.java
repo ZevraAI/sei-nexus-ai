@@ -96,16 +96,73 @@ class ReasoningPlannerClarificationTest {
     }
 
     @Test
-    void aResponseWithNeitherSqlNorClarificationIsTreatedAsDone() {
+    void aResponseWithNeitherSqlNorClarificationIsAnExplicitNoQueryStepNeverAGuessedOne() {
         // Malformed/incomplete response (no sql, no clarification_question) — must not be
-        // silently promoted to an executable step with Java filling in a guess.
+        // silently promoted to an executable step with Java filling in a guess. With no evidence
+        // it must also not masquerade as "the evidence is sufficient": it is surfaced as an
+        // explicit "no query ran" fact so the answer is never "the data returned nothing".
         aiClient.scriptedResponse = """
                 {"done":false,"description":"nothing useful"}""";
 
         ReasoningPlanner.StepPlan plan = planner.nextStep("show purchase orders with status open",
                 "schema context", evidence);
 
-        assertNull(plan, "an incomplete response with neither sql nor a clarification must resolve to 'done', never a guessed step");
+        assertNotNull(plan);
+        assertTrue(plan.isNoQuery(), "an unusable zero-evidence response is reported as 'no query ran'");
+        assertNull(plan.sql(), "never a guessed SQL step");
+        assertNull(plan.connectionKey());
+        assertFalse(plan.isClarification());
+    }
+
+    @Test
+    void doneWithNoEvidenceCarriesThePlannersOwnReasonAsANoQueryFact() {
+        aiClient.scriptedResponse = """
+                {"done":true,"rationale":"No business object was selected for this question, so nothing can be queried."}""";
+
+        ReasoningPlanner.StepPlan plan = planner.nextStep("anything", "schema context", evidence);
+
+        assertNotNull(plan, "'done' with zero evidence is not 'the evidence is sufficient'");
+        assertTrue(plan.isNoQuery());
+        assertEquals("No business object was selected for this question, so nothing can be queried.",
+                plan.noQueryReason(), "the planner's own words are relayed verbatim, never rewritten by Java");
+        assertNull(plan.sql());
+    }
+
+    @Test
+    void doneWithNoEvidenceAndNoReasonStillStatesThatNothingWasQueried() {
+        aiClient.scriptedResponse = "{\"done\":true}";
+
+        ReasoningPlanner.StepPlan plan = planner.nextStep("anything", "schema context", evidence);
+
+        assertTrue(plan.isNoQuery());
+        assertFalse(plan.noQueryReason().isBlank());
+    }
+
+    @Test
+    void doneAfterEvidenceExistsIsStillTheOrdinaryNullMeaningSufficient() {
+        evidence.add(1, "step", "SELECT 1", "conn-1", List.of(Map.of("c", 1)), "r", "SUFFICIENT", "ok", 5L);
+        aiClient.scriptedResponse = "{\"done\":true}";
+
+        assertNull(planner.nextStep("anything", "schema context", evidence),
+                "once something was queried, 'done' keeps its original meaning");
+    }
+
+    @Test
+    void aFailedPlannerCallWithNoEvidenceIsReportedAsNoQueryNotAsEmptyData() {
+        aiClient.scriptedResponse = "this is not json {{{";
+
+        ReasoningPlanner.StepPlan plan = planner.nextStep("anything", "schema context", evidence);
+
+        assertNotNull(plan);
+        assertTrue(plan.isNoQuery());
+    }
+
+    @Test
+    void aNormalSqlStepIsNeverMarkedNoQuery() {
+        aiClient.scriptedResponse = """
+                {"done":false,"description":"d","sql":"SELECT 1","connection_key":"conn-1","rationale":"r"}""";
+
+        assertFalse(planner.nextStep("q", "schema context", evidence).isNoQuery());
     }
 
     // ── Test 3 — a business term the LLM resolves via available context is relayed

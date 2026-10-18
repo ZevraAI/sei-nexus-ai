@@ -84,11 +84,16 @@ nexus:
     memory-selection-model: ${OPENAI_MEMORY_SELECTION_MODEL:gpt-4o-mini}
     # Phase 3 controlled core model migration: Planner/Evaluator/Composer moved to gpt-4.1 after
     # Phase 2's live evaluation found it an acceptable candidate for these three workloads (8/8,
-    # 3/3, and 4/4 contract-correct respectively). Stage 1 deliberately stays on chat-model
-    # (gpt-4o) above — Phase 2 found gpt-4.1 unusable there (File Search never invoked, 0/3).
+    # 3/3, and 4/4 contract-correct respectively). Stage 1 has its own model (stage1-model below).
     planner-model: ${OPENAI_PLANNER_MODEL:gpt-4.1}
     evaluator-model: ${OPENAI_EVALUATOR_MODEL:gpt-4.1}
     composer-model: ${OPENAI_COMPOSER_MODEL:gpt-4.1}
+    # Stage 1 (business-concept selection + routing) model. The candidate concepts it chooses
+    # from come from Zevra's own pgvector concept index (nexus.concept-retrieval below).
+    stage1-model: ${OPENAI_STAGE1_MODEL:gpt-4.1}
+  concept-retrieval:
+    # How many of the nearest concepts Stage 1 is shown per question (doubled on a reconsideration).
+    top-k: ${NEXUS_CONCEPT_RETRIEVAL_TOP_K:20}
   security:
     jwt-secret: ${NEXUS_JWT_SECRET:change-me-in-production}
     session-expiry-hours: 24

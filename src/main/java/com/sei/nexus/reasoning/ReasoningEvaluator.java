@@ -71,11 +71,12 @@ public class ReasoningEvaluator {
             Return JSON only:
             {
               "resultSetMatches": true,
+              "zeroRowResultConfirmed": null,
               "decision": "SUFFICIENT | NEED_MORE_DATA | DEAD_END",
               "rationale": "one sentence explaining your decision"
             }
 
-            Answer these as TWO SEPARATE questions — do not let one influence the other:
+            Answer these as SEPARATE questions — do not let one influence another:
 
             1. resultSetMatches — are the rows ALREADY GATHERED literally the correct rows for
                THIS question, with no different filter, additional filter, subset, grouping,
@@ -84,28 +85,51 @@ public class ReasoningEvaluator {
                already there — even if you personally could read through the existing rows and
                work out the right number or description. Being able to COMPUTE an answer from
                the existing rows is not the test; whether those exact rows are what should be
-               RETURNED to the user is the test. A count, total, or description OF the existing
+               RETURNED to the user is the test. Rows gathered only to CHECK how the data is
+               stored (a diagnostic sample, a value range, a list of distinct values) are
+               never the answer to the user's question — they do not match, so answer false
+               — unless the question itself asked for exactly that listing. A count, total, or description OF the existing
                rows, completely unchanged, is the only case where resultSetMatches is true for a
                follow-up that narrows, reorders, or otherwise reshapes what was gathered before.
 
-            2. decision — is the evidence answerable and enough to proceed?
+            2. zeroRowResultConfirmed — ONLY when the MOST RECENT step returned 0 rows; otherwise
+               null. Answer true ONLY if that zero-row result is genuinely confirmed as "no such
+               data exists": its query had no value-dependent filter (no literal, text match or
+               numeric threshold), OR the evidence already shows how the filtered column's values
+               are actually stored and the filter was demonstrably correct, OR a verification step
+               has already been run and also found nothing. Answer false when the query filtered
+               on a literal, text match or numeric threshold and nothing in the evidence shows the
+               filter matches how the data is stored — an unverified zero-row result confirms
+               nothing. (See the ZERO-ROW rule below.)
+
+            3. decision — is the evidence answerable and enough to proceed?
 
             A correct result-set shape is not the whole test. The evidence must also be
             SEMANTICALLY ANSWERABLE: sufficient to answer the question as phrased, not merely
             shaped like the right rows. An identifier that locates a record or entity is not
             necessarily sufficient to identify that entity in the form the user asked for. If
-            the question asks you to identify, name, or describe an entity, and the evidence
+            the question asks you to identify, name, or describe an entity — or to break results
+            down by, group by, or list them per an entity — and the evidence
             gathered contains only an opaque identifier for that entity — with no human-readable
             descriptive value for it — the evidence is not yet sufficient, even when its row
             shape is otherwise exactly correct. This applies however that identifier was
             learned, including from a JOIN/relationship reference — an identifier surfaced that
             way is still just an identifier, never a substitute for that entity's own descriptive
-            evidence. Do not assume a conventional column name exists or invent one to fill this
-            gap; this is about whether the evidence you actually have contains a presentable
+            evidence. Judge opacity from the sample values in the result summary: a generated unique id
+            (a UUID, a long surrogate number) is opaque — no person recognises it — while a name,
+            title or familiar code is not.
+            Do not assume a conventional column name exists or invent one to fill this gap; this is about whether the evidence you actually have contains a presentable
             answer, not about guessing at a column. Do not require further evidence merely because
             an identifier is present — only require it when the question specifically asks to
             identify, name, or describe that entity and no descriptive value for it has actually
             been gathered yet.
+
+            COMPLETENESS. Rows that are well-formed and readable can still describe only PART of what
+            was asked. Read the SQL: if it narrowed the data in a way the question did not ask for —
+            a condition, or an inner join, that keeps only one of several values of a type or
+            category column, or drops rows with no match — the figures cover only part of the data,
+            so the evidence is not yet sufficient (NEED_MORE_DATA). Narrowing the question itself
+            asked for is fine.
 
             Decision guide:
             - SUFFICIENT    : the evidence collected is actually about what THIS question asks
@@ -125,8 +149,8 @@ public class ReasoningEvaluator {
                               result set (a filter, subset, grouping, sort order, limit, or scope
                               different from what's already gathered) even though the existing
                               evidence is about the right subject and could be read to compute an
-                              answer, OR (d) the question asks to identify, name, or describe an
-                              entity and the evidence gathered contains only an opaque identifier
+                              answer, OR (d) the question asks to identify, name, describe, or break
+                              results down by an entity and the evidence gathered contains only an opaque identifier
                               for it, with no descriptive value yet gathered.
             - DEAD_END      : queries have been run TOWARD THIS QUESTION's subject — including,
                               when applicable, toward the specific result set or descriptive
@@ -136,6 +160,17 @@ public class ReasoningEvaluator {
                               result-set shape, or that identifies an entity only by an opaque
                               identifier and has not yet been re-queried for its descriptive
                               evidence, is not a dead end — that has not been queried yet.
+
+            A ZERO-ROW RESULT IS NOT, BY ITSELF, PROOF THAT NO SUCH DATA EXISTS. When a step
+            returned 0 rows and its query filtered on a literal, a text match, or a numeric
+            threshold, the filter value may simply not match how the data is actually stored —
+            units or scale (e.g. a ratio versus a percentage), punctuation, abbreviation, case,
+            spacing, or format. Such a step has not confirmed anything: choose NEED_MORE_DATA so a
+            verification query can check the assumption. Choose SUFFICIENT or DEAD_END for a
+            zero-row step only when (a) its query had no value-dependent filter, or (b) the
+            evidence already shows how the filtered column's values are actually stored and the
+            filter was demonstrably correct, or (c) a verification step has already been run and
+            also found nothing.
 
             Be decisive. Prefer SUFFICIENT over NEED_MORE_DATA when evidence that is actually
             about this question, AND is already the correct result set for it, is good enough
@@ -192,6 +227,7 @@ public class ReasoningEvaluator {
             String  decision         = strOr(parsed, "decision",  "SUFFICIENT");
             String  rationale        = strOr(parsed, "rationale", "");
             Boolean resultSetMatches = boolOrNull(parsed, "resultSetMatches");
+            Boolean zeroRowConfirmed = boolOrNull(parsed, "zeroRowResultConfirmed");
 
             // Deterministic clamp (conversational evidence-reuse correctness): the model's own
             // holistic `decision` label was live-validated to still say SUFFICIENT for a
@@ -208,8 +244,22 @@ public class ReasoningEvaluator {
                 decision = "NEED_MORE_DATA";
             }
 
-            log.debug("Evaluator decision after step {}: {} (resultSetMatches={}) — {}",
-                    evidence.stepCount(), decision, resultSetMatches, rationale);
+            // Same ratified pattern for the zero-row rule: a prose instruction alone was
+            // live-observed NOT to be reliably followed (the model called an unverified zero-row
+            // result "sufficient"), so the model reports one narrow boolean of its own and this
+            // clamp enforces it. Java reads only that self-report — never the SQL, the question
+            // or the evidence text. null (rows were returned, or the field is absent) never
+            // clamps. Bounded by MAX_STEPS in the engine, and the model reports true after a
+            // verification step has run.
+            if (("SUFFICIENT".equals(decision) || "DEAD_END".equals(decision))
+                    && Boolean.FALSE.equals(zeroRowConfirmed)) {
+                log.debug("Evaluator said {} but zeroRowResultConfirmed=false at step {}; "
+                        + "overriding to NEED_MORE_DATA", decision, evidence.stepCount());
+                decision = "NEED_MORE_DATA";
+            }
+
+            log.debug("Evaluator decision after step {}: {} (resultSetMatches={}, zeroRowConfirmed={}) — {}",
+                    evidence.stepCount(), decision, resultSetMatches, zeroRowConfirmed, rationale);
             return new EvaluationResult(decision, rationale);
         } catch (Exception e) {
             log.warn("ReasoningEvaluator failed: {}; defaulting to SUFFICIENT", e.getMessage());
@@ -235,6 +285,7 @@ public class ReasoningEvaluator {
     static Map<String, Object> evaluatorJsonSchema() {
         Map<String, Object> properties = new LinkedHashMap<>();
         properties.put("resultSetMatches", Map.of("type", "boolean"));
+        properties.put("zeroRowResultConfirmed", Map.of("type", List.of("boolean", "null")));
         properties.put("decision", Map.of("type", "string",
                 "enum", List.of("SUFFICIENT", "NEED_MORE_DATA", "DEAD_END")));
         properties.put("rationale", Map.of("type", "string"));
@@ -242,7 +293,7 @@ public class ReasoningEvaluator {
         Map<String, Object> schema = new LinkedHashMap<>();
         schema.put("type", "object");
         schema.put("properties", properties);
-        schema.put("required", List.of("resultSetMatches", "decision", "rationale"));
+        schema.put("required", List.of("resultSetMatches", "zeroRowResultConfirmed", "decision", "rationale"));
         schema.put("additionalProperties", false);
         return schema;
     }

@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  *
  * <p>{@code REAL_SCHEMA_CTX} below is not invented — it is the exact, byte-for-byte {@code
  * schemaCtx} string captured from a REAL run of the production pipeline (real tenant {@code
- * persistent-ai-test}, real connection {@code conn-c1590229}, real Stage 1 File Search, real
+ * persistent-ai-test}, real connection {@code conn-c1590229}, real Stage 1, real
  * {@code ExecutionContractBuilder}/{@code PromptContextBuilder}/{@code PromptAssembler}) for the
  * question "Show me all open purchase orders", frozen here so both models receive an IDENTICAL,
  * real, already-resolved schema/resolutions/legal-values context — removing Stage 1 as a variable

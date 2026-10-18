@@ -49,6 +49,7 @@ class PromptCacheKeyPayloadTest {
         setField(client, "plannerModel", "gpt-4.1");
         setField(client, "evaluatorModel", "gpt-4.1");
         setField(client, "composerModel", "gpt-4.1");
+        setField(client, "stage1Model", "gpt-4.1");
         return client;
     }
 
@@ -180,63 +181,33 @@ class PromptCacheKeyPayloadTest {
         assertFieldsIdenticalExceptCacheKeyAndModel(unkeyed, keyed, "gpt-4o", "gpt-4.1");
     }
 
-    // ── 4. Stage 1 combined File Search sends the expected cache key ───────────────────────────
+    // ── 4. Stage 1 (concept + routing) sends the expected cache key, model and strict schema ─────────
 
     @Test
-    void stage1CombinedSendsTheExpectedCacheKey() throws Exception {
+    void stage1SendsTheExpectedCacheKeyModelAndNoTools() throws Exception {
         AzureOpenAiClient client = client();
-        String instructions = "STAGE1-COMBINED-INSTRUCTIONS-MARKER";
+        String instructions = "STAGE1-INSTRUCTIONS-MARKER";
         String question = "TENANT-SPECIFIC-QUESTION-MARKER-conn-a13f";
-        String vectorStoreId = "vs_tenant_specific_marker_5591";
         Map<String, Object> schema = Map.of(
                 "type", "object",
-                "properties", Map.of("metadataRequest", Map.of("type", "object")),
-                "required", List.of("metadataRequest"),
+                "properties", Map.of("conceptKeys", Map.of("type", "array")),
+                "required", List.of("conceptKeys"),
                 "additionalProperties", false);
 
-        JsonNode keyed = capture(() -> client.chatWithFileSearchForConceptAndRouting(
-                vectorStoreId, instructions, question, null, schema));
+        JsonNode keyed = capture(() -> client.respondForStage1(
+                List.of(ChatMessage.user(question)), instructions, "stage1_concept_and_routing", schema));
 
-        assertEquals("zevra:stage1-concept-and-routing:v1", keyed.path("prompt_cache_key").asText());
-        // Phase 3 controlled core model migration: Stage 1 is explicitly OUT of scope — Phase 2's
-        // live evaluation found gpt-4.1 unusable there (File Search never invoked, 0/3) — so this
-        // call must still use chatModel (gpt-4o), unlike Planner/Evaluator/Composer above.
-        assertEquals("gpt-4o", keyed.path("model").asText(),
-                "Stage 1 must remain on chatModel (gpt-4o) — it was explicitly excluded from the Phase 3 migration");
+        assertEquals("zevra:stage1-concept-and-routing:v2", keyed.path("prompt_cache_key").asText());
+        assertEquals("gpt-4.1", keyed.path("model").asText(), "Stage 1 uses its own configured model");
         assertEquals(instructions, keyed.path("instructions").asText());
         assertTrue(keyed.path("input").asText().contains(question));
-        assertEquals(vectorStoreId, keyed.path("tools").get(0).path("vector_store_ids").get(0).asText(),
-                "File Search tool configuration must be unaffected by the cache key addition");
+        assertEquals("json_schema", keyed.path("text").path("format").path("type").asText());
+        assertEquals("stage1_concept_and_routing", keyed.path("text").path("format").path("name").asText());
+        assertTrue(keyed.path("tools").isMissingNode() || keyed.path("tools").isEmpty(),
+                "Stage 1 sends no tools — the candidate concepts are in the prompt");
         assertFalse(keyed.path("prompt_cache_key").asText().contains("TENANT-SPECIFIC-QUESTION-MARKER"));
-        assertFalse(keyed.path("prompt_cache_key").asText().contains("tenant_specific_marker"));
-
-        JsonNode unkeyed = capture(() -> client.chatWithFileSearch(
-                vectorStoreId, instructions, question, null, schema));
-        assertFieldsIdenticalExceptCacheKey(unkeyed, keyed);
     }
-
     // ── 5 / 7. Every field on the un-keyed request is still present and unchanged ──────────────
-
-    /** Verifies the keyed and unkeyed requests are identical in every field except the additive
-     *  {@code prompt_cache_key} — proving the change is purely additive, not a reordering or
-     *  restructuring of the existing stable prefix / dynamic content. */
-    private static void assertFieldsIdenticalExceptCacheKey(JsonNode unkeyed, JsonNode keyed) {
-        var unkeyedFields = new java.util.TreeSet<String>();
-        unkeyed.fieldNames().forEachRemaining(unkeyedFields::add);
-        var keyedFields = new java.util.TreeSet<String>();
-        keyed.fieldNames().forEachRemaining(keyedFields::add);
-
-        assertFalse(unkeyedFields.contains("prompt_cache_key"),
-                "the existing (non-cache-keyed) method must never itself gain a prompt_cache_key");
-        keyedFields.remove("prompt_cache_key");
-        assertEquals(unkeyedFields, keyedFields,
-                "the cache-keyed call must add prompt_cache_key and nothing else");
-
-        for (String field : unkeyedFields) {
-            assertEquals(unkeyed.path(field), keyed.path(field),
-                    "field '" + field + "' must be byte-for-byte identical between the keyed and unkeyed calls");
-        }
-    }
 
     /**
      * Phase 3 controlled core model migration variant: for Planner/Evaluator/Composer, the

@@ -25,10 +25,10 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class ConnectionServiceTest {
 
-    /** Postgres → Vector Store sync is out of scope for this test — a no-op double so
+    /** Postgres → concept index sync is out of scope for this test — a no-op double so
      *  {@link IndustryPackService}'s constructor is satisfied without any real OpenAI/DB wiring. */
     private static ConceptKnowledgeSynchronizationService noOpConceptKnowledgeSynchronizationService() {
-        return new ConceptKnowledgeSynchronizationService(null, null, null, null, null) {
+        return new ConceptKnowledgeSynchronizationService(null, null, null) {
             @Override public void triggerAsync() { }
         };
     }

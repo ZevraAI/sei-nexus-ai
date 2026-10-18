@@ -72,13 +72,13 @@ class SemanticControllerTest {
 
     static class FakeMaterializationService extends ConceptKnowledgeMaterializationService {
         List<Map<String, String>> catalog = new ArrayList<>();
-        FakeMaterializationService() { super(null, null, null, null, null, null); }
+        FakeMaterializationService() { super(null, null, null, null, null); }
         @Override public List<Map<String, String>> listConceptCatalog() { return catalog; }
     }
 
     static class FakeSynchronizationService extends ConceptKnowledgeSynchronizationService {
         int triggerAsyncCalls = 0;
-        FakeSynchronizationService() { super(null, null, null, null, null); }
+        FakeSynchronizationService() { super(null, null, null); }
         @Override public void triggerAsync() { triggerAsyncCalls++; }
     }
 

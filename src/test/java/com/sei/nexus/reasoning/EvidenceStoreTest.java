@@ -263,4 +263,36 @@ class EvidenceStoreTest {
         assertEquals("DEAD_END", step.evaluatorDecision());
         assertEquals("Query returned 0 rows.", step.rowSummary());
     }
+
+    // ── a large result still shows what an otherwise-undescribed column's values look like ──────
+
+    @Test
+    void aLargeResultShowsSampleValuesForAColumnNothingElseDescribes() {
+        // 12 rows (above the small-result limit), a reference-key column of 12 distinct values and a
+        // measure: without the sample the reader never learns the key column holds generated ids.
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            rows.add(row("ref_key", String.format("80000000-0000-0000-0000-%012d", i), "total", 10 + i));
+        }
+
+        String summary = summaryFor(rows);
+
+        assertTrue(summary.contains("ref_key: 12 distinct, e.g. 80000000-0000-0000-0000-000000000000, "
+                + "80000000-0000-0000-0000-000000000001, 80000000-0000-0000-0000-000000000002"), summary);
+        assertTrue(summary.contains("total: sum="), "the measure is still summarised as before");
+    }
+
+    @Test
+    void theSampleIsBoundedAndNeverAddedToSmallOrCoveredColumns() {
+        List<Map<String, Object>> small = List.of(row("name", "A", "qty", 1), row("name", "B", "qty", 2));
+        assertFalse(summaryFor(small).contains("distinct, e.g."), "small results keep their Values block only");
+
+        List<Map<String, Object>> big = new java.util.ArrayList<>();
+        for (int i = 0; i < 12; i++) big.add(row("label", "x".repeat(100) + i, "kind", i % 2 == 0 ? "a" : "b"));
+        String summary = summaryFor(big);
+        assertTrue(summary.contains("kind distribution:"), "a low-cardinality column keeps its distribution");
+        assertFalse(summary.contains("kind: "), "and gets no extra sample line");
+        assertTrue(summary.lines().filter(l -> l.startsWith("  label: ")).findFirst().orElseThrow().length() < 200,
+                "each sampled value is truncated");
+    }
 }

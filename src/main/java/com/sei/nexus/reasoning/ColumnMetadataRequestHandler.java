@@ -1,6 +1,7 @@
 package com.sei.nexus.reasoning;
 
 import com.sei.nexus.agentbrain.ExecutionContract;
+import com.sei.nexus.agentbrain.ExecutionContractBuilder;
 import com.sei.nexus.agentbrain.PromptAssembler;
 import com.sei.nexus.agentbrain.PromptContext;
 import com.sei.nexus.agentbrain.PromptContextBuilder;
@@ -45,11 +46,82 @@ public class ColumnMetadataRequestHandler {
     private final PromptAssembler              assembler;
     private final EnterpriseSemanticAssembler  enterpriseAssembler;
 
+    private final ExecutionContractBuilder         contractBuilder;
+
+    @org.springframework.beans.factory.annotation.Autowired
     public ColumnMetadataRequestHandler(PromptContextBuilder contextBuilder, PromptAssembler assembler,
-                                        EnterpriseSemanticAssembler enterpriseAssembler) {
+                                        EnterpriseSemanticAssembler enterpriseAssembler,
+                                        ExecutionContractBuilder contractBuilder) {
         this.contextBuilder      = contextBuilder;
         this.assembler           = assembler;
         this.enterpriseAssembler = enterpriseAssembler;
+        this.contractBuilder     = contractBuilder;
+    }
+
+    /** Convenience (tests, and any caller that predates scope extension): uses a stock builder. */
+    public ColumnMetadataRequestHandler(PromptContextBuilder contextBuilder, PromptAssembler assembler,
+                                        EnterpriseSemanticAssembler enterpriseAssembler) {
+        this(contextBuilder, assembler, enterpriseAssembler,
+                new ExecutionContractBuilder(new com.sei.nexus.sql.SqlTableReferenceExtractor()));
+    }
+
+    /**
+     * A validated metadata request's result: the object's rendered column detail, and — only when
+     * the object was found in the catalog but was NOT already part of the contract's scope — the
+     * single-object {@link SemanticModel} that would make it executable. {@code additions} is
+     * {@code null} when the object was already in scope.
+     */
+    public record Resolution(String columns, SemanticModel additions) {
+        public boolean outsideCurrentScope() { return additions != null; }
+    }
+
+    /**
+     * Same exact-identity lookup as {@link #resolveColumns}, additionally reporting whether the
+     * object had to be found in the catalog because it was outside the contract's current scope.
+     * The LLM asked for this object by name; Java only confirms it exists (for the SAME approved
+     * connections) and reports where it was found — it does not choose, rank or substitute.
+     */
+    public Optional<Resolution> resolve(ExecutionContract contract, String requestedObject) {
+        if (contract == null || requestedObject == null || requestedObject.isBlank()) {
+            return Optional.empty();
+        }
+        String needle = requestedObject.trim();
+
+        PromptContext resolved = contextBuilder.build(contract);
+        for (PromptContext.PromptObject o : resolved.objects()) {
+            if (matches(o, needle)) {
+                return Optional.of(new Resolution(assembler.assembleObject(o), null));
+            }
+        }
+        if (enterpriseAssembler != null && contract.connectionKeys() != null
+                && !contract.connectionKeys().isEmpty()) {
+            SemanticModel catalog = enterpriseAssembler.assemble(contract.connectionKeys());
+            for (BusinessObject object : catalog.objects()) {
+                PhysicalTable table = catalog.objectTargets().get(object.objectKey());
+                PromptContext.PromptObject candidate =
+                        contextBuilder.buildObject(object, table, catalog.attributeTargets());
+                if (matches(candidate, needle)) {
+                    java.util.Map<String, com.sei.nexus.semanticmodel.PhysicalColumn> attrs = new java.util.LinkedHashMap<>();
+                    for (com.sei.nexus.semanticmodel.BusinessAttribute a : object.attributes()) {
+                        com.sei.nexus.semanticmodel.PhysicalColumn col = catalog.attributeTargets().get(a.attributeKey());
+                        if (col != null) attrs.put(a.attributeKey(), col);
+                    }
+                    SemanticModel additions = table == null
+                            ? null
+                            : new SemanticModel(java.util.List.of(object),
+                                    java.util.Map.of(object.objectKey(), table), attrs);
+                    return Optional.of(new Resolution(assembler.assembleObject(candidate), additions));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** Derives the contract that additionally covers a validated request's object — see {@link
+     *  ExecutionContractBuilder#extend}. Returns {@code base} unchanged when nothing is to be added. */
+    public ExecutionContract extend(ExecutionContract base, Resolution resolution) {
+        if (base == null || resolution == null || !resolution.outsideCurrentScope()) return base;
+        return contractBuilder.extend(base, resolution.additions());
     }
 
     /**

@@ -89,6 +89,42 @@ public class ReasoningPlanner {
               connection_key belonging to the table your SQL actually reads from.
             - Do NOT repeat a query that has already been executed (check "Evidence so far").
             - If the evidence already answers the question, return: {"done": true}
+            - VERIFY A ZERO-ROW RESULT BEFORE CONCLUDING. If the previous step returned 0 rows and
+              its SQL filtered on a literal, a text match, or a numeric threshold, do NOT return
+              {"done": true} yet: the filter may not match how the data is stored (units or scale,
+              punctuation, abbreviation, case, spacing, format). Plan one verification step that
+              checks that assumption with approved columns only — for example the column's value
+              range or a small sample of its distinct values, or the same question with a looser
+              match — and decide for yourself which check fits. Conclude "nothing matches" only
+              after verification also finds nothing, or when the question had no value-dependent
+              filter. If verification shows your original assumption was wrong (e.g. the stored
+              values are on a different scale or format than your filter), your NEXT step must
+              re-run the ORIGINAL question with the corrected filter — a verification result is
+              never the final answer to the user's question.
+            - A QUOTED IDENTIFIER LIVES ON ITS OWN OBJECT. A literal can only be compared with a
+              column that actually holds that kind of value. If the user quotes a business number,
+              code or name for an entity and the table you are querying holds only an opaque
+              foreign-key id for that entity (a type mismatch such as comparing a UUID column to a
+              quoted number is the tell), do not compare the literal to the key and do not guess
+              ids. Find the related object that carries that identifier (use the relationship hints
+              and RESOLUTIONS; request its metadata if its columns are not shown) and JOIN to it.
+            - REFERENCE KEYS NEED LABELS. When rows are grouped by, listed per, or filtered on a
+              reference key (an id that points at another object), JOIN the object that owns that
+              entity's descriptive label so each row is readable — but a label join must never drop
+              rows or change totals: use LEFT JOIN. If a type/discriminator column sits beside a
+              generic id column that can point at several different objects (a polymorphic
+              reference), cover EVERY discriminator value present in the data: give each candidate
+              object its own LEFT JOIN conditioned on that value and COALESCE their labels. Have
+              every candidate's metadata (request it) before writing the SQL; never leave one
+              unresolved because its columns were not shown, and fall back to the raw key only for
+              a row that matches no candidate. If you cannot tell which values exist or which object
+              each maps to, verify first (e.g. SELECT DISTINCT on the discriminator).
+            - If NO evidence exists yet and you cannot or should not run a query (the question
+              cannot be mapped to any object in "Approved schema", or "Approved schema" says no
+              business objects were selected), either ask a clarification question (action (c) —
+              it is also the right action when the question is too vague to map to any object) or
+              return {"done": true} with a plain "rationale" stating exactly why nothing was
+              queried. Never imply data was searched when it was not.
             - Write focused SQL — a targeted SELECT, not SELECT *. Select the columns whose
               business meaning is relevant to the user's question, using each column's role
               and business name from the approved schema — not every available column, and
@@ -120,7 +156,10 @@ public class ReasoningPlanner {
               {"done":false,"description":"one-line goal","requires_metadata":{"object":"<the exact table name, or business name, as shown in Approved schema>","metadataType":"columns"},"rationale":"why this object's columns are needed"}
               You will receive that object's real column list on your next turn and can then
               continue planning with it. Only request metadata for an object already named
-              somewhere in "Approved schema" — never for one you have no evidence exists.
+              somewhere in "Approved schema" (including its RESOLUTIONS block, which names the
+              table behind a business term even when that table's columns were not listed) —
+              never for one you have no evidence exists. A metadata request for such an object
+              also makes it available to query for this investigation.
               The value you put in "object" MUST be the exact table name or exact business name
               as shown under "Approved schema" — that is the ONLY authoritative identity source
               for this field. A Knowledge Graph section, if present, names business entities and
@@ -138,79 +177,34 @@ public class ReasoningPlanner {
               "requires_metadata" for it rather than guessing a column or presenting the
               identifier alone as the answer.
             - Joins, aggregations, GROUP BY, ORDER BY, LIMIT are all allowed.
-            - SUPPLEMENTARY BREAKDOWN STEPS (optional, your own judgment): after a step already
-              answers the user's primary question, look at what you now know about that result —
-              does it have a natural categorical dimension (e.g. status, category, buyer, owner)
-              or a natural time dimension (e.g. month, week) where a simple count/aggregate
-              breakdown along that dimension would add genuine analytical or visual value to
-              answering the business question? If so, you MAY plan one or two additional steps —
-              never more — that run a simple aggregate query (e.g. "SELECT status, COUNT(*) AS
-              order_count FROM ... GROUP BY status") against the same approved tables/columns,
-              before returning {"done": true}. This is entirely optional and driven by business
-              judgment: never mandatory, never for every question, and never for a simple lookup
-              of one record or a single identifier/value — only when a breakdown genuinely helps
-              the user understand the result (typically a "show me all/list all ..." style
-              question over a set of records that has an obvious grouping dimension). Base this
-              decision purely on whether the RESULT DATA itself has a natural grouping dimension
-              worth surfacing — never on whether the user's own phrasing happened to use words
-              like "group by", "breakdown", "by category", or similar. A plain "show me all open
-              purchase orders" deserves exactly the same consideration for a supplementary step as
-              "show me all open purchase orders grouped by status" — if the underlying data has a
-              natural grouping dimension, propose it regardless of how the question was worded;
-              if it doesn't, decline regardless of how the question was worded. Each such
-              step is a normal SQL step in every respect: it follows every rule above (approved
-              schema/columns only, the LITERAL AUTHORITY RULE, no SELECT *, its own
-              connection_key) and goes through the same governance as any other step — there is
-              no shortcut or bypass for it. Give it a clear, business-facing "description" (e.g.
-              "Open orders by status", "Orders by buyer", "Orders by expected delivery month")
-              since that description is shown to the user as this step's own title — write it
-              accordingly.
-            - OPTIONAL VISUALIZATION HINT: when you plan a step whose result would genuinely
-              benefit from a chart — most naturally a SUPPLEMENTARY BREAKDOWN STEP above, but any
-              step you judge chart-worthy — you MAY add a "chart_hint" object to that SAME step's
-              SQL response: {"chart_hint":{"chart_type":"bar","category_key":"status",
+            - SUPPLEMENTARY BREAKDOWN STEPS (optional, your own judgment): once a step answers the
+              user's primary question, you MAY plan one or two more (never more) simple aggregate
+              steps — e.g. "SELECT status, COUNT(*) AS order_count FROM ... GROUP BY status" — when
+              the RESULT DATA has a natural categorical dimension (status, category, owner) or time
+              dimension (month, week) where a breakdown genuinely helps the user understand it,
+              before returning {"done": true}. Decide from the result data alone, never from
+              whether the user's wording mentioned "group by", "breakdown" or similar: the same
+              result set gets the same consideration however the question was phrased. Never for a
+              single-record or single-value lookup; never mandatory. Each such step is an ordinary
+              SQL step in every respect (approved schema/columns only, the LITERAL AUTHORITY RULE,
+              no SELECT *, its own connection_key, the same governance) with a clear business-facing
+              "description" (e.g. "Open orders by status"), which is shown to the user as its title.
+            - OPTIONAL "chart_hint" (same step's SQL response; omit it entirely when a step does not
+              warrant a chart): {"chart_hint":{"chart_type":"bar","category_key":"status",
               "category_label":"Order Status","value_keys":["order_count"],
-              "value_labels":["Order Count"],"metric_label":"Total Orders"}}. "chart_type" must be
-              exactly one of "stats", "bar", "area", "donut" — pick the shape that actually fits
-              what you're returning (e.g. a handful of categories each with one count is a natural
-              "donut" or "bar"; a single summary number is "stats"; a value over dates/months is
-              "area"). "category_key" names the column or alias — copied from THIS step's own
-              SELECT list, exactly as you aliased it — to group/label by; omit it for "stats".
-              "value_keys" lists one or more numeric column/alias names, also from THIS step's own
-              SELECT list, to chart — e.g. if your SQL writes "COUNT(*) AS order_count", use
-              "order_count" in "value_keys", never the raw "COUNT(*)" expression. This is entirely
-              optional and your own judgment call: never mandatory, never for every step, and it
-              never changes what SQL you write — only whether you additionally describe how to
-              chart the result you're already returning. Omit "chart_hint" entirely for a step
-              that doesn't warrant its own chart. You alone decide chart type and category/value
-              columns here — never infer this from table or column naming conventions Java might
-              apply; if you reference a column or alias that turns out not to be present in this
-              step's own result, it is safely ignored, never an error — so only ever reference
-              columns/aliases you actually selected in this same step's SQL.
-            - OPTIONAL HUMAN-READABLE LABELS (part of the same "chart_hint" object above): you
-              wrote the SQL, so you already know what a raw column alias like "order_count" or
-              "total_order_count" actually MEANS in plain English — say so directly, once, rather
-              than leaving Java to guess or show the raw alias to the user. All three are optional
-              and independent of each other and of whether you also set a chart type:
-                • "category_label" — a short, human-readable label for what "category_key" groups
-                  by (e.g. category_key "status" → category_label "Order Status"). Omit when the
-                  raw key is already a fine label or you have no better one.
-                • "value_labels" — a list the SAME LENGTH AND ORDER as "value_keys", one plain-
-                  English label per value column (e.g. value_keys ["order_count"] → value_labels
-                  ["Order Count"]). Omit entirely, or omit individual entries as empty strings,
-                  when you have nothing better than the raw key for that column.
-                • "metric_label" — a short label for a single summary figure (most relevant when
-                  "chart_type" is "stats", but usable any time this step's result reduces to one
-                  headline number a KPI tile would show) — e.g. "Total Orders" rather than the raw
-                  "total_order_count" alias.
-              These are plain-English presentation strings ONLY — never a business rule, a filter,
-              or anything that changes what data is returned. Java relays whatever you write here
-              verbatim; it applies no lookup table and infers no meaning of its own from column or
-              table names. When you omit a label, Java falls back to a purely mechanical casing
-              transform of the raw key (e.g. "order_count" → "Order Count") — still far better
-              than showing raw the alias, but your own plain-English label is always preferred
-              when you provide one, since you understand what the query actually computes and Java
-              never will.
+              "value_labels":["Order Count"],"metric_label":"Total Orders"}}. "chart_type" is
+              exactly one of "stats" (a single summary number), "bar" or "donut" (a few categories
+              with one value each), "area" (a value over dates). "category_key" and "value_keys"
+              (numeric) are column names or aliases copied exactly from THIS step's own SELECT list
+              — use the alias ("order_count"), never the raw expression ("COUNT(*)"); omit
+              "category_key" for "stats". A key not present in the step's result is safely ignored.
+              A chart hint never changes the SQL you write.
+            - OPTIONAL LABELS inside "chart_hint" — plain-English presentation strings only, never a
+              business rule or filter; you wrote the query, so say what an alias means: "category_label"
+              (what "category_key" groups by), "value_labels" (the SAME LENGTH AND ORDER as "value_keys",
+              one per value; an empty string for none), "metric_label" (a short name for a single
+              headline figure). Omit any you have nothing better than the raw key for; Java then
+              falls back to a purely mechanical casing of the key, and relays your labels verbatim.
             - Extract filter values from the attached file content when present.
             - RESOLUTIONS map the user's terms to this tenant's canonical names and values.
               Prefer them over your own interpretation of those terms.
@@ -348,7 +342,18 @@ public class ReasoningPlanner {
             String json   = extractJson(raw);
             Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<>() {});
 
-            if (Boolean.TRUE.equals(parsed.get("done"))) return null;
+            if (Boolean.TRUE.equals(parsed.get("done"))) {
+                log.info("PLANNER_OUTCOME outcome=DONE priorSteps={}", evidence.stepCount());
+                // "Done" with NO evidence is not "the evidence answers the question" — nothing was
+                // queried. Surface that fact (with the planner's own stated reason) instead of
+                // collapsing it into the same null as a genuine "evidence is sufficient", so the
+                // answer composer can say truthfully that no query ran.
+                if (evidence.stepCount() == 0) {
+                    return StepPlan.noQuery(strOr(parsed, "rationale",
+                            "The planner chose not to run any query and gave no reason."));
+                }
+                return null;
+            }
 
             // Missing-Column Metadata Request: the planner's own, explicit way to decline
             // generating SQL when it needs a column from a table whose detail was omitted (by
@@ -382,7 +387,16 @@ public class ReasoningPlanner {
 
             String sql     = (String) parsed.get("sql");
             String connKey = (String) parsed.get("connection_key");
-            if (sql == null || sql.isBlank() || connKey == null || connKey.isBlank()) return null;
+            if (sql == null || sql.isBlank() || connKey == null || connKey.isBlank()) {
+                log.warn("PLANNER_OUTCOME outcome=UNUSABLE sqlPresent={} connectionKeyPresent={} raw={}",
+                        sql != null && !sql.isBlank(), connKey != null && !connKey.isBlank(),
+                        raw == null ? null : raw.substring(0, Math.min(600, raw.length())));
+                if (evidence.stepCount() == 0) {
+                    return StepPlan.noQuery("The planner's response contained no executable query "
+                            + "(missing SQL or connection). " + strOr(parsed, "rationale", ""));
+                }
+                return null;
+            }
 
             // Optional LLM-declared chart hint (see SYSTEM_PROMPT's OPTIONAL VISUALIZATION HINT
             // guidance) — parsed and relayed verbatim; Java performs no interpretation of it here.
@@ -403,6 +417,10 @@ public class ReasoningPlanner {
                     chartHint == null ? null : chartHint.metricLabel());
         } catch (Exception e) {
             log.warn("ReasoningPlanner failed: {}", e.getMessage());
+            if (evidence.stepCount() == 0) {
+                return StepPlan.noQuery("The planning step failed technically before any query "
+                        + "could be produced.");
+            }
             return null;
         }
     }
@@ -649,8 +667,37 @@ public class ReasoningPlanner {
             // any) didn't include labels.
             String categoryLabel,
             List<String> valueLabels,
-            String metricLabel
+            String metricLabel,
+            // Non-null ⇒ the planner produced NO action while there was NO evidence at all (it
+            // answered "done", returned an unusable response, or failed) — i.e. nothing was
+            // queried. The value is the planner's own stated reason (or a plain factual
+            // description of the failure). It exists so the fact "no query ran" reaches the
+            // answer composer instead of being collapsed into a genuine "evidence is sufficient".
+            String noQueryReason
     ) {
+        /** Pre-noQuery shape — every field except {@code noQueryReason}. */
+        public StepPlan(String description, String sql, String connectionKey,
+                        String objectKeys, String rationale, List<LiteralBinding> literalBindings,
+                        String clarificationQuestion, MetadataRequest metadataRequest,
+                        String chartType, String categoryKey, List<String> valueKeys,
+                        String categoryLabel, List<String> valueLabels, String metricLabel) {
+            this(description, sql, connectionKey, objectKeys, rationale, literalBindings,
+                    clarificationQuestion, metadataRequest, chartType, categoryKey, valueKeys,
+                    categoryLabel, valueLabels, metricLabel, null);
+        }
+
+        /** True when no query ran because the planner took no action with no evidence. */
+        public boolean isNoQuery() {
+            return noQueryReason != null && !noQueryReason.isBlank();
+        }
+
+        /** Constructs the "planner took no action, nothing was queried" step. */
+        public static StepPlan noQuery(String reason) {
+            return new StepPlan("No query executed", null, null, "", reason, List.of(), null, null,
+                    null, null, List.of(), null, List.of(), null,
+                    reason == null || reason.isBlank() ? "No reason was given." : reason);
+        }
+
         /** Pre-label shape — chart hint fields present, no LLM-authored labels. */
         public StepPlan(String description, String sql, String connectionKey,
                         String objectKeys, String rationale, List<LiteralBinding> literalBindings,
