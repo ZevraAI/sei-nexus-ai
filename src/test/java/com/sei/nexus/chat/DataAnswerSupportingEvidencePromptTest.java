@@ -21,12 +21,13 @@ class DataAnswerSupportingEvidencePromptTest {
     }
 
     @Test
-    void verificationDatasetsArePresentedAsSupportingEvidenceNotAsTheResult() throws Exception {
+    void verificationDatasetsAreNotDisplayedBesideTheAnswer() throws Exception {
         String p = prompt();
         assertTrue(p.contains("SUPPORTING EVIDENCE"));
         assertTrue(p.contains("it is not the answer"));
-        assertTrue(p.contains("never a conclusion the rows cannot show by themselves"));
+        assertTrue(p.contains("Do not display it"));
+        assertTrue(p.contains("it stays visible in the reasoning trace"));
         assertTrue(p.contains("no row has it right now, not that it is invalid or unused"));
-        assertTrue(p.contains("Never present it as the result of the user's question"));
+        assertTrue(p.contains("Display such a dataset only when the user explicitly asked for those values"));
     }
 }

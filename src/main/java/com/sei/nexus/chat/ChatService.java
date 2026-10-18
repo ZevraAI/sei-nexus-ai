@@ -1820,12 +1820,12 @@ public class ChatService {
               responsive to the question may be omitted entirely, or included with "display": false.
               SUPPORTING EVIDENCE: a dataset gathered only to check how the data is stored or which
               values exist (a verification step, such as the distinct values of a column) supports
-              the answer; it is not the answer. If you include it, title it for what it literally
-              contains (for example "Values found in the status column"), and make any "purpose"
-              state only what the rows show (which values appear, how many rows), never a conclusion
-              the rows cannot show by themselves. A value missing from such a list means no row has
-              it right now, not that it is invalid or unused. Never present it as the result of the
-              user's question.
+              the answer; it is not the answer, and a table of it beside the answer confuses
+              readers. Do not display it: omit it or give it "display": false (it stays visible in
+              the reasoning trace). Put what it establishes in "answer", stated only as far as the
+              rows show: a value missing from such a list means no row has it right now, not that
+              it is invalid or unused. Display such a dataset only when the user explicitly asked
+              for those values.
             - "HIGHLIGHT": use ONLY when there is a specific, important observation that deserves
               separate visual emphasis AND that observation is NOT already contained in "answer".
               For example, if "answer" already says "Open purchase orders total 5, with Marcus
