@@ -36,6 +36,9 @@ public class ReasoningEngine {
     static final int MAX_STEPS = 6;
     /** How many database execution failures the planner may self-correct from in one investigation. */
     static final int MAX_FAILED_REPLANS = 2;
+    /** Fetching one table's columns does not use up a query step, so a question that spans several
+     *  tables is not starved of steps by metadata requests; beyond this many they count as steps. */
+    static final int MAX_METADATA_REQUESTS = 8;
 
     // ── dependencies ──────────────────────────────────────────────────────────
     private final ReasoningPlanner         planner;
@@ -146,6 +149,10 @@ public class ReasoningEngine {
         int           postSufficiencyPlannerCalls = 0;
         // Database execution failures seen so far in this investigation — bounds self-correction.
         int           executionFailures = 0;
+        // Governance blocks seen so far — bounds how often a blocked query may be rewritten.
+        int           blockedReplans = 0;
+        // Metadata requests that have been granted their own allowance on top of MAX_STEPS.
+        int           metadataStepsGranted = 0;
         // PRO-33 retry memory: (column, literal) pairs already rejected once —
         // the "re-prompted once" bound of PRO-32 §5.
         Set<String>            literalRejections = new HashSet<>();
@@ -191,7 +198,7 @@ public class ReasoningEngine {
             }
         }
 
-        while (stepNo <= MAX_STEPS) {
+        while (stepNo <= MAX_STEPS + metadataStepsGranted) {
             // ── 1. Plan the next step ─────────────────────────────────────────
             ReasoningPlanner.StepPlan plan = planner.nextStep(enrichedQ, schemaCtx, evidence);
             if (plan == null) {
@@ -290,6 +297,7 @@ public class ReasoningEngine {
                             + "resolved scope or the enterprise metadata catalog (run '{}')",
                             stepNo, req.object(), runKey);
                 }
+                if (metadataStepsGranted < MAX_METADATA_REQUESTS) metadataStepsGranted++;
                 evidence.addMetadataStep(stepNo, plan.description(), plan.rationale(), decision, detail);
                 saveStep(sessionKey, stepNo, plan, decision, detail, evidence, List.of(), null);
                 eventBus.publish(runKey, "step_metadata_request",
@@ -396,7 +404,13 @@ public class ReasoningEngine {
                         plan.rationale(), "BLOCKED", ro.message(), 0L);
                 saveStep(sessionKey, stepNo, plan, "BLOCKED", ro.message(), evidence, List.of(), null);
                 eventBus.publish(runKey, "step_blocked", Map.of("stepNo", stepNo, "reason", ro.message()));
-                break;
+                // The reason (for example a limit on how many tables one query may join) is a
+                // physical observation the planner can re-plan against, like a failed query: the
+                // rewritten query goes through the same governance checks. Bounded; after
+                // MAX_FAILED_REPLANS blocks the investigation stops and reports the reason.
+                if (++blockedReplans > MAX_FAILED_REPLANS) break;
+                stepNo++;
+                continue;
             }
 
             if (ro.status() == GovernedSqlRuntime.Status.ASYNC) {

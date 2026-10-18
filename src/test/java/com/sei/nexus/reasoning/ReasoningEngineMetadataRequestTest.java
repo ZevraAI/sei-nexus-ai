@@ -388,7 +388,7 @@ class ReasoningEngineMetadataRequestTest {
     // ── Scenario: iteration limits prevent infinite metadata-request loops ────────────────────
 
     @Test
-    void repeatedMetadataRequestsAreBoundedByTheExistingMaxStepsLimit() {
+    void repeatedMetadataRequestsAreBoundedByTheStepsPlusTheMetadataAllowance() {
         AtomicInteger plannerCalls = new AtomicInteger(0);
         ReasoningPlanner fakePlanner = new ReasoningPlanner(null, null) {
             @Override
@@ -413,8 +413,8 @@ class ReasoningEngineMetadataRequestTest {
                 "q", "q", "rsession", "schema context", "run-1", "user@test.com",
                 false, null, null, false, "conv-1", null, null, resolvedContract());
 
-        assertEquals(ReasoningEngine.MAX_STEPS, plannerCalls.get(),
-                "the loop must stop at the existing MAX_STEPS bound, never looping indefinitely");
+        assertEquals(ReasoningEngine.MAX_STEPS + ReasoningEngine.MAX_METADATA_REQUESTS, plannerCalls.get(),
+                "the loop must stop at MAX_STEPS plus the metadata allowance, never looping indefinitely");
         assertTrue(result.queryData().isEmpty());
     }
 
@@ -458,5 +458,117 @@ class ReasoningEngineMetadataRequestTest {
         // post-sufficiency Planner call, yielding no further execution.
         assertEquals(2, plannerCalls.get());
         assertEquals(1, executions.get());
+    }
+
+    // ── Scenario: metadata requests do not starve the question of query steps ─────────────────
+
+    @Test
+    void fetchingSeveralTablesColumnsDoesNotUseUpTheQueryStepAllowance() {
+        AtomicInteger plannerCalls = new AtomicInteger(0);
+        ReasoningPlanner fakePlanner = new ReasoningPlanner(null, null) {
+            @Override
+            public StepPlan nextStep(String question, String schemaCtx, EvidenceStore evidence) {
+                int call = plannerCalls.incrementAndGet();
+                if (call <= ReasoningEngine.MAX_STEPS) {
+                    return StepPlan.metadataRequest("columns " + call, "r", "order_lines", "columns");
+                }
+                if (call == ReasoningEngine.MAX_STEPS + 1) {
+                    return new StepPlan("the real query", "SELECT id FROM orders", CONN, "", "r");
+                }
+                return null;
+            }
+        };
+        ReasoningEvaluator fakeEvaluator = new ReasoningEvaluator(null, null) {
+            @Override public EvaluationResult evaluate(String question, EvidenceStore evidence) {
+                return new EvaluationResult("SUFFICIENT", "done");
+            }
+        };
+        AtomicInteger executions = new AtomicInteger(0);
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
+            @Override public Outcome execute(Request r) {
+                executions.incrementAndGet();
+                return new Outcome(Status.EXECUTED, null, null,
+                        List.of(Map.of("id", 1)), "[{\"id\":1}]", 5L, List.of(), null, null, null);
+            }
+        };
+
+        engine(fakePlanner, fakeEvaluator, fakeRuntime).reason(
+                "q", "q", "rsession", "schema context", "run-1", "user@test.com",
+                false, null, null, false, "conv-1", null, null, resolvedContract());
+
+        assertEquals(1, executions.get(),
+                "the query after MAX_STEPS metadata requests must still run: they do not use up query steps");
+    }
+
+    // ── Scenario: a governance block is re-planned, not the end of the investigation ──────────
+
+    @Test
+    void aGovernanceBlockIsReplannedAndTheRewrittenQueryRuns() {
+        AtomicInteger plannerCalls = new AtomicInteger(0);
+        java.util.List<String> evidenceSeenByPlanner = new java.util.ArrayList<>();
+        ReasoningPlanner fakePlanner = new ReasoningPlanner(null, null) {
+            @Override
+            public StepPlan nextStep(String question, String schemaCtx, EvidenceStore evidence) {
+                int call = plannerCalls.incrementAndGet();
+                evidenceSeenByPlanner.add(String.valueOf(evidence.stepCount()));
+                if (call == 1) return new StepPlan("five joins", "SELECT 1 FROM a", CONN, "", "r");
+                if (call == 2) return new StepPlan("four joins", "SELECT 2 FROM a", CONN, "", "r");
+                return null;
+            }
+        };
+        ReasoningEvaluator fakeEvaluator = new ReasoningEvaluator(null, null) {
+            @Override public EvaluationResult evaluate(String question, EvidenceStore evidence) {
+                return new EvaluationResult("SUFFICIENT", "done");
+            }
+        };
+        AtomicInteger executions = new AtomicInteger(0);
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
+            @Override public Outcome execute(Request r) {
+                if (executions.getAndIncrement() == 0) {
+                    return new Outcome(Status.GOVERNANCE_BLOCKED, "Too many JOINs: 5 (max 4)", null,
+                            List.of(), "[]", 0L, List.of(), null, null, null);
+                }
+                return new Outcome(Status.EXECUTED, null, null,
+                        List.of(Map.of("id", 1)), "[{\"id\":1}]", 5L, List.of(), null, null, null);
+            }
+        };
+
+        ReasoningEngine.ReasoningResult result = engine(fakePlanner, fakeEvaluator, fakeRuntime).reason(
+                "q", "q", "rsession", "schema context", "run-1", "user@test.com",
+                false, null, null, false, "conv-1", null, null, resolvedContract());
+
+        assertEquals(2, executions.get(), "the blocked query is rewritten and the second one runs");
+        assertEquals("1", evidenceSeenByPlanner.get(1), "the planner sees the block as evidence on its next turn");
+        assertEquals(1, result.queryData().size());
+    }
+
+    @Test
+    void repeatedGovernanceBlocksStopAfterTheReplanBound() {
+        AtomicInteger plannerCalls = new AtomicInteger(0);
+        ReasoningPlanner fakePlanner = new ReasoningPlanner(null, null) {
+            @Override
+            public StepPlan nextStep(String question, String schemaCtx, EvidenceStore evidence) {
+                plannerCalls.incrementAndGet();
+                return new StepPlan("always blocked", "SELECT 1 FROM a", CONN, "", "r");
+            }
+        };
+        ReasoningEvaluator fakeEvaluator = new ReasoningEvaluator(null, null) {
+            @Override public EvaluationResult evaluate(String question, EvidenceStore evidence) {
+                fail("nothing executes");
+                return null;
+            }
+        };
+        GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
+            @Override public Outcome execute(Request r) {
+                return new Outcome(Status.GOVERNANCE_BLOCKED, "blocked", null,
+                        List.of(), "[]", 0L, List.of(), null, null, null);
+            }
+        };
+
+        engine(fakePlanner, fakeEvaluator, fakeRuntime).reason(
+                "q", "q", "rsession", "schema context", "run-1", "user@test.com",
+                false, null, null, false, "conv-1", null, null, resolvedContract());
+
+        assertEquals(ReasoningEngine.MAX_FAILED_REPLANS + 1, plannerCalls.get());
     }
 }
