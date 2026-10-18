@@ -36,7 +36,7 @@ public class QueryGovernanceService {
     private int asyncTimeout;
     @Value("${nexus.query-governance.point-lookup-timeout-seconds:10}")
     private int pointLookupTimeout;
-    @Value("${nexus.query-governance.max-joins:4}")
+    @Value("${nexus.query-governance.max-joins:8}")
     private int maxJoins;
     @Value("${nexus.query-governance.default-row-limit:100}")
     private int defaultRowLimit;

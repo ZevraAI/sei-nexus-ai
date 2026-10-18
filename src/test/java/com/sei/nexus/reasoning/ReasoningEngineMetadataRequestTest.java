@@ -525,7 +525,7 @@ class ReasoningEngineMetadataRequestTest {
         GovernedSqlRuntime fakeRuntime = new GovernedSqlRuntime(null, null, null, null, null, null, null, null, null) {
             @Override public Outcome execute(Request r) {
                 if (executions.getAndIncrement() == 0) {
-                    return new Outcome(Status.GOVERNANCE_BLOCKED, "Too many JOINs: 5 (max 4)", null,
+                    return new Outcome(Status.GOVERNANCE_BLOCKED, "Too many JOINs: 9 (max 8)", null,
                             List.of(), "[]", 0L, List.of(), null, null, null);
                 }
                 return new Outcome(Status.EXECUTED, null, null,

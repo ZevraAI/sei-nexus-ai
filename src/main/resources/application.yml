@@ -108,7 +108,7 @@ nexus:
     max-sync-cost: 500
     max-async-rows: 10000
     max-async-cost: 10000
-    max-joins: 4
+    max-joins: 8
     max-selected-columns: 30
     default-row-limit: 100
     max-row-limit: 500
