@@ -28,7 +28,7 @@ public class RegisteredTableCatalog {
                 .map(o -> new Entry(qualified(o.schemaName(), o.tableName()), o.businessName(),
                         withColumns
                                 ? repository.findColumnsByObject(o.objectKey()).stream()
-                                        .map(DataColumn::columnName).toList()
+                                        .map(this::describe).toList()
                                 : List.of()))
                 .toList();
     }
@@ -40,6 +40,32 @@ public class RegisteredTableCatalog {
                         ? e.qualifiedName()
                         : e.qualifiedName() + " (" + e.businessName() + ")")
                 .collect(Collectors.joining(", "));
+    }
+
+    /**
+     * A column's name, plus its legal values when it is an enum-typed column with a discovered
+     * value domain, so a generated query can only compare it to values the database accepts.
+     */
+    private String describe(DataColumn c) {
+        if (c.valueDomainKey() == null) return c.columnName();
+        try {
+            return repository.findValueDomainByKey(c.valueDomainKey())
+                    .map(d -> c.columnName() + " (allowed values: "
+                            + parseValues(d.domainValuesJson()) + ")")
+                    .orElse(c.columnName());
+        } catch (Exception e) {
+            return c.columnName();
+        }
+    }
+
+    private static String parseValues(String json) {
+        try {
+            List<String> values = new com.fasterxml.jackson.databind.ObjectMapper().readValue(json,
+                    new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+            return String.join(" | ", values);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     static String qualified(String schema, String table) {

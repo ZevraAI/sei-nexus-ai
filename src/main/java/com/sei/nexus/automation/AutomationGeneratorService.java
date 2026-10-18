@@ -223,6 +223,9 @@ data: {
   "maxRows": 100
 }
 IMPORTANT: Use ONLY table and column names from the schema provided in the user message.
+Where a column lists "allowed values", compare it ONLY to one of those values, spelled exactly as
+listed; never guess a status or code value. If the requirement's wording does not map to a listed
+value, choose the closest listed one and say so in the workflow description.
 Output: list of row maps. Access a field as: {{nodes.NODEID[0].column_name}}
 
 ### AI_REASON  (call GPT-4o)

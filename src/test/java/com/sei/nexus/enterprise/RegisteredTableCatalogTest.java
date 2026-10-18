@@ -54,6 +54,25 @@ class RegisteredTableCatalogTest {
     }
 
     @Test
+    void enumColumnsCarryTheirLegalValues() {
+        EnterpriseMapRepository repo = new EnterpriseMapRepository(null) {
+            @Override public List<DataObject> findDataObjectsByConnection(String connectionKey) {
+                return List.of(object("o1", "retail_core", "purchase_orders", null));
+            }
+            @Override public List<DataColumn> findColumnsByObject(String objectKey) {
+                return List.of(new DataColumn("c1", objectKey, "status", "USER-DEFINED", true, null,
+                        false, true, false, false, false, "po_status", "vd1", null, null, null));
+            }
+            @Override public java.util.Optional<ValueDomain> findValueDomainByKey(String key) {
+                return java.util.Optional.of(new ValueDomain(key, "conn", "retail_core", "po_status",
+                        "ENUM", true, "[\"draft\",\"submitted\"]", null));
+            }
+        };
+        assertEquals(List.of("status (allowed values: draft | submitted)"),
+                new RegisteredTableCatalog(repo).tables("conn", true).get(0).columns());
+    }
+
+    @Test
     void lineShowsQualifiedNameAndBusinessName() {
         assertEquals("retail_core.inventory_balances (Inventory Balances), plain_table",
                 catalog.tableLine("conn"));
