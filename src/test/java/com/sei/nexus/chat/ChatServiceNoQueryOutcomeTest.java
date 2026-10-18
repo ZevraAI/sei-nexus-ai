@@ -34,8 +34,11 @@ class ChatServiceNoQueryOutcomeTest {
         EvidenceStore evidence = new EvidenceStore();
         evidence.add(1, "d", "SELECT 1", "conn-1", List.of(), "r", "DEAD_END", "nothing", 3L);
 
-        assertTrue(ChatService.evidenceToExecResults(evidence).isEmpty(),
-                "an executed query with zero rows stays the ordinary empty-result case");
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+        assertEquals(1, results.size());
+        assertFalse(results.get(0).containsKey("noQuery"), "an executed query is never reported as 'no query run'");
+        assertTrue(results.get(0).containsKey("emptyResult"),
+                "an executed query with zero rows is carried to the composer as an empty-result finding");
     }
 
     @Test

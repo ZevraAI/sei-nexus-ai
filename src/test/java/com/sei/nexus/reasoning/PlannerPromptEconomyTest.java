@@ -20,8 +20,10 @@ import static org.junit.jupiter.api.Assertions.*;
 class PlannerPromptEconomyTest {
 
     /** Ceiling in characters (~4 chars per token). After the condensing it is 21,910; it was
-     *  ~25,950 before. Raise it deliberately, with a cost review. */
-    private static final int MAX_SYSTEM_PROMPT_CHARS = 23_100;
+     *  ~25,950 before. Raise it deliberately, with a cost review.
+     *  Raised 23,100 -> 23,200 for the "don't bend the user's wording" rule (~400 chars, ~100 tokens
+     *  x ~2.4 planner calls = ~240 input tokens per question, well under 1% of a question's cost). */
+    private static final int MAX_SYSTEM_PROMPT_CHARS = 23_200;
 
     static class CapturingClient extends AzureOpenAiClient {
         String systemPrompt;

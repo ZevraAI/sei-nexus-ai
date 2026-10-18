@@ -1245,6 +1245,13 @@ public class ChatService {
                     // Already rendered above, per-dataset, with explicit boundaries — skip here
                     // to avoid rendering the same step's rows twice.
                     continue;
+                } else if (r.containsKey("emptyResult")) {
+                    // A query that ran cleanly and matched nothing is itself a finding. Without this
+                    // line the composer never learns of it when other steps returned rows (e.g. a
+                    // diagnostic list of values), and answers from those instead.
+                    ctx.append("A query returned 0 rows (step ").append(r.get("step")).append(": ")
+                       .append(r.get("description")).append(").\n  SQL: ").append(r.get("sql"))
+                       .append("\n  Evaluator note: ").append(r.get("note")).append("\n");
                 } else if (r.containsKey("noQuery")) {
                     ctx.append("No query was run. Reason: ").append(r.get("reason")).append("\n");
                     anyNoQuery = true;
@@ -1617,7 +1624,8 @@ public class ChatService {
                 : """
                 You are Zevra, an enterprise operational intelligence AI.
                 The query executed successfully and returned no matching records.
-                State plainly and concisely that no records currently match the requested criteria.
+                State plainly and concisely that no records currently match the requested criteria,
+                naming the criteria the query applied (from the context, in business terms).
                 Do NOT suggest the table is wrong, the metadata is misconfigured, the data is missing,
                 or that the system failed — the query was valid and simply had no matches.
                 Offer one natural next step only if helpful (e.g. broadening the criteria or a different filter).
@@ -1748,6 +1756,15 @@ public class ChatService {
                 }                          // "$373,750", "Oct 3, 2025" — your own formatting
               ]
             }
+
+            QUERIES THAT RETURNED NO ROWS. The context may list queries that ran cleanly and
+            returned 0 rows ("A query returned 0 rows ..."). That is a finding, not a failure. When
+            the final query for the user's question returned 0 rows, say plainly that none were
+            found, state the criteria it applied (in business terms, not SQL), and mention the
+            closest thing the other evidence shows when it helps (for example, the largest value
+            that exists when the user asked for values above a threshold). Do not say there is "no
+            evidence" or that the data is missing when a checked query came back empty, and do not
+            answer from a diagnostic list of values as if it were the answer.
 
             ══════════════════════════════ CORE PRINCIPLE ══════════════════════════════
             The schema below lists AVAILABLE content types, not REQUIRED content. Never create a
@@ -2558,6 +2575,12 @@ public class ChatService {
             if (!s.rows().isEmpty()) {
                 results.add(Map.of("step", s.stepNo(), "rows", s.rows(),
                         "sql", s.sql() != null ? s.sql() : ""));
+            } else if (EvidenceStore.OUTCOME_QUERY_SUCCEEDED.equals(s.outcome())) {
+                // A query that executed and matched no rows (not a failure, not a metadata fetch).
+                results.add(Map.of("step", s.stepNo(), "emptyResult", true,
+                        "description", s.description() != null ? s.description() : "",
+                        "sql", s.sql() != null ? s.sql() : "",
+                        "note", s.evaluatorRationale() != null ? s.evaluatorRationale() : ""));
             } else if ("ERROR".equals(s.outcome())) {
                 results.add(Map.of("step", s.stepNo(), "error",
                         s.evaluatorRationale() != null ? s.evaluatorRationale() : "Step failed"));

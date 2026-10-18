@@ -101,6 +101,10 @@ public class ReasoningPlanner {
               values are on a different scale or format than your filter), your NEXT step must
               re-run the ORIGINAL question with the corrected filter — a verification result is
               never the final answer to the user's question.
+            - DON'T BEND THE USER'S WORDING. A legal value that satisfies everyday wording only
+              PARTLY (a stage short of complete) is read literally: "not yet X" includes it,
+              "X" excludes it. If still ambiguous, use the broader reading and name the values
+              in the step description.
             - A QUOTED IDENTIFIER LIVES ON ITS OWN OBJECT. A literal can only be compared with a
               column that actually holds that kind of value. If the user quotes a business number,
               code or name for an entity and the table you are querying holds only an opaque

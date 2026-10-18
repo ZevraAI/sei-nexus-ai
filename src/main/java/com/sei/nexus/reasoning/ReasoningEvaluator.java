@@ -129,7 +129,9 @@ public class ReasoningEvaluator {
             a condition, or an inner join, that keeps only one of several values of a type or
             category column, or drops rows with no match — the figures cover only part of the data,
             so the evidence is not yet sufficient (NEED_MORE_DATA). Narrowing the question itself
-            asked for is fine.
+            asked for is fine. Treating a value that only PARTLY satisfies the user's wording (a
+            stage short of complete) as if it fully satisfied it is also narrowing the question did
+            not ask for: judge the query's reading of the condition, not only its rows.
 
             Decision guide:
             - SUFFICIENT    : the evidence collected is actually about what THIS question asks

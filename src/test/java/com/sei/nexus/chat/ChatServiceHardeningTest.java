@@ -185,6 +185,21 @@ class ChatServiceHardeningTest {
     }
 
     @Test
+    void evidenceToExecResultsKeepsACleanZeroRowStepAsAFindingNotNothing() {
+        EvidenceStore evidence = new EvidenceStore();
+        evidence.add(1, "orders above the threshold", "SELECT po_number FROM retail_core.purchase_orders WHERE total > 50000",
+                "conn-1", List.of(), null, "NEED_MORE_DATA", "verify the filter", 5L);
+
+        List<Map<String, Object>> results = ChatService.evidenceToExecResults(evidence);
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).containsKey("emptyResult"));
+        assertEquals("orders above the threshold", results.get(0).get("description"));
+        assertTrue(String.valueOf(results.get(0).get("sql")).contains("50000"));
+        assertFalse(results.get(0).containsKey("error"));
+    }
+
+    @Test
     void evidenceToExecResultsEmitsRowsForASuccessfulStep() {
         EvidenceStore evidence = new EvidenceStore();
         evidence.add(1, "step", "SELECT po_number FROM retail_core.purchase_orders",
