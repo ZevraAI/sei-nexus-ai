@@ -6,33 +6,32 @@ import com.sei.nexus.ai.ChatMessage;
 import com.sei.nexus.common.NexusException;
 import com.sei.nexus.connection.ConnectionRepository;
 import com.sei.nexus.connection.NexusConnection;
-import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.enterprise.RegisteredTableCatalog;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 @Service
 public class AutomationGeneratorService {
 
     private final AzureOpenAiClient openAi;
     private final ConnectionRepository connectionRepository;
-    private final DynamicSqlService dynamicSql;
+    private final RegisteredTableCatalog catalog;
     private final AutomationService automationService;
     private final AutomationRepository automationRepository;
     private final ObjectMapper mapper;
 
     public AutomationGeneratorService(AzureOpenAiClient openAi,
                                       ConnectionRepository connectionRepository,
-                                      DynamicSqlService dynamicSql,
+                                      RegisteredTableCatalog catalog,
                                       AutomationService automationService,
                                       AutomationRepository automationRepository,
                                       ObjectMapper mapper) {
         this.openAi = openAi;
         this.connectionRepository = connectionRepository;
-        this.dynamicSql = dynamicSql;
+        this.catalog = catalog;
         this.automationService = automationService;
         this.automationRepository = automationRepository;
         this.mapper = mapper;
@@ -40,8 +39,8 @@ public class AutomationGeneratorService {
 
     /**
      * Step 1 — Analyse the requirement.
-     * Fetches real table names from each available connection so the LLM
-     * can suggest accurate tables rather than hallucinating names.
+     * Lists the tables registered for each connection (any schema, schema-qualified) so the
+     * LLM suggests real tables rather than hallucinating names.
      */
     public Map<String, Object> analyze(String requirement) {
         List<NexusConnection> connections = connectionRepository.findAll();
@@ -57,10 +56,10 @@ public class AutomationGeneratorService {
                     ctx.append(" desc=").append(c.usageDescription());
                 ctx.append("\n");
 
-                // Append real table names from this connection
+                // Append the registered tables of this connection
                 String tables = fetchTableNames(c.connectionKey());
-                if (!tables.isBlank())
-                    ctx.append("  Tables: ").append(tables).append("\n");
+                ctx.append("  Tables: ").append(tables.isBlank()
+                        ? "(none registered for this connection)" : tables).append("\n");
             }
         }
 
@@ -77,13 +76,15 @@ public class AutomationGeneratorService {
                   "suggestedConnections": ["connection-key"],
                   "suggestedTables": ["exact_table_name_from_the_list_above"],
                   "proposedSteps": [
-                    "1. Trigger: receive webhook with order_id",
-                    "2. DB_QUERY: fetch row from demo_order by order_id",
+                    "1. Trigger: receive webhook with <an identifier the requirement mentions>",
+                    "2. DB_QUERY: fetch the matching row from <a table in the list above> by that identifier",
                     "3. RESPONSE: return result"
                   ],
                   "clarifications": []
                 }
-                Use ONLY table names that appear in the connections list above.
+                Use ONLY table names that appear in the connections list above, written exactly as
+                listed (including the schema prefix). If no listed table fits the requirement, leave
+                suggestedTables empty and say so in clarifications; never invent or borrow a name.
                 Return only valid JSON — no markdown, no extra text.
                 """;
 
@@ -130,19 +131,17 @@ public class AutomationGeneratorService {
                          .append(" type=").append(c.connectionType()).append("\n");
 
                 try {
-                    List<Map<String, Object>> tables =
-                            dynamicSql.listTablesWithColumnCounts(connKey, "public");
-                    for (Map<String, Object> row : tables) {
-                        String tableName = String.valueOf(row.get("table_name"));
-                        String columns   = String.valueOf(row.getOrDefault("column_names", ""));
+                    for (RegisteredTableCatalog.Entry t : catalog.tables(connKey, true)) {
+                        String bare = t.qualifiedName().substring(t.qualifiedName().lastIndexOf('.') + 1);
                         // Only include tables the user actually selected (if any were selected)
-                        if (selectedTables.isEmpty() || selectedTables.contains(tableName)) {
-                            schemaCtx.append("  Table: ").append(tableName)
-                                     .append(" — columns: ").append(columns).append("\n");
+                        if (selectedTables.isEmpty() || selectedTables.contains(t.qualifiedName())
+                                || selectedTables.contains(bare)) {
+                            schemaCtx.append("  Table: ").append(t.qualifiedName())
+                                     .append(" - columns: ").append(String.join(", ", t.columns())).append("\n");
                         }
                     }
                 } catch (Exception ignored) {
-                    // If catalog fails, still attempt generation without column hints
+                    // If the catalog fails, still attempt generation without column hints
                     if (!selectedTables.isEmpty())
                         schemaCtx.append("  Tables: ").append(String.join(", ", selectedTables)).append("\n");
                 }
@@ -307,11 +306,7 @@ Return ONLY this JSON object (no markdown fences, no extra text):
     /** Returns a comma-separated list of table names for a connection, or "" on failure. */
     private String fetchTableNames(String connectionKey) {
         try {
-            List<Map<String, Object>> rows =
-                    dynamicSql.listTablesWithColumnCounts(connectionKey, "public");
-            return rows.stream()
-                    .map(r -> String.valueOf(r.get("table_name")))
-                    .collect(Collectors.joining(", "));
+            return catalog.tableLine(connectionKey);
         } catch (Exception e) {
             return "";
         }

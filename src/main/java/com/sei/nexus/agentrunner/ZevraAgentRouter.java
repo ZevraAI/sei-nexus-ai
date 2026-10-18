@@ -3,7 +3,7 @@ package com.sei.nexus.agentrunner;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sei.nexus.ai.AzureOpenAiClient;
 import com.sei.nexus.ai.ChatMessage;
-import com.sei.nexus.sql.DynamicSqlService;
+import com.sei.nexus.enterprise.RegisteredTableCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -27,16 +27,16 @@ public class ZevraAgentRouter {
     private final ZevraAgentRepository repository;
     private final AzureOpenAiClient    openAi;
     private final ObjectMapper         mapper;
-    private final DynamicSqlService    dynamicSql;
+    private final RegisteredTableCatalog catalog;
 
     public ZevraAgentRouter(ZevraAgentRepository repository,
                              AzureOpenAiClient openAi,
                              ObjectMapper mapper,
-                             DynamicSqlService dynamicSql) {
+                             RegisteredTableCatalog catalog) {
         this.repository = repository;
         this.openAi     = openAi;
         this.mapper     = mapper;
-        this.dynamicSql = dynamicSql;
+        this.catalog    = catalog;
     }
 
     /**
@@ -63,23 +63,20 @@ public class ZevraAgentRouter {
                     agentList.append(" | ").append(a.description());
                 }
 
-                // Include the actual table names from each connection so the router
-                // can match data-retrieval questions even when the goal text doesn't
-                // explicitly mention the data type.
-                // "get me all orders" → agent has demo_order table → confident match.
-                // Table names are loaded dynamically — no hardcoding per tenant.
+                // Include the tables registered for each connection so the router can match
+                // data-retrieval questions even when the goal text doesn't name the data type.
+                // They come from the company's registered data objects (any schema), never from
+                // a fixed schema of the source database.
                 if (!a.connectionKeys().isEmpty()) {
                     String tables = a.connectionKeys().stream()
-                            .flatMap(connKey -> {
+                            .map(connKey -> {
                                 try {
-                                    return dynamicSql.listTablesWithColumnCounts(connKey, "public")
-                                            .stream()
-                                            .map(row -> String.valueOf(row.get("table_name")))
-                                            .filter(t -> !t.startsWith("nexus_") && !t.startsWith("flyway_"));
+                                    return catalog.tableLine(connKey);
                                 } catch (Exception e) {
-                                    return java.util.stream.Stream.of(connKey);
+                                    return "";
                                 }
                             })
+                            .filter(t -> !t.isBlank())
                             .collect(Collectors.joining(", "));
                     if (!tables.isBlank()) {
                         agentList.append(" | data tables: ").append(tables);
