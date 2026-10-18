@@ -175,7 +175,7 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
 
     private ChatService newChatService(AgentBrain agentBrain, AzureOpenAiClient aiClient) {
         ObjectMapper mapper = new ObjectMapper();
-        return new ChatService(
+        ChatService service = new ChatService(
                 new NoOpRunRepository(),
                 new NoOpDocumentMemoryService(),
                 new EmptySemanticService(),
@@ -204,6 +204,17 @@ class ChatServiceDecisionRouterAbsorptionCallCountTest {
                 new NoOpExecutionReferenceRepository(),
                 null,
                 null);
+        // Field-injected in production; this tenant has no approved instructions.
+        try {
+            java.lang.reflect.Field f = ChatService.class.getDeclaredField("instructionPromptService");
+            f.setAccessible(true);
+            f.set(service, new com.sei.nexus.instruction.InstructionPromptService(null, null, 5, 0.3, 2000) {
+                @Override public String forQuestion(String question) { return ""; }
+            });
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        return service;
     }
 
     @Test

@@ -163,6 +163,14 @@ public class ChatService {
     @org.springframework.beans.factory.annotation.Value("${zevra.chat.conversation-memory.enabled:false}")
     private boolean chatMemoryEnabled;
 
+    // Standing instructions ("always show the item description"): proposed with /knowledge, approved
+    // by an admin, and the relevant few added to the planner context below. Field-injected, like
+    // chatMemoryEnabled above, so the long constructor stays unchanged.
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.sei.nexus.instruction.InstructionService instructionService;
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.sei.nexus.instruction.InstructionPromptService instructionPromptService;
+
     public ChatService(RunRepository runRepository,
                        DocumentMemoryService documentMemoryService,
                        SemanticService semanticService,
@@ -689,6 +697,12 @@ public class ChatService {
                             learningCtxMs);
                     if (!learningCtx.isEmpty()) {
                         schemaCtx = schemaCtx + "\n\n" + learningCtx.contextText();
+                    }
+
+                    // Approved standing instructions relevant to this question (capped; "" if none).
+                    String instructionCtx = instructionPromptService.forQuestion(raw);
+                    if (!instructionCtx.isBlank()) {
+                        schemaCtx = schemaCtx + "\n\n" + instructionCtx;
                     }
 
                     // ── Conversation Memory → Chat (Phase 3): an isolated, dedicated
@@ -2399,10 +2413,7 @@ public class ChatService {
     // =========================================================================
 
     private ChatResponse handleKnowledgeProposal(String text, String userEmail) {
-        String gapKey = Keys.uniqueKey("gap");
-        KnowledgeGap gap = new KnowledgeGap(gapKey, null, "KNOWLEDGE_PROPOSAL", null, text,
-                "User-submitted knowledge proposal awaiting review.", text, "OPEN", null, null, null, null);
-        knowledgeGapRepository.save(gap);
+        com.sei.nexus.instruction.Instruction proposed = instructionService.submit(text, userEmail);
         String convId = Keys.conversationKey();
         String runKey = Keys.runKey();
         NexusRun run = new NexusRun(runKey, convId, null, null, userEmail, "/knowledge " + text,
@@ -2411,7 +2422,8 @@ public class ChatService {
         runRepository.update(runKey, "Knowledge proposal submitted for domain owner review.",
                 "KNOWLEDGE_PROPOSAL", "COMPLETE", null);
         return buildResponse(convId, runKey,
-                "Your knowledge proposal has been submitted for review by the domain owner. Ref: " + gapKey,
+                "Your instruction has been submitted for review by an admin or domain owner. Once approved, "
+                        + "Zevra will apply it to relevant questions. Ref: " + proposed.instructionId(),
                 "KNOWLEDGE_PROPOSAL", null, 1.0, false, List.of(), List.of(), List.of(), List.of(), List.of());
     }
 
