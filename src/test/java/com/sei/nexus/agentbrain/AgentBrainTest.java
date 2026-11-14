@@ -34,8 +34,10 @@ class AgentBrainTest {
         List<String> seenDomainKeys;
         List<String> seenObjectKeys;
         FakeAssembler(SemanticModel model) { super(null); this.model = model; }
+        // SC-2: every connection-primitive call, in order (seenKeys keeps only the last one).
+        final List<List<String>> assembleCalls = new java.util.ArrayList<>();
         @Override public SemanticModel assemble(List<String> connectionKeys) {
-            this.seenKeys = connectionKeys; return model;
+            this.seenKeys = connectionKeys; assembleCalls.add(connectionKeys); return model;
         }
         @Override public SemanticModel assembleByDomains(List<String> domainKeys) {
             this.seenDomainKeys = domainKeys;
@@ -625,25 +627,186 @@ class AgentBrainTest {
                 conceptResolver.seenQuestion, "the raw question is relayed unmodified — AgentBrain never rewrites or matches it itself");
     }
 
-    // Test 7 — connection isolation remains intact for a domain-bearing, multi-connection scope:
-    // if EVERY in-scope connection can be concept-scoped, narrowing applies across all of them;
-    // if the prerequisite is missing for ANY one connection, the whole thing falls back to the
-    // existing safe domain+connection-narrowing path — never a partial/mixed narrowing.
+    // Test 7 — SC-2 (approved amendment of the former all-or-nothing rule): narrowing is decided
+    // PER CONNECTION. A connection to which narrowing does not apply (no Pack / no concept
+    // catalog) no longer disables narrowing for the others; it contributes its own approved
+    // surface. The three cases that keep their exact prior behavior are covered below: every
+    // connection narrows, no connection narrows, and any unresolved ambiguity.
+
+    private static SemanticModel domainModelAB() {
+        return new SemanticModel(
+                List.of(new BusinessObject("obj-a", "A", "", List.of(), List.of()),
+                        new BusinessObject("obj-b", "B", "", List.of(), List.of())),
+                Map.of("obj-a", new PhysicalTable("conn-1", "public", "a"),
+                       "obj-b", new PhysicalTable("conn-2", "public", "b")),
+                Map.of());
+    }
+
+    private static Set<String> objectKeysOf(ResolvedBusinessModel model) {
+        return model.objects().stream().map(BusinessObject::objectKey)
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
     @Test
-    void multiConnectionDomainBearingScopeNarrowsOnlyWhenEveryConnectionQualifies() {
+    void mixedScopeNarrowsThePackedConnectionAndIncludesThePackLessConnectionSurface() {
         FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();   // conn-1, narrowed (obj-inv)
+        assembler.domainModel = domainModelAB();       // obj-a on conn-1, obj-b on conn-2
         FakeConceptResolver conceptResolver = new FakeConceptResolver();
         conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
-        // conn-2 has no entry ⇒ Optional.empty() ⇒ concept-scoping is inapplicable for the pair.
+        // conn-2 has no entry ⇒ Optional.empty() ⇒ narrowing does not apply to it.
         AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
 
-        brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of("PLATFORM"), "how many orders");
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "how many orders");
 
         assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys,
-                "both connections must be attempted before deciding narrowing is inapplicable");
-        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys,
-                "one connection lacking prerequisites must fall the WHOLE scope back to assembleByDomains — never a partial narrowing");
+                "both connections are still attempted");
+        assertEquals(List.of("obj-inv"), assembler.seenObjectKeys,
+                "the narrowed connection contributes only its Stage 2 selection");
+        assertEquals(Set.of("obj-inv", "obj-b"), objectKeysOf(model),
+                "narrowed conn-1 object + pack-less conn-2 surface; conn-1's unnarrowed obj-a must NOT be re-admitted");
+        assertTrue(model.objectTargets().containsKey("obj-b"));
+        assertTrue(model.conceptScoped(),
+                "narrowing ran for at least one connection — downstream context stays bounded by this object scope");
+        // Execution authorization is still the full approved surface, independent of narrowing.
+        assertEquals(Set.of("obj-a", "obj-b"),
+                model.executionScope().orElseThrow().objects().stream().map(BusinessObject::objectKey)
+                        .collect(java.util.stream.Collectors.toSet()));
+    }
+
+    @Test
+    void mixedScopeNeverReAdmitsTheNarrowedConnectionWhenThePackLessConnectionHasNoObjects() {
+        // Guard for assembleByFallback's stale-connection rule (returns the whole domain when
+        // narrowing would empty the scope): the mixed path must not inherit it.
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        assembler.domainModel = new SemanticModel(
+                List.of(new BusinessObject("obj-a", "A", "", List.of(), List.of())),
+                Map.of("obj-a", new PhysicalTable("conn-1", "public", "a")), Map.of());
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(Set.of("obj-inv"), objectKeysOf(model),
+                "a pack-less connection with nothing in scope contributes nothing — never the narrowed connection's other objects");
+    }
+
+    @Test
+    void mixedAgentScopeAssemblesOnlyThePackLessConnectionsForTheirSurface() {
+        // Domain-free (autonomous agent) scope: the connection primitive is used, restricted to the
+        // pack-less connections.
+        SemanticModel conn2Only = new SemanticModel(
+                List.of(new BusinessObject("obj-b", "B", "", List.of(), List.of())),
+                Map.of("obj-b", new PhysicalTable("conn-2", "public", "b")), Map.of());
+        FakeAssembler assembler = new FakeAssembler(conn2Only);
+        assembler.objectKeysModel = inventoryOnly();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of("obj-inv")));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve(agent(List.of("conn-1", "conn-2")), "how many orders");
+
+        assertTrue(assembler.assembleCalls.contains(List.of("conn-2")),
+                "the pack-less connection's surface is assembled for that connection alone");
+        assertEquals(Set.of("obj-inv", "obj-b"), objectKeysOf(model));
+    }
+
+    @Test
+    void mixedScopeWherePackedConnectionSelectsNoConceptStillIncludesPackLessSurface() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.domainModel = domainModelAB();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", java.util.Optional.of(List.of())); // honest "nothing applies"
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "what is the weather today?");
+
+        assertNull(assembler.seenObjectKeys, "no concept selected ⇒ assembleByObjectKeys is not needed");
+        assertEquals(Set.of("obj-b"), objectKeysOf(model),
+                "the packed connection contributes nothing; the pack-less connection's surface is still offered");
+        assertTrue(model.conceptScoped());
+    }
+
+    @Test
+    void ambiguityOnTheNarrowedConnectionEmptiesTheWholeScopeEvenInAMixedScope() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        conceptResolver.resultByConnection.put("conn-1", combined(
+                List.of(), List.of("purchase-order", "sales-transaction"), "Do you mean A or B?"));
+        // conn-2: no entry ⇒ EMPTY ⇒ pack-less.
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of(),
+                "show me all open orders", "conv-1", true);
+
+        assertTrue(model.conceptAmbiguityClarification().isPresent());
+        assertTrue(model.objects().isEmpty(), "no physical object is approved for an unresolved ambiguity");
+        assertTrue(model.executionScope().orElseThrow().objects().isEmpty(),
+                "execution scope must also stay empty for an unresolved ambiguity");
+        assertTrue(assembler.assembleCalls.isEmpty(),
+                "the pack-less connection's surface must not even be assembled for an ambiguity");
+    }
+
+    @Test
+    void routingAndConceptKeysComeOnlyFromNarrowedConnectionsInAMixedScope() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.objectKeysModel = inventoryOnly();
+        FakeRoutingConceptResolver conceptResolver = new FakeRoutingConceptResolver();
+        // conn-1 is pack-less (no entry ⇒ EMPTY); conn-2 narrows and carries a routing decision.
+        conceptResolver.resultByConnection.put("conn-2", new ConceptScopedMetadataResolver.CombinedResolution(
+                java.util.Optional.of(List.of("obj-inv")),
+                java.util.Optional.of(new ConceptScopedMetadataResolver.RoutingDecision("QUERY_LIVE_DATA", null)),
+                java.util.Optional.of(List.of("inventory-balance")),
+                java.util.Optional.empty()));
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of(),
+                "how much stock do we have?", "conv-1", true);
+
+        assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys);
+        assertEquals("QUERY_LIVE_DATA", model.routingDecision().orElseThrow().type(),
+                "the first NARROWED connection's routing decision is the request's decision");
+        assertEquals(List.of("inventory-balance"), model.resolvedConceptKeys(),
+                "only narrowed connections contribute concept keys");
+    }
+
+    @Test
+    void noConnectionNarrowsFallsBackToTheFullAssemblyExactlyAsBefore() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        assembler.domainModel = domainModelAB();
+        FakeConceptResolver conceptResolver = new FakeConceptResolver(); // no entries ⇒ EMPTY for both
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), conceptResolver);
+
+        ResolvedBusinessModel model = brain.resolve("agent-1", List.of("conn-1", "conn-2"),
+                List.of("PLATFORM"), "how many orders");
+
+        assertEquals(List.of("conn-1", "conn-2"), conceptResolver.seenConnectionKeys);
+        assertEquals(List.of("PLATFORM"), assembler.seenDomainKeys);
         assertNull(assembler.seenObjectKeys);
+        assertFalse(model.conceptScoped(), "narrowing did not apply to any connection");
+        assertEquals(Set.of("obj-a", "obj-b"), objectKeysOf(model));
+    }
+
+    @Test
+    void aStage1FailureOnAPackedConnectionStillFailsLoudlyInAMixedScope() {
+        FakeAssembler assembler = new FakeAssembler(twoObjects());
+        ConceptScopedMetadataResolver failing = new ConceptScopedMetadataResolver(null, null, null, null, null, null) {
+            @Override public CombinedResolution resolveObjectKeysWithRouting(String connectionKey, String question,
+                                                                             String conversationId, boolean memoryAvailable) {
+                if ("conn-1".equals(connectionKey)) throw new IllegalStateException("Stage 1 failed");
+                return CombinedResolution.EMPTY;
+            }
+        };
+        AgentBrain brain = new AgentBrain(assembler, new FakeResolver(), failing);
+
+        assertThrows(IllegalStateException.class,
+                () -> brain.resolve("agent-1", List.of("conn-1", "conn-2"), List.of("PLATFORM"), "q"),
+                "failures stay loud — a pack-less sibling must not turn a real failure into a silent fallback");
     }
 
     @Test

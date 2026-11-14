@@ -133,8 +133,8 @@ public class AgentBrain {
 
         // One Stage 1 path for every caller. memoryAvailable is null for callers with no document
         // memory (autonomous agents) — the model is told "false" in that case.
-        ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, question, conversationId,
-                Boolean.TRUE.equals(memoryAvailable));
+        ConceptScopedModelResult r = conceptScopedModelWithRouting(connectionKeys, domainKeys, question,
+                conversationId, Boolean.TRUE.equals(memoryAvailable));
         Optional<SemanticModel> conceptScoped = r.model();
         Optional<ConceptScopedMetadataResolver.RoutingDecision> routingDecision =
                 memoryAvailable == null ? Optional.empty() : r.routing();
@@ -195,15 +195,16 @@ public class AgentBrain {
      * it to {@link #resolver} regardless of what this method does). It is NOT the criterion for
      * <em>which physical objects/columns to retrieve</em> — that decision now belongs to {@link
      * ConceptScopedMetadataResolver} whenever it can make it (an active Pack + a non-empty
-     * tenant concept catalog on every in-scope connection), independent of whether {@code
-     * domainKeys} happens to be empty or not. Concretely:
+     * tenant concept catalog on at least one in-scope connection — SC-2: narrowing is decided per
+     * connection, and connections without a Pack contribute their own approved surface), independent
+     * of whether {@code domainKeys} happens to be empty or not. Concretely:
      *
      * <ul>
      *   <li><b>Concept-scoped narrowing applies</b> (any scope — domain-free or domain-bearing):
      *       {@link #conceptScopedModelWithRouting} resolves the physical surface. {@code assembleByDomains}
      *       is never called in this case.</li>
      *   <li><b>Concept-scoped narrowing does not apply</b> (no resolver wired, no connections, no
-     *       active Pack on any in-scope connection, no tenant concept catalog yet, or any
+     *       active Pack on ANY in-scope connection, no tenant concept catalog yet, or any
      *       failure — see {@link #conceptScopedModelWithRouting}'s own fallback discipline): falls through
      *       to exactly the pre-existing behavior —
      *       <ul>
@@ -253,63 +254,119 @@ public class AgentBrain {
      * absorption's routing decision from the combined Persistent Knowledge call per connection
      * (see {@link ConceptScopedMetadataResolver#resolveObjectKeysWithRouting}).
      *
+     * <p><b>Per-connection degradation (System Catalogue SC-2, approved amendment).</b> Narrowing
+     * is decided per CONNECTION. A connection to which narrowing does not apply (no active Pack,
+     * or no concept catalog yet — the resolver returns {@code EMPTY}) contributes its own approved
+     * surface, assembled the same way the fallback assembles it, restricted to that connection.
+     * Connections that DO narrow contribute only their Stage 2 object set. Previously one such
+     * connection made the whole request fall back to the unnarrowed surface of every connection.
+     * Three cases keep their exact prior behavior: every connection narrows; no connection
+     * narrows (the whole request falls back, as before); and any unresolved ambiguity (the whole
+     * scope is empty — no physical object is approved for an unresolved ambiguity).
+     *
      * <p>Scope limitation, honestly disclosed rather than silently resolved: {@code
      * routingDecision} is a whole-REQUEST decision, but Stage 1 runs per CONNECTION. For the
      * common case (one connection in scope), this is exactly one combined call and one routing
-     * decision. For a multi-connection scope, the FIRST connection's routing decision is used as
-     * the request's routing decision — later connections' routing decisions (if they differ) are
-     * discarded. This mirrors this class's existing all-or-nothing semantics for object keys
-     * (any one connection failing empties the whole scope) rather than inventing a new merge
-     * rule for a case that does not arise in this codebase's current agent/connection topology.
+     * decision. For a multi-connection scope, the FIRST NARROWED connection's routing decision is
+     * used as the request's routing decision — later connections' routing decisions (if they
+     * differ) are discarded. A connection that does not narrow makes no Stage 1 call and has no
+     * routing decision to contribute.
      */
-    private ConceptScopedModelResult conceptScopedModelWithRouting(List<String> connectionKeys, String question,
+    private ConceptScopedModelResult conceptScopedModelWithRouting(List<String> connectionKeys,
+                                                                    List<String> domainKeys, String question,
                                                                     String conversationId, boolean memoryAvailable) {
         if (conceptResolver == null || connectionKeys == null || connectionKeys.isEmpty()) {
             return new ConceptScopedModelResult(Optional.empty(), Optional.empty(), List.of(), Optional.empty());
         }
         List<String> allObjectKeys = new ArrayList<>();
         List<String> allConceptKeys = new ArrayList<>();
+        // Connections to which concept-scoped narrowing does not apply (SC-2): they are not an
+        // error and do not abort the request; their surface is added below.
+        List<String> unnarrowedConnections = new ArrayList<>();
+        int narrowedConnections = 0;
         Optional<ConceptScopedMetadataResolver.RoutingDecision> routing = Optional.empty();
         // Concept-Level Disjunctive Ambiguity design: the first connection to signal ambiguity
-        // wins — the same all-or-nothing, first-wins discipline this method already documents for
-        // routing above (a whole-REQUEST decision from a per-CONNECTION call).
+        // wins — the same first-wins discipline this method documents for routing above (a
+        // whole-REQUEST decision from a per-CONNECTION call).
         Optional<String> ambiguity = Optional.empty();
         for (String connectionKey : connectionKeys) {
             ConceptScopedMetadataResolver.CombinedResolution resolution =
                     conceptResolver.resolveObjectKeysWithRouting(connectionKey, question, conversationId, memoryAvailable);
             if (resolution.objectKeys().isEmpty()) {
-                return new ConceptScopedModelResult(Optional.empty(), Optional.empty(), List.of(), Optional.empty());
+                unnarrowedConnections.add(connectionKey);
+                continue;
             }
+            narrowedConnections++;
             allObjectKeys.addAll(resolution.objectKeys().get());
             resolution.conceptKeys().ifPresent(allConceptKeys::addAll);
             if (routing.isEmpty()) routing = resolution.routing();
             if (ambiguity.isEmpty()) ambiguity = resolution.conceptAmbiguityClarification();
+        }
+        if (narrowedConnections == 0) {
+            // No connection narrows: the whole request falls back to the full assembly, exactly
+            // as before this amendment.
+            return new ConceptScopedModelResult(Optional.empty(), Optional.empty(), List.of(), Optional.empty());
         }
         List<String> distinctConceptKeys = allConceptKeys.stream().distinct().toList();
         // CRITICAL DOWNSTREAM BOUNDARY: checked explicitly and BEFORE the allObjectKeys.isEmpty()
         // branch below, rather than relying on allObjectKeys happening to be empty — a
         // multi-connection scope where one connection is ambiguous but ANOTHER connection
         // legitimately contributed object keys must still never approve those object keys.
-        // Ambiguity on any one connection empties the WHOLE scope, mirroring this method's
-        // existing all-or-nothing semantics for a connection that fails outright (see the
-        // `resolution.objectKeys().isEmpty()` branch above) — assembleByObjectKeys is never
-        // reached in this case.
+        // Ambiguity on any one narrowed connection empties the WHOLE scope — including the
+        // surface of connections that do not narrow: no physical object is approved for an
+        // unresolved ambiguity. assembleByObjectKeys is never reached in this case.
         if (ambiguity.isPresent()) {
             return new ConceptScopedModelResult(
                     Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing, distinctConceptKeys,
                     ambiguity);
         }
-        if (allObjectKeys.isEmpty()) {
-            // Every in-scope connection is concept-classified, and the LLM found none of the
-            // available concepts relevant — a legitimate, honest "nothing applies" outcome,
-            // distinct from ambiguity (already handled above).
-            return new ConceptScopedModelResult(
-                    Optional.of(new SemanticModel(List.of(), Map.of(), Map.of())), routing, distinctConceptKeys,
+        // Narrowed connections: Stage 2's resolved objects only. When the LLM found none of the
+        // available concepts relevant this is a legitimate, honest "nothing applies" outcome for
+        // those connections, distinct from ambiguity (already handled above).
+        SemanticModel narrowed = allObjectKeys.isEmpty()
+                ? new SemanticModel(List.of(), Map.of(), Map.of())
+                : assembler.assembleByObjectKeys(allObjectKeys);
+        if (unnarrowedConnections.isEmpty()) {
+            return new ConceptScopedModelResult(Optional.of(narrowed), routing, distinctConceptKeys,
                     Optional.empty());
         }
-        return new ConceptScopedModelResult(
-                Optional.of(assembler.assembleByObjectKeys(allObjectKeys)), routing, distinctConceptKeys,
-                Optional.empty());
+        // Mixed scope: add the approved surface of the connections that do not narrow.
+        SemanticModel unnarrowed = assembleUnnarrowedSurface(unnarrowedConnections, domainKeys);
+        return new ConceptScopedModelResult(Optional.of(mergeModels(narrowed, unnarrowed)), routing,
+                distinctConceptKeys, Optional.empty());
+    }
+
+    /**
+     * The approved surface of connections to which concept narrowing does not apply — the same
+     * selection {@link #assembleByFallback} makes (domain-bearing scopes keep their domain
+     * boundaries; domain-free scopes use the connections), restricted to those connections.
+     *
+     * <p>Deliberately does NOT reuse {@code assembleByFallback}'s stale-connection fallback
+     * (which returns the whole domain when narrowing would empty the scope): in a mixed scope that
+     * would re-admit the unnarrowed objects of connections that DID narrow. Here an empty result
+     * simply means these connections have nothing in scope.
+     */
+    private SemanticModel assembleUnnarrowedSurface(List<String> unnarrowedConnections, List<String> domainKeys) {
+        if (domainKeys == null || domainKeys.isEmpty()) {
+            return assembler.assemble(unnarrowedConnections);
+        }
+        return narrowToConnections(assembler.assembleByDomains(domainKeys), unnarrowedConnections);
+    }
+
+    /** Union of two semantic models over disjoint connections; the first model wins on any key
+     *  collision (none is expected — object keys are connection-scoped). */
+    private static SemanticModel mergeModels(SemanticModel first, SemanticModel second) {
+        List<BusinessObject> objects = new ArrayList<>(first.objects());
+        Set<String> seen = new HashSet<>();
+        for (BusinessObject o : first.objects()) seen.add(o.objectKey());
+        for (BusinessObject o : second.objects()) {
+            if (seen.add(o.objectKey())) objects.add(o);
+        }
+        Map<String, PhysicalTable> objectTargets = new LinkedHashMap<>(first.objectTargets());
+        second.objectTargets().forEach(objectTargets::putIfAbsent);
+        Map<String, PhysicalColumn> attributeTargets = new LinkedHashMap<>(first.attributeTargets());
+        second.attributeTargets().forEach(attributeTargets::putIfAbsent);
+        return new SemanticModel(objects, objectTargets, attributeTargets);
     }
 
     /** Restricts a domain scope to objects reachable through the approved connections. */
