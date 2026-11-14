@@ -640,7 +640,7 @@ public class ChatService {
                 }
                 case "ASK_CLARIFICATION" -> {
                     answer = (String) decision.getOrDefault("clarification_question",
-                            "Could you provide more context about what you're looking for?");
+                            "I need a little more detail to answer that well. Which measure, period or group do you mean?");
                 }
                 case "KNOWLEDGE_GAP" -> {
                     String gapKey = Keys.uniqueKey("gap");
@@ -650,8 +650,8 @@ public class ChatService {
                             "No approved knowledge or data sources found for this question.",
                             null, "OPEN", null, null, null, null);
                     knowledgeGapRepository.save(gap);
-                    answer = "I don't have approved knowledge or data sources for this question. " +
-                            "Use /knowledge to propose adding this, or /request-source to request a data connection.";
+                    answer = "Nothing in the connected data or documents covers this, so I can't answer it reliably. " +
+                            "To get it covered, use /knowledge to add the information, or /request-source to ask for a data connection.";
                     decisionType = "KNOWLEDGE_GAP";
                 }
                 case "QUERY_LIVE_DATA", "HYBRID_DOC_AND_DATA", "ANSWER_FROM_PRIOR_RESULTS" -> {
@@ -1609,8 +1609,32 @@ public class ChatService {
      * promotions") must not be framed as a system or metadata fault. Only the file-lookup case —
      * where the user supplied specific values as parameters — states those records "do not exist".
      */
+    /**
+     * The shared voice for every answer Zevra composes. Appended to each prompt below so a
+     * routine result and an unwelcome one (nothing found, blocked, failed, unclear) sound like
+     * the same experienced analyst. It sets tone only: the facts each prompt must not misstate
+     * are fixed by the prompt it is appended to, and this block never overrides them.
+     */
+    static final String ANALYST_VOICE = """
+
+            VOICE — write as a senior analyst briefing an executive:
+            - Calm, direct and specific. Open with the finding itself, never with filler such as
+              "Based on the data", "It appears", "It seems" or "Our analysis shows".
+            - Never apologise or hedge ("unfortunately", "I'm sorry", "I was unable to"). Where
+              there is a limit, state it as a plain fact and say what can be done about it.
+            - Be precise: name the figure, the unit and the scope or period it covers. Separate
+              what the evidence shows from what you are inferring, and say so in a clause when
+              the evidence is partial.
+            - Plain business language. No SQL, table or column names, system terms or jargon.
+            - When there is a sensible next step, offer exactly one, as a specific suggestion.
+            """;
+
+    private static String withVoice(String prompt) {
+        return prompt + ANALYST_VOICE;
+    }
+
     static String zeroRowSystemPrompt(boolean hasAttachment) {
-        return hasAttachment
+        return withVoice(hasAttachment
                 ? """
                 You are Zevra, an enterprise operational intelligence AI.
                 The database query returned zero matching rows.
@@ -1630,7 +1654,7 @@ public class ChatService {
                 or that the system failed — the query was valid and simply had no matches.
                 Offer one natural next step only if helpful (e.g. broadening the criteria or a different filter).
                 Keep the response to 1-2 sentences.
-                """;
+                """);
     }
 
     /**
@@ -1639,7 +1663,7 @@ public class ChatService {
      * {@link #zeroRowSystemPrompt} — a failure is not an empty result.
      */
     static String failedQuerySystemPrompt() {
-        return """
+        return withVoice("""
                 You are Zevra, an enterprise operational intelligence AI.
                 The database query could not be executed — it failed with an error.
                 State plainly and concisely that the query could not be completed and no data
@@ -1650,7 +1674,7 @@ public class ChatService {
                 plain-language statement that execution failed is enough. Suggest the user try
                 again or rephrase the request.
                 Keep the response to 1-2 sentences.
-                """;
+                """);
     }
 
     /**
@@ -1658,7 +1682,7 @@ public class ChatService {
      * distinct from both a clean zero-row result and an execution failure.
      */
     static String blockedQuerySystemPrompt() {
-        return """
+        return withVoice("""
                 You are Zevra, an enterprise operational intelligence AI.
                 The query was blocked by a data governance check before it could run. This is
                 different from a query that executed and found nothing, and different from a
@@ -1671,7 +1695,7 @@ public class ChatService {
                 records were found. Do NOT say the query executed successfully.
                 Do not expose SQL or internal identifiers.
                 Keep the response to 1-3 sentences.
-                """;
+                """);
     }
 
     /**
@@ -1683,7 +1707,7 @@ public class ChatService {
      * internal issue as a deliberate access restriction.
      */
     static String validationFailedSystemPrompt() {
-        return """
+        return withVoice("""
                 You are Zevra, an enterprise operational intelligence AI.
                 The investigation could not complete because a filter value it generated failed an
                 internal data-validation check — this is a technical limitation, NOT an access or
@@ -1694,7 +1718,7 @@ public class ChatService {
                 say no records were found. Do NOT say the query executed successfully.
                 Do not expose raw error text, SQL, or internal implementation details.
                 Keep the response to 1-2 sentences.
-                """;
+                """);
     }
 
     private static final String DATA_ANSWER_SYSTEM_PROMPT = """
@@ -1712,6 +1736,9 @@ public class ChatService {
             - Bold the key figures. Plain prose only; no markdown headings or bullet lists unless
               there are several genuinely distinct, independent findings.
             - Be brief: 2 to 5 sentences total. Stop once the point is made.
+            - Never open with filler ("Based on the data", "It appears", "The analysis shows").
+              Give the figure with its unit and the scope or period it covers, and say in a clause
+              when the evidence is partial. Plain business language: no SQL or system terms.
             """;
 
     /**
@@ -1802,6 +1829,11 @@ public class ChatService {
               it.
             - Include a concrete figure, comparison, or relationship when it materially explains
               the conclusion; bold important figures when useful. Plain prose otherwise.
+            - Write as a senior analyst briefing an executive: never open with filler ("Based on
+              the data", "It appears", "The analysis shows"); never apologise or hedge; give each
+              figure with its unit and the scope or period it covers; and when the evidence is
+              partial or an assumption was made, say so in one clause rather than implying
+              certainty.
 
             RULES FOR "sections" — each one is OPTIONAL, and exists only when it adds something
             "answer" doesn't already say. Below you will be shown one or more INVESTIGATION
@@ -2076,7 +2108,7 @@ public class ChatService {
      * answer is the model's call; this prompt only fixes the facts it must not misstate.
      */
     static String noQueryExecutedSystemPrompt() {
-        return """
+        return withVoice("""
                 You are Zevra, an enterprise operational intelligence AI.
                 No database query was run for this question, so you have NO data to report. The
                 reason is given after "No query was run. Reason:" in the context above.
@@ -2087,7 +2119,7 @@ public class ChatService {
                 available, say so. Then invite them to rephrase, or to say precisely what they want
                 to see. Do not expose SQL, identifiers or internal implementation details.
                 Keep the response to 1-3 sentences.
-                """;
+                """);
     }
 
     /**
@@ -2099,7 +2131,7 @@ public class ChatService {
      * genuine question back to the user, not to answer on the term's behalf.
      */
     static String clarificationSystemPrompt() {
-        return """
+        return withVoice("""
                 You are Zevra, an enterprise operational intelligence AI.
                 The investigation could not proceed because one of the user's terms does not
                 match any of the actual, authoritative values for the column it would filter —
@@ -2112,7 +2144,7 @@ public class ChatService {
                 any SQL or filter value yourself — this is a question back to the user, not an
                 answer.
                 Keep the response to 1-2 sentences.
-                """;
+                """);
     }
 
     /** The composer's last-resort fallback text (used only if the LLM call itself fails) —
@@ -2143,10 +2175,10 @@ public class ChatService {
                                          boolean anyClarification, boolean anyValidationFailed,
                                          boolean anyNoQuery) {
         if (anyRows) return "Investigation completed. Results are shown in the table below.";
-        if (anyError) return "The query could not be executed.";
-        if (anyClarification) return "One of the terms in your question doesn't match an available value — could you clarify?";
+        if (anyError) return "That query could not be executed, so there are no figures to report yet. Please try again, or rephrase the request.";
+        if (anyClarification) return "One of the terms in your question doesn't match any value on record. Which did you mean?";
         if (anyValidationFailed) return "The investigation could not be completed due to an internal technical limitation.";
-        if (anyBlocked) return "The request was blocked by data governance policy.";
+        if (anyBlocked) return "That request was blocked by a data governance policy, so no figures were retrieved. Try narrowing it, or ask your administrator about access.";
         if (anyNoQuery) return "I couldn't run a query for that question as asked. Could you rephrase it or say what you'd like to see?";
         return "Investigation completed. No data returned.";
     }
